@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/Toshik1978/voicenotes/internal/capture"
+	"github.com/Toshik1978/voicenotes/internal/enrich"
 	"github.com/Toshik1978/voicenotes/internal/memos"
 	"github.com/Toshik1978/voicenotes/internal/openai"
 	"github.com/Toshik1978/voicenotes/internal/pipeline"
@@ -35,4 +36,19 @@ func (n notesShim) Create(ctx context.Context, in pipeline.NoteInput) (string, s
 
 func (n notesShim) Attach(ctx context.Context, name, filename, mime string, data []byte) capture.Outcome {
 	return n.c.Attach(ctx, name, filename, mime, data)
+}
+
+// llmShim adapts the OpenAI-compatible chat client to pipeline.Enricher,
+// mapping the enrich messages onto the client's.
+type llmShim struct{ c *openai.Chat }
+
+var _ pipeline.Enricher = llmShim{}
+
+func (l llmShim) Complete(ctx context.Context, msgs []enrich.Message) (string, capture.Outcome) {
+	out := make([]openai.Message, len(msgs))
+	for i, m := range msgs {
+		out[i] = openai.Message{Role: m.Role, Content: m.Content}
+	}
+
+	return l.c.Complete(ctx, out)
 }

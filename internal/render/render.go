@@ -120,7 +120,12 @@ func quoteBlock(lang, text string) string {
 	for i, l := range lines {
 		lines[i] = "> " + l
 	}
-	return fmt.Sprintf("*Original (%s):*\n%s", lang, strings.Join(lines, "\n"))
+	head := "*Original:*"
+	if lang != "" {
+		head = fmt.Sprintf("*Original (%s):*", lang)
+	}
+
+	return head + "\n" + strings.Join(lines, "\n")
 }
 
 func tagsLine(in Input) string {

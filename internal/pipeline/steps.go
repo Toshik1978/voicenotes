@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/Toshik1978/voicenotes/internal/capture"
+	"github.com/Toshik1978/voicenotes/internal/enrich"
 	"github.com/Toshik1978/voicenotes/internal/render"
 )
 
@@ -85,13 +86,21 @@ type AudioStore interface {
 	Remove(name string) error
 }
 
-// Deps are the collaborators of the step handlers. All but Log are required.
+// Enricher is the chat call of the optional LLM step. It is nil when the LLM
+// is not configured.
+type Enricher interface {
+	Complete(ctx context.Context, messages []enrich.Message) (string, capture.Outcome)
+}
+
+// Deps are the collaborators of the step handlers. All but Enricher and Log
+// are required.
 type Deps struct {
 	Transcriber Transcriber
 	Notes       NotesWriter
 	Replier     Replier
 	Downloader  Downloader
 	Audio       AudioStore
+	Enricher    Enricher
 	Log         *zap.Logger
 }
 
@@ -103,6 +112,9 @@ type StepsConfig struct {
 	SourceLanguages []string
 	// Location decides the local date in attachment names; nil means UTC.
 	Location *time.Location
+	// Enrich selects the LLM functions and validation limits; it is used only
+	// when Deps.Enricher is set.
+	Enrich enrich.Options
 }
 
 // NewHandlers builds the handler for every step. Each handler is safe to
@@ -242,23 +254,78 @@ func (s *stepRunner) transcribe(ctx context.Context, c capture.Capture) (capture
 	return c, capture.OK()
 }
 
-// enrich is the pass-through used until an LLM is configured.
-func (s *stepRunner) enrich(_ context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
-	c.LLMSkipped = capture.SkippedDisabled
+// enrich runs the optional LLM step. Without an Enricher it records
+// 'disabled'. A stored result (a re-run after a crash) or an empty transcript
+// needs no call. An answer that fails validation is Permanent, which the
+// policy turns into 'invalid_output'; the 3 attempt / 2 minute budget is the
+// policy's too. Prompts, transcripts and answers are never logged.
+func (s *stepRunner) enrich(ctx context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
+	if s.d.Enricher == nil {
+		c.LLMSkipped = capture.SkippedDisabled
+
+		return c, capture.OK()
+	}
+	if c.EnrichedJSON != "" || strings.TrimSpace(c.Text) == "" {
+		return c, capture.OK()
+	}
+	raw, out := s.d.Enricher.Complete(ctx, enrich.BuildRequest(s.cfg.Enrich, c.Text, c.Language))
+	if out.Class != capture.ClassOK {
+		return c, out
+	}
+	res, err := enrich.Parse(raw, c.Text, s.cfg.Enrich)
+	if err != nil {
+		s.log(c, "LLM answer rejected", err)
+
+		return c, capture.Permanent("LLM output invalid")
+	}
+	stored, err := res.Marshal()
+	if err != nil {
+		s.log(c, "enriched result not stored", err)
+
+		return c, capture.Permanent("LLM output not storable")
+	}
+	c.EnrichedJSON, c.TaskCount = stored, len(res.Tasks)
 
 	return c, capture.OK()
+}
+
+// noteInput maps the capture to the renderer input. A stored LLM result
+// supplies the main text, checklist and tags; when it translated, the raw
+// transcript becomes the quoted original. A result that cannot be decoded
+// degrades to the raw transcript rather than failing the note. A minimal note
+// ignores the stored result: the retry must differ from the rejected create.
+func (s *stepRunner) noteInput(c capture.Capture) render.Input {
+	in := render.Input{
+		Text: c.Text, Failure: c.Failure, NoAudio: !holdsAudio(c),
+		InboxTag: s.cfg.InboxTag, TodoTag: s.cfg.TodoTag,
+	}
+	if c.EnrichedJSON == "" || c.Failure != "" || c.MinimalNote {
+		return in
+	}
+	res, err := enrich.Unmarshal(c.EnrichedJSON)
+	if err != nil {
+		s.log(c, "enriched result unreadable, rendering the transcript", err)
+
+		return in
+	}
+	in.Text, in.Actions, in.SuggestedTags = res.Text, res.Tasks, res.Tags
+	if res.Translated {
+		in.Original, in.OriginalLang = c.Text, c.Language
+		if in.OriginalLang == "" {
+			in.OriginalLang = res.Language
+		}
+	}
+
+	return in
 }
 
 // writeNote renders and creates the note (Create is idempotent through its
 // deterministic memo id) and then attaches the audio (Attach dedupes). The
 // note name is kept even when the attach fails, so a retry resumes there.
-// MinimalNote keeps the text (truncated to the limit) and drops only the
-// attachment; LLM output is not rendered yet.
+// MinimalNote keeps the raw text (truncated to the limit) and drops the
+// attachment and the LLM output.
 func (s *stepRunner) writeNote(ctx context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
-	in := render.Input{
-		Text: c.Text, Failure: c.Failure, NoAudio: !holdsAudio(c),
-		InboxTag: s.cfg.InboxTag, TodoTag: s.cfg.TodoTag,
-	}
+	in := s.noteInput(c)
 	if c.MinimalNote && c.AudioPath != "" && c.Failure == "" {
 		// The full note was rejected (typically the attachment): the text
 		// stays in the note, the audio does not, and the reply says so.
@@ -283,7 +350,7 @@ func (s *stepRunner) writeNote(ctx context.Context, c capture.Capture) (capture.
 
 		return c, out
 	}
-	c.NoteName, c.NoteURL, c.TaskCount = name, link, 0
+	c.NoteName, c.NoteURL, c.TaskCount = name, link, len(in.Actions)
 
 	if c.AudioPath == "" || c.MinimalNote {
 		return c, capture.OK()

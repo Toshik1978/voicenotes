@@ -18,6 +18,7 @@ import (
 	"github.com/Toshik1978/voicenotes/internal/capture"
 	"github.com/Toshik1978/voicenotes/internal/config"
 	"github.com/Toshik1978/voicenotes/internal/digest"
+	"github.com/Toshik1978/voicenotes/internal/enrich"
 	"github.com/Toshik1978/voicenotes/internal/memos"
 	"github.com/Toshik1978/voicenotes/internal/openai"
 	"github.com/Toshik1978/voicenotes/internal/pipeline"
@@ -137,24 +138,9 @@ func wire(cfg config.Config, log *zap.Logger, db *sqlite.DB, audioDir string) (*
 		return nil, fmt.Errorf("telegram: %w", err)
 	}
 
-	// Later task (LLM enrich): when cfg.LLMEnabled, build the LLM enrich handler here with a
-	// plain conditional.
-	handlers, err := pipeline.NewHandlers(pipeline.Deps{
-		Transcriber: sttShim{t: transcriber},
-		Notes:       notesShim{c: notes},
-		Replier:     tg,
-		Downloader:  tg,
-		Audio:       pipeline.NewDirAudio(audioDir),
-		Log:         log,
-	}, pipeline.StepsConfig{
-		InboxTag:        cfg.InboxTag,
-		TodoTag:         cfg.TodoTag,
-		NoteLimit:       cfg.MemosContentLimit,
-		SourceLanguages: cfg.SourceLanguages,
-		Location:        cfg.Location,
-	})
+	handlers, err := newHandlers(cfg, log, tg, transcriber, notes, audioDir)
 	if err != nil {
-		return nil, fmt.Errorf("handlers: %w", err)
+		return nil, err
 	}
 	worker, err := pipeline.New(db, pipeline.SystemClock{},
 		capture.Policy{MaxInterval: cfg.RetryMaxInterval, Rand: rand.Float64}, handlers, log)
@@ -193,8 +179,8 @@ func wire(cfg config.Config, log *zap.Logger, db *sqlite.DB, audioDir string) (*
 }
 
 // digestGoroutines returns the morning digest runner, or nothing when the
-// digest is disabled. T031 (LLM summaries) will call SetSummarizer on the
-// runner when cfg.LLMDigestSummary.
+// digest is disabled. With LLM_DIGEST_SUMMARY on and the LLM configured, the
+// runner gets an LLM summarizer.
 func digestGoroutines(
 	cfg config.Config, log *zap.Logger, notes digest.NotesReader, store digest.Store, sender digest.Sender,
 ) ([]func(context.Context), error) {
@@ -211,6 +197,9 @@ func digestGoroutines(
 	}, notes, store, sender)
 	if err != nil {
 		return nil, fmt.Errorf("digest: %w", err)
+	}
+	if cfg.LLMEnabled && cfg.LLMDigestSummary {
+		runner.SetSummarizer(digest.NewLLMSummarizer(llmShim{c: newChat(cfg)}, cfg.LLMTimeout))
 	}
 
 	return []func(context.Context){runner.Run}, nil
@@ -237,4 +226,50 @@ func newClients(cfg config.Config) (*openai.Transcriber, *memos.Client) {
 	}, nil)
 
 	return transcriber, notes
+}
+
+// newChat builds the LLM chat client; its http.Client carries LLM_TIMEOUT.
+func newChat(cfg config.Config) *openai.Chat {
+	return openai.NewChat(openai.ChatConfig{
+		BaseURL: cfg.LLMBaseURL,
+		APIKey:  cfg.LLMAPIKey,
+		Model:   cfg.LLMModel,
+		Version: Version,
+	}, &http.Client{Timeout: cfg.LLMTimeout})
+}
+
+// newHandlers builds the step handlers; the LLM is wired only when configured.
+func newHandlers(
+	cfg config.Config, log *zap.Logger, tg *telegram.API,
+	transcriber *openai.Transcriber, notes *memos.Client, audioDir string,
+) (map[capture.Step]pipeline.Handler, error) {
+	deps := pipeline.Deps{
+		Transcriber: sttShim{t: transcriber},
+		Notes:       notesShim{c: notes},
+		Replier:     tg,
+		Downloader:  tg,
+		Audio:       pipeline.NewDirAudio(audioDir),
+		Log:         log,
+	}
+	if cfg.LLMEnabled {
+		deps.Enricher = llmShim{c: newChat(cfg)}
+	}
+
+	handlers, err := pipeline.NewHandlers(deps, pipeline.StepsConfig{
+		InboxTag:        cfg.InboxTag,
+		TodoTag:         cfg.TodoTag,
+		NoteLimit:       cfg.MemosContentLimit,
+		SourceLanguages: cfg.SourceLanguages,
+		Location:        cfg.Location,
+		Enrich: enrich.Options{
+			Translate: cfg.LLMTranslate, Tidy: cfg.LLMTidy, Tasks: cfg.LLMTasks,
+			Target: cfg.TargetLanguage, MaxTags: cfg.LLMMaxTags,
+			InboxTag: cfg.InboxTag, TodoTag: cfg.TodoTag,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("handlers: %w", err)
+	}
+
+	return handlers, nil
 }

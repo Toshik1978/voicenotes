@@ -44,7 +44,7 @@ The LLM step is enabled only when `LLM_BASE_URL` is set.
 | `LLM_TIDY` | no | `true` | no | Tidy punctuation and suggest tags |
 | `LLM_TASKS` | no | `true` | no | Spot action items → checklist + `#todo` |
 | `LLM_DIGEST_SUMMARY` | no | `true` | no | One-line summaries in the digest |
-| `LLM_MAX_TAGS` | no | `3` | no | Upper bound on suggested tags |
+| `LLM_MAX_TAGS` | no | `3` | no | Upper bound on suggested tags; extra suggestions are dropped, `0` disables tags |
 | `LLM_TIMEOUT` | no | `60s` | no | Per-request timeout |
 
 ## Memos

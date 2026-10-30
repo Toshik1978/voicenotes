@@ -192,24 +192,24 @@ packages are in `internal/` (see plan.md Structure).
 
 **Independent Test**: quickstart scenarios 7 and 8.
 
-- [ ] T027 [P] [US4] Implement the chat client in `internal/openai/chat.go`. It sends `POST {LLM_BASE_URL}/chat/completions` with `{model, temperature:0, messages}`, no `response_format`, tools or other provider fields, and a Bearer key if set. It returns `choices[0].message.content` and classifies errors as in T012. Tests use httptest.
-- [ ] T028 [P] [US4] Implement pure prompt building and response validation in `internal/enrich`.
+- [x] T027 [P] [US4] Implement the chat client in `internal/openai/chat.go`. It sends `POST {LLM_BASE_URL}/chat/completions` with `{model, temperature:0, messages}`, no `response_format`, tools or other provider fields, and a Bearer key if set. It returns `choices[0].message.content` and classifies errors as in T012. Tests use httptest.
+- [x] T028 [P] [US4] Implement pure prompt building and response validation in `internal/enrich`.
   - Building: the system prompt is assembled from the enabled functions (`LLM_TRANSLATE`, `LLM_TIDY`, `LLM_TASKS`) plus the JSON shape. The user content holds the text, the detected language and the target language.
   - Parsing: extract the first `{…}` and validate it per contracts/external-apis.md §2. `text` must be non-empty and ≤4× the input length. `tasks` allows ≤10 items, each ≤200 chars. `tags` must match `[a-z0-9_-]{1,32}`, at most `LLM_MAX_TAGS`, with the inbox and todo tags dropped.
   - Any violation returns `invalid_output`.
   - Also build and parse the digest summaries call (`{"summaries":{"<n>":"≤80 chars"}}`).
   - Table tests.
-- [ ] T029 [US4] Extend `internal/render` to the full FR-022 layout:
+- [x] T029 [US4] Extend `internal/render` to the full FR-022 layout:
   - Main text first, then `- [ ] <task>` lines.
   - When translated, the original goes under `*Original (<lang>):*` followed by `> ` quote lines.
   - The tags line is `#inbox`, then `#todo` when there are tasks, then the suggested tags.
   - Truncation to `MEMOS_CONTENT_LIMIT` shortens the original quote first, then the main text, with `(truncated)` markers, and never cuts tags or the checklist (FR-024).
   - Table tests.
-- [ ] T030 [US4] Implement the real `enrich` step in `internal/pipeline/steps.go`. Text captures follow the same path (US4 scenario 7).
+- [x] T030 [US4] Implement the real `enrich` step in `internal/pipeline/steps.go`. Text captures follow the same path (US4 scenario 7).
   - When the LLM is configured: call it and store the validated JSON in `enriched_json`, and set `task_count`.
   - The bounded budget is 3 attempts or 2 minutes, then `llm_skipped='unavailable'` (FR-018). Invalid output sets `llm_skipped='invalid_output'`.
   - With the LLM skipped, the reply finalises to `✓ saved (no AI) · open`. With tasks, it finalises to `✓ saved · N tasks · open`.
-- [ ] T031 [US4] Add digest summaries in `internal/digest/runner.go`.
+- [x] T031 [US4] Add digest summaries in `internal/digest/runner.go`.
   - When `LLM_DIGEST_SUMMARY` is on and the LLM is configured, make one batched call with the first 500 chars of each note.
   - Missing or invalid summaries fall back per line to the first line.
 

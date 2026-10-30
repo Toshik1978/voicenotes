@@ -65,9 +65,14 @@ Verified compatible:
 Validation:
 - `text` must be non-empty and ≤ 4× the input length.
 - `tasks`: ≤10 items, each ≤200 characters.
-- `tags`: lowercase `[a-z0-9_-]{1,32}`, at most `LLM_MAX_TAGS`. The inbox and todo tags are
-  dropped from suggestions because VoiceNotes adds them itself.
-- If validation fails, the capture is saved without LLM output (`invalid_output`).
+- `tags` are normalised, never rejected: each item is trimmed, loses its leading `#`, is
+  lowercased and has inner whitespace replaced by `-`. Items that still do not match
+  `[a-z0-9_-]{1,32}`, items that are not strings, the inbox and todo tags (VoiceNotes adds them
+  itself) and duplicates are dropped, order is kept, and the list is cut to `LLM_MAX_TAGS`.
+  A `tags` value that is not an array yields no tags; the rest of the answer is kept.
+  `LLM_MAX_TAGS=0` disables tags.
+- If validation of any other key fails, the capture is saved without LLM output
+  (`invalid_output`).
 
 **Digest summaries** (one call per digest):
 - The input is `[{"id":"<n>","text":"<first 500 chars>"}]`.

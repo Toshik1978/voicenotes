@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Toshik1978/voicenotes/internal/capture"
+	"github.com/Toshik1978/voicenotes/internal/enrich"
 	"github.com/Toshik1978/voicenotes/internal/pipeline"
 )
 
@@ -499,6 +500,102 @@ func TestWriteNote(t *testing.T) {
 	})
 }
 
+func TestWriteNoteEnriched(t *testing.T) {
+	c := base()
+	c.AudioPath, c.Text = "5.ogg", "buy milk"
+	t.Run("enriched result renders the full layout", func(t *testing.T) {
+		r := newRig(t)
+		r.audio.files["5.ogg"] = []byte("A")
+		cc := c
+		cc.Text, cc.Language = "Привет, купить молоко", "ru"
+		cc.EnrichedJSON = `{"text":"Hello, buy milk","translated":true,"tasks":["buy milk"],"tags":["shopping"]}`
+		got, out := r.run(capture.StepWriteNote, cc)
+		if out.Class != capture.ClassOK {
+			t.Fatalf("out %+v", out)
+		}
+		want := "Hello, buy milk\n\n- [ ] buy milk\n\n*Original (ru):*\n> Привет, купить молоко\n\n#inbox #todo #shopping"
+		if r.notes.created[0].Content != want {
+			t.Errorf("content %q, want %q", r.notes.created[0].Content, want)
+		}
+		if got.TaskCount != 1 {
+			t.Errorf("task count %d", got.TaskCount)
+		}
+	})
+	t.Run("original language falls back to the result's", func(t *testing.T) {
+		r := newRig(t)
+		r.audio.files["5.ogg"] = []byte("A")
+		cc := c
+		cc.Language = ""
+		cc.EnrichedJSON = `{"text":"Hi","language":"de","translated":true}`
+		r.run(capture.StepWriteNote, cc)
+		if got := r.notes.created[0].Content; !strings.Contains(got, "*Original (de):*\n> buy milk") {
+			t.Errorf("content %q", got)
+		}
+	})
+	t.Run("no language anywhere gives a heading without parentheses", func(t *testing.T) {
+		r := newRig(t)
+		r.audio.files["5.ogg"] = []byte("A")
+		cc := c
+		cc.Language = ""
+		cc.EnrichedJSON = `{"text":"Hi","translated":true}`
+		r.run(capture.StepWriteNote, cc)
+		if got := r.notes.created[0].Content; !strings.Contains(got, "*Original:*\n> buy milk") {
+			t.Errorf("content %q", got)
+		}
+	})
+	t.Run("untranslated enriched text has no quote", func(t *testing.T) {
+		r := newRig(t)
+		r.audio.files["5.ogg"] = []byte("A")
+		cc := c
+		cc.Language = "en"
+		cc.EnrichedJSON = `{"text":"Buy milk."}`
+		r.run(capture.StepWriteNote, cc)
+		if got := r.notes.created[0].Content; got != "Buy milk.\n\n#inbox" {
+			t.Errorf("content %q", got)
+		}
+	})
+	t.Run("undecodable enriched result falls back to transcript", func(t *testing.T) {
+		r := newRig(t)
+		r.audio.files["5.ogg"] = []byte("A")
+		cc := c
+		cc.EnrichedJSON = `{not json`
+		_, out := r.run(capture.StepWriteNote, cc)
+		if out.Class != capture.ClassOK || r.notes.created[0].Content != "buy milk\n\n#inbox" {
+			t.Errorf("out %+v content %q", out, r.notes.created[0].Content)
+		}
+	})
+}
+
+// TestWriteNoteMinimalDropsLLM: a permanently rejected create is retried with
+// a different, LLM-free payload (ruling vn-jmb.3.5 (a)).
+func TestWriteNoteMinimalDropsLLM(t *testing.T) {
+	const enriched = `{"text":"Hello, buy milk","translated":true,"tasks":["buy milk"],"tags":["shopping"]}`
+	for _, audio := range []bool{false, true} {
+		r := newRig(t)
+		cc := base()
+		cc.Text, cc.Language, cc.EnrichedJSON = "Привет, купить молоко", "ru", enriched
+		if audio {
+			cc.AudioPath = "5.ogg"
+			r.audio.files["5.ogg"] = []byte("A")
+		} else {
+			cc.Kind = capture.KindText
+		}
+		full, _ := r.run(capture.StepWriteNote, cc)
+		cc.MinimalNote = true
+		got, out := r.run(capture.StepWriteNote, cc)
+		if out.Class != capture.ClassOK || len(r.notes.created) != 2 {
+			t.Fatalf("audio %v: out %+v created %d", audio, out, len(r.notes.created))
+		}
+		if first, minimal := r.notes.created[0].Content, r.notes.created[1].Content; minimal == first ||
+			minimal != "Привет, купить молоко\n\n#inbox" {
+			t.Errorf("audio %v: first %q minimal %q", audio, first, minimal)
+		}
+		if got.TaskCount != 0 || full.TaskCount != 1 {
+			t.Errorf("audio %v: task counts full %d minimal %d", audio, full.TaskCount, got.TaskCount)
+		}
+	}
+}
+
 func TestWriteNoteFailures(t *testing.T) {
 	c := base()
 	c.AudioPath, c.Text = "5.ogg", "buy milk"
@@ -972,6 +1069,131 @@ func testDownloadPermanentPlaceholder(t *testing.T) {
 	if !strings.Contains(r.notes.created[0].Content, "audio too large") ||
 		!strings.Contains(r.notes.created[0].Content, "#inbox") {
 		t.Errorf("content %q", r.notes.created[0].Content)
+	}
+}
+
+type fakeEnricher struct {
+	raw   string
+	out   capture.Outcome
+	calls int
+	got   []enrich.Message
+}
+
+func (f *fakeEnricher) Complete(_ context.Context, m []enrich.Message) (string, capture.Outcome) {
+	f.calls++
+	f.got = m
+
+	return f.raw, f.out
+}
+
+func llmHandlers(t *testing.T, e pipeline.Enricher) map[capture.Step]pipeline.Handler {
+	t.Helper()
+	h, err := pipeline.NewHandlers(pipeline.Deps{
+		Transcriber: &fakeTranscriber{}, Notes: &fakeNotes{}, Replier: &fakeReplier{},
+		Downloader: &fakeDownloader{}, Audio: newFakeAudio(), Enricher: e,
+	}, pipeline.StepsConfig{
+		InboxTag: "inbox", TodoTag: "todo", NoteLimit: 1000,
+		Enrich: enrich.Options{Translate: true, Tidy: true, Tasks: true, Target: "en", MaxTags: 3},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return h
+}
+
+func TestEnrichWithLLM(t *testing.T) {
+	good := `{"language":"ru","text":"Buy milk and call Bob.","translated":true,"tasks":["Buy milk","Call Bob"],"tags":["home"]}`
+	tests := []struct {
+		name        string
+		raw         string
+		out         capture.Outcome
+		text        string
+		prior       string
+		wantCalls   int
+		wantClass   capture.Class
+		wantTasks   int
+		wantStored  bool
+		wantSkipped string
+	}{
+		{
+			name: "result stored", raw: good, out: capture.OK(), text: "kupi moloko", wantCalls: 1,
+			wantClass: capture.ClassOK, wantTasks: 2, wantStored: true,
+		},
+		{
+			name: "invalid output is permanent", raw: "nope", out: capture.OK(), text: "x", wantCalls: 1,
+			wantClass: capture.ClassPermanent,
+		},
+		{
+			name: "temporary passes through", out: capture.Temporary("down"), text: "x", wantCalls: 1,
+			wantClass: capture.ClassTemporary,
+		},
+		{
+			name: "empty transcript skips the call", raw: good, out: capture.OK(), text: "  ", wantCalls: 0,
+			wantClass: capture.ClassOK,
+		},
+		{
+			name: "stored result is not recomputed", raw: good, out: capture.OK(), text: "x", prior: `{"text":"x"}`,
+			wantCalls: 0, wantClass: capture.ClassOK, wantStored: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e := &fakeEnricher{raw: tc.raw, out: tc.out}
+			c := base()
+			c.Text, c.Language, c.EnrichedJSON = tc.text, "ru", tc.prior
+			got, out := llmHandlers(t, e)[capture.StepEnrich](context.Background(), c)
+			if out.Class != tc.wantClass || e.calls != tc.wantCalls {
+				t.Fatalf("class %v calls %d", out.Class, e.calls)
+			}
+			if (got.EnrichedJSON != "") != tc.wantStored || got.TaskCount != tc.wantTasks || got.LLMSkipped != "" {
+				t.Errorf("got %+v", got)
+			}
+			if tc.wantCalls > 0 && !strings.Contains(e.got[1].Content, "Detected language: ru") {
+				t.Errorf("language missing from request: %q", e.got[1].Content)
+			}
+		})
+	}
+}
+
+func TestEnrichBudgetViaPolicy(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	p := capture.Policy{MaxInterval: time.Minute}
+	c := base()
+	c.Step = capture.StepEnrich
+	c = p.Next(c, capture.Permanent("LLM output invalid"), now)
+	if c.Step != capture.StepWriteNote || c.LLMSkipped != capture.SkippedInvalidOutput || c.Failure != "" {
+		t.Errorf("invalid: %+v", c)
+	}
+	c = base()
+	c.Step = capture.StepEnrich
+	for range 3 {
+		c = p.Next(c, capture.Temporary("down"), now)
+	}
+	if c.Step != capture.StepWriteNote || c.LLMSkipped != capture.SkippedUnavailable || c.QueueReplyEdit {
+		t.Errorf("unavailable: %+v", c)
+	}
+}
+
+func TestReplyNoAIOnlyWhenSkipped(t *testing.T) {
+	for skipped, want := range map[string]string{
+		capture.SkippedDisabled:      "✓ saved · ",
+		capture.SkippedUnavailable:   "✓ saved (no AI) · ",
+		capture.SkippedInvalidOutput: "✓ saved (no AI) · ",
+		"":                           "✓ saved · 2 tasks · ",
+	} {
+		r := newRig(t)
+		c := base()
+		c.ReplyMessageID, c.LLMSkipped = 9, skipped
+		if skipped == "" {
+			c.TaskCount = 2
+		}
+		if _, out := r.run(capture.StepFinalizeReply, c); out.Class != capture.ClassOK {
+			t.Fatal(out)
+		}
+		if got := r.rep.edits[len(r.rep.edits)-1].text; !strings.HasPrefix(got, want) {
+			t.Errorf("%q: got %q want prefix %q", skipped, got, want)
+		}
 	}
 }
 

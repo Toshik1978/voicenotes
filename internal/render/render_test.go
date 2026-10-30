@@ -39,6 +39,11 @@ func TestRender(t *testing.T) {
 			i.Original, i.OriginalLang = "Привет\nмир", "ru"
 			return i
 		}, "Hello\n\n*Original (ru):*\n> Привет\n> мир\n\n#inbox"},
+		{"original without language", func(i Input) Input {
+			i.Text = "Hello"
+			i.Original = "Hallo"
+			return i
+		}, "Hello\n\n*Original:*\n> Hallo\n\n#inbox"},
 		{"suggested tags deduped", func(i Input) Input {
 			i.Text = "x"
 			i.Actions = []string{"a"}
@@ -149,4 +154,62 @@ func TestRenderQuoteDrop(t *testing.T) {
 			t.Errorf("fixed parts cut: %q", got)
 		}
 	})
+}
+
+func TestRenderFullLayoutLimits(t *testing.T) {
+	full := Input{
+		InboxTag: "inbox", TodoTag: "todo",
+		Text:    strings.Repeat("ж", 300),
+		Actions: []string{"call", "buy"}, SuggestedTags: []string{"home"},
+		Original: strings.Repeat("я", 300), OriginalLang: "ru",
+	}
+	fixed := "\n\n- [ ] call\n- [ ] buy\n\n"
+	tests := []struct {
+		name  string
+		limit int
+		check func(got string) string
+	}{
+		{"fits whole", 4096, func(got string) string {
+			if strings.Contains(got, "(truncated)") {
+				return "unexpected truncation"
+			}
+			return ""
+		}},
+		{"quote shrinks first", 900, func(got string) string {
+			if !strings.Contains(got, full.Text+fixed) || strings.Count(got, "(truncated)") != 1 {
+				return "main must stay whole with one marker"
+			}
+			return ""
+		}},
+		{"main shrinks after quote is gone", 200, func(got string) string {
+			if strings.Contains(got, "*Original") || !strings.Contains(got, "(truncated)"+fixed) {
+				return "quote not dropped or main not marked"
+			}
+			return ""
+		}},
+		{"limit below tags and checklist", 5, func(got string) string {
+			want := "(truncated)" + fixed + "#inbox #todo #home"
+			if got != want {
+				return "want " + want
+			}
+			return ""
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := Render(full, tt.limit)
+			if !utf8.ValidString(got) {
+				t.Fatalf("invalid UTF-8: %q", got)
+			}
+			if tt.limit >= 200 && len(got) > tt.limit {
+				t.Errorf("len %d > %d", len(got), tt.limit)
+			}
+			if !strings.Contains(got, "- [ ] call\n- [ ] buy") || !strings.HasSuffix(got, "#inbox #todo #home") {
+				t.Errorf("checklist or tags cut: %q", got)
+			}
+			if msg := tt.check(got); msg != "" {
+				t.Errorf("%s: %q", msg, got)
+			}
+		})
+	}
 }
