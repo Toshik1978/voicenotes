@@ -1,0 +1,42 @@
+# Install with `pre-commit install`. That alone only wires the pre-commit
+# stage, which would leave the commit-msg and pre-push hooks dormant —
+# declaring the hook types here is what makes one command enough.
+default_install_hook_types: [pre-commit, pre-push, commit-msg]
+
+repos:
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.4.0
+    hooks:
+      # Not decoration: `.cliff.toml` groups the CHANGELOG by these prefixes
+      # and that file becomes the release notes. commit-lint.yml re-checks the
+      # same rule, for anyone who never ran `pre-commit install`.
+      - id: conventional-pre-commit
+        stages:
+          - commit-msg
+
+  - repo: local
+    hooks:
+      # Each gate at the cheapest stage that still catches it. Everything
+      # per-commit breeds the `--no-verify` habit .claude/CLAUDE.md forbids.
+      - id: golangci-lint-fmt
+        name: golangci-lint fmt --diff
+        entry: golangci-lint fmt --diff
+        language: system
+        types: [go]
+        pass_filenames: false
+        stages:
+          - pre-commit
+
+      # Pre-push, not earlier: lint is the slowest check that still has to be
+      # green before anything reaches the shared remote. Tests and the
+      # coverage floor are CI's job and `task test:coverage`'s.
+      #
+      # Not filtered by file type: a config or prose change can break the
+      # lint run too, and `types: [go]` would skip exactly those pushes.
+      - id: task-lint
+        name: task lint
+        entry: task lint
+        language: system
+        pass_filenames: false
+        stages:
+          - pre-push

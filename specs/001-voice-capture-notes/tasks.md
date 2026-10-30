@@ -30,23 +30,23 @@ packages are in `internal/` (see plan.md Structure).
 
 **Purpose**: an empty but fully gated repository that mirrors the maintainer's other Go services.
 
-- [ ] T001 Initialise the Go module and repo files: `go.mod` (module `github.com/Toshik1978/voicenotes`, go 1.27), `.mise.toml` (go 1.27, golangci-lint latest, as in tgshd), `.gitignore`, `.dockerignore`, `LICENSE` (same licence as tgshd), and a stub `cmd/voicenotes/main.go` with `main.Buildstamp`/`main.Commit` vars and a `version` subcommand.
+- [x] T001 Initialise the Go module and repo files: `go.mod` (module `github.com/Toshik1978/voicenotes`, go 1.27), `.mise.toml` (go 1.27, golangci-lint latest, as in tgshd), `.gitignore`, `.dockerignore`, `LICENSE` (same licence as tgshd), and a stub `cmd/voicenotes/main.go` with `main.Buildstamp`/`main.Commit` vars and a `version` subcommand.
   - The `version` output must say "VoiceNotes" (FR-035). Test: `cmd/voicenotes/main_test.go`.
   - Add only the four approved dependencies when first used: telebot.v4, zap, caarlos0/env/v11, modernc sqlite (plan.md Technical Context).
-- [ ] T002 [P] Create `Taskfile.yml` modelled on `tgshd/Taskfile.yml`, with these tasks:
+- [x] T002 [P] Create `Taskfile.yml` modelled on `tgshd/Taskfile.yml`, with these tasks:
   - `setup`, `lint`, `format`, `test`
   - `test:coverage`: `-race -coverpkg={{.COVERPKG}}` with `COVERPKG: ./internal/config,./internal/capture,./internal/pipeline,./internal/language,./internal/enrich,./internal/render,./internal/digest,./internal/health`
   - `build`: `CGO_ENABLED=0`, ldflags, output `bin/voicenotes`
   - `run` (loads `.env`), `clean`
-- [ ] T003 [P] Create `.golangci.yml`, copied from tgshd's configuration and adjusted for the module path.
-- [ ] T004 [P] Create `.pre-commit-config.yaml` with `default_install_hook_types: [pre-commit, pre-push, commit-msg]`:
+- [x] T003 [P] Create `.golangci.yml`, copied from tgshd's configuration and adjusted for the module path.
+- [x] T004 [P] Create `.pre-commit-config.yaml` with `default_install_hook_types: [pre-commit, pre-push, commit-msg]`:
   - `compilerla/conventional-pre-commit` at the `commit-msg` stage
   - `golangci-lint fmt --diff` at the `pre-commit` stage
   - `task lint` at the `pre-push` stage
   - Pattern: `~/Development/beads-viewer/.pre-commit-config.yaml`, including its explanatory comments.
-- [ ] T005 [P] Create `.github/workflows/ci.yml` with lint, `test:coverage` and an 80% floor check, plus a `CGO_ENABLED=0` build. Its `-coverpkg` MUST equal Taskfile `COVERPKG`. Also create `.github/workflows/commit-lint.yml` (Conventional Commits check that re-runs the repo's commit-msg hook over the push/PR range, as in beads-viewer).
-- [ ] T006 [P] Create `.cliff.toml` (git-cliff grouping by Conventional Commit type, as in beads-viewer) and `CHANGELOG.md` with an `Unreleased` section.
-- [ ] T007 [P] Create `CLAUDE.md`, the runtime guide consistent with `.specify/memory/constitution.md`:
+- [x] T005 [P] Create `.github/workflows/ci.yml` with lint, `test:coverage` and an 80% floor check, plus a `CGO_ENABLED=0` build. Its `-coverpkg` MUST equal Taskfile `COVERPKG`. Also create `.github/workflows/commit-lint.yml` (Conventional Commits check that re-runs the repo's commit-msg hook over the push/PR range, as in beads-viewer).
+- [x] T006 [P] Create `.cliff.toml` (git-cliff grouping by Conventional Commit type, as in beads-viewer) and `CHANGELOG.md` with an `Unreleased` section.
+- [x] T007 [P] Create `CLAUDE.md`, the runtime guide consistent with `.specify/memory/constitution.md`:
   - gates
   - Conventional Commits
   - no fx

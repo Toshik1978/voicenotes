@@ -1,0 +1,20 @@
+# Build outputs
+/bin/
+
+# Coverage artifacts
+coverage.txt
+coverage.out
+coverage.xml
+coverage_func.txt
+
+# Local runtime files
+.env
+data/
+
+# Local tooling state
+.worktrees/
+.superpowers/
+.specify/feature.json
+.idea
+.vscode
+/voicenotes

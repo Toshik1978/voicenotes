@@ -1,0 +1,80 @@
+version: "3"
+
+# `task run` reads .env if present; every other task works without it.
+dotenv: ['.env']
+
+vars:
+  BINARY: bin/voicenotes
+  # Coverage gate scope: the pure decision logic (config, pipeline steps,
+  # language selection, enrichment, note rendering, digest composition, health).
+  # The I/O adapters run against real external services and are excluded, though
+  # their tests still run. MUST stay identical to -coverpkg in
+  # .github/workflows/ci.yml.
+  #
+  # Some of these packages do not exist yet. Go (checked on 1.27) only warns
+  # for a -coverpkg pattern that matches nothing, so the list is passed
+  # verbatim. With no statements to measure the profile is empty and the floor
+  # check passes with a notice; it enforces 80% as soon as code exists.
+  COVERPKG: ./internal/config,./internal/capture,./internal/pipeline,./internal/language,./internal/enrich,./internal/render,./internal/digest,./internal/health
+  BUILDSTAMP:
+    sh: date +%Y/%m/%d_%H:%M:%S
+  COMMIT:
+    sh: git rev-parse --short HEAD 2>/dev/null || echo unknown
+
+tasks:
+  setup:
+    desc: Download Go module dependencies
+    cmd: go mod download
+
+  lint:
+    desc: Run golangci-lint
+    cmd: golangci-lint run
+
+  format:
+    desc: Format the codebase
+    cmds:
+      - golangci-lint fmt
+      - golangci-lint run --fix
+
+  test:
+    desc: Run unit tests
+    cmd: go test -v ./...
+
+  test:coverage:
+    desc: Run all unit tests with the race detector, coverage over the gate scope and the 80% floor
+    cmds:
+      - >-
+        go test -race
+        -coverpkg={{.COVERPKG}}
+        -coverprofile=coverage.txt -covermode=atomic ./...
+      - .github/scripts/check-coverage-floor.sh coverage.txt 80
+
+  build:
+    desc: Compile the voicenotes binary (static, CGO-free)
+    env:
+      CGO_ENABLED: "0"
+    cmds:
+      - rm -f {{.BINARY}}
+      - >-
+        go build -v
+        -ldflags "-X main.Buildstamp={{.BUILDSTAMP}} -X main.Commit={{.COMMIT}}"
+        -o {{.BINARY}} ./cmd/voicenotes
+    generates:
+      - "{{.BINARY}}"
+
+  run:
+    desc: Build and run the service (loads .env)
+    deps: [build]
+    cmd: ./{{.BINARY}} run
+
+  clean:
+    desc: Remove build artifacts and test cache
+    cmds:
+      - go clean -testcache
+      - rm -f {{.BINARY}} coverage.txt
+
+  changelog:
+    desc: Prepend the generated commit list for the next release to CHANGELOG.md (TAG=vX.Y.Z)
+    requires:
+      vars: [TAG]
+    cmd: git-cliff --config .cliff.toml --unreleased --tag {{.TAG}} --prepend CHANGELOG.md
