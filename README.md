@@ -141,6 +141,7 @@ The LLM step is enabled only when `LLM_BASE_URL` is set.
 | `LLM_DIGEST_SUMMARY` | no | `true` | no | One-line summaries in the digest |
 | `LLM_MAX_TAGS` | no | `3` | no | Upper bound on suggested tags; extra suggestions are dropped, `0` disables tags |
 | `LLM_TIMEOUT` | no | `60s` | no | Per-request timeout |
+| `LLM_TEMPERATURE` | no | unset | no | Sampling temperature `0`–`2`; unset sends none, so the model uses its default (some models accept only that) |
 
 ### Memos
 
@@ -195,11 +196,12 @@ forced, `language`. `Authorization: Bearer` is sent only when `STT_API_KEY` is s
 
 ### LLM
 
-`POST {LLM_BASE_URL}/chat/completions` with `temperature=0` and no provider-specific fields; the
-model is instructed to answer with one JSON object. Provision one model alias through any
-OpenAI-compatible endpoint, for example a LiteLLM model named `voicenotes`, and set `LLM_MODEL` to
-it. A small, fast model is enough: about one call per capture plus one per day, a few hundred
-tokens each. If the output fails validation, the note is saved without LLM output (`✓ saved (no
+`POST {LLM_BASE_URL}/chat/completions` with no provider-specific fields; the model is instructed
+to answer with one JSON object. Provision one model alias through any OpenAI-compatible endpoint,
+for example a LiteLLM model named `voicenotes`, and set `LLM_MODEL` to it. A small, fast model is
+enough: about one call per capture plus one per day, a few hundred tokens each. No `temperature`
+is sent unless `LLM_TEMPERATURE` is set, because some models (Claude Haiku, for one) accept only
+their default. If the output fails validation, the note is saved without LLM output (`✓ saved (no
 AI)`).
 
 ### Memos

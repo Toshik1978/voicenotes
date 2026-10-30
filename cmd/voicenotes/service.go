@@ -246,10 +246,11 @@ func newClients(cfg config.Config) (*openai.Transcriber, *memos.Client) {
 // newChat builds the LLM chat client; its http.Client carries LLM_TIMEOUT.
 func newChat(cfg config.Config) *openai.Chat {
 	return openai.NewChat(openai.ChatConfig{
-		BaseURL: cfg.LLMBaseURL,
-		APIKey:  cfg.LLMAPIKey,
-		Model:   cfg.LLMModel,
-		Version: Version,
+		BaseURL:     cfg.LLMBaseURL,
+		APIKey:      cfg.LLMAPIKey,
+		Model:       cfg.LLMModel,
+		Version:     Version,
+		Temperature: cfg.LLMTemperature,
 	}, &http.Client{Timeout: cfg.LLMTimeout})
 }
 

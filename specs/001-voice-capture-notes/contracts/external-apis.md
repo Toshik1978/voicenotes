@@ -37,7 +37,7 @@ Verified compatible:
 ```json
 {
   "model": "<LLM_MODEL>",
-  "temperature": 0,
+  "temperature": <LLM_TEMPERATURE>,
   "messages": [
     {"role": "system", "content": "<instructions for the enabled functions + JSON schema>"},
     {"role": "user", "content": "<capture text, detected language, target language>"}
@@ -45,6 +45,8 @@ Verified compatible:
 }
 ```
 
+- `temperature` is sent only when `LLM_TEMPERATURE` is set. Unset, the model uses its default;
+  some models (for example Claude Haiku behind LiteLLM) reject any other value.
 - No `response_format`, tools or other provider-specific fields. The model is told to answer with
   one JSON object only.
 - The first `{…}` block in `choices[0].message.content` is extracted and validated.

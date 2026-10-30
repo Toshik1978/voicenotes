@@ -49,6 +49,10 @@ type Config struct {
 	LLMDigestSummary bool          `env:"LLM_DIGEST_SUMMARY" envDefault:"true"`
 	LLMMaxTags       int           `env:"LLM_MAX_TAGS"       envDefault:"3"`
 	LLMTimeout       time.Duration `env:"LLM_TIMEOUT"        envDefault:"60s"`
+	// LLMTemperature is nil when LLM_TEMPERATURE is unset or empty: the
+	// request then carries no temperature, because some models accept only
+	// their own default.
+	LLMTemperature *float64 `env:"LLM_TEMPERATURE"`
 
 	// Memos. MemosPublicURL defaults to MemosURL.
 	MemosURL          string `env:"MEMOS_URL"`
@@ -227,6 +231,10 @@ func (v *validator) validateLLM() {
 		v.fail("LLM_MAX_TAGS", "must not be negative")
 	}
 	v.positive("LLM_TIMEOUT", c.LLMTimeout > 0)
+	// Written this way round so NaN fails too.
+	if t := c.LLMTemperature; t != nil && !(*t >= 0 && *t <= 2) {
+		v.fail("LLM_TEMPERATURE", "must be between 0 and 2")
+	}
 }
 
 func (v *validator) validateMemos() {

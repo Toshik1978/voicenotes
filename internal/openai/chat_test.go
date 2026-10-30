@@ -58,17 +58,38 @@ func TestChatRequest(t *testing.T) {
 	if gotAuth != "Bearer FAKE-KEY" || gotUA != "VoiceNotes/1.2.3" || gotCT != "application/json" {
 		t.Errorf("headers = %q %q %q", gotAuth, gotUA, gotCT)
 	}
-	if len(gotBody) != 3 {
-		t.Errorf("body keys = %v, want exactly model, temperature, messages", gotBody)
+	if len(gotBody) != 2 {
+		t.Errorf("body keys = %v, want exactly model, messages", gotBody)
 	}
-	if string(gotBody["model"]) != `"voicenotes"` || string(gotBody["temperature"]) != "0" {
-		t.Errorf("model/temperature = %s %s", gotBody["model"], gotBody["temperature"])
+	if string(gotBody["model"]) != `"voicenotes"` {
+		t.Errorf("model = %s", gotBody["model"])
 	}
 	var msgs []Message
 	want := testMessages()
 	if err := json.Unmarshal(gotBody["messages"], &msgs); err != nil || len(msgs) != 2 ||
 		msgs[0] != want[0] || msgs[1] != want[1] {
 		t.Errorf("messages = %s (%v)", gotBody["messages"], err)
+	}
+}
+
+// Some models accept only their default temperature, so it is sent only when
+// configured, and then even when it is 0.
+func TestChatTemperature(t *testing.T) {
+	for _, temp := range []float64{0, 1, 0.2} {
+		var gotBody map[string]json.RawMessage
+		c := newTestChat(t, func(w http.ResponseWriter, r *http.Request) {
+			raw, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(raw, &gotBody)
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+		}, func(cfg *ChatConfig) { cfg.Temperature = &temp })
+
+		if _, out := c.Complete(context.Background(), testMessages()); out.Class != capture.ClassOK {
+			t.Fatalf("outcome = %+v", out)
+		}
+		var got float64
+		if err := json.Unmarshal(gotBody["temperature"], &got); err != nil || got != temp || len(gotBody) != 3 {
+			t.Errorf("temperature %v: body = %v (%v)", temp, gotBody, err)
+		}
 	}
 }
 

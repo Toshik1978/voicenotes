@@ -22,6 +22,8 @@ type ChatConfig struct {
 	Model string
 	// Version is used for "User-Agent: VoiceNotes/<version>".
 	Version string
+	// Temperature is sent only when set; nil leaves the model's default.
+	Temperature *float64
 }
 
 // Message is one chat message.
@@ -45,9 +47,10 @@ func NewChat(cfg ChatConfig, client *http.Client) *Chat {
 	return &Chat{cfg: cfg, client: client}
 }
 
-// Complete sends the messages with temperature 0 and returns
-// choices[0].message.content. Only model, temperature and messages are sent, so
-// any OpenAI-compatible gateway accepts the call. Errors are classified like
+// Complete sends the messages and returns choices[0].message.content. Only
+// model, messages and, when configured, temperature are sent, so any
+// OpenAI-compatible gateway accepts the call; some models reject any
+// temperature but their default. Errors are classified like
 // Transcribe (research R10). A 2xx whose body is not JSON or has no choices is
 // Permanent: retrying the same prompt will not fix it, and the enrich policy
 // then skips the LLM. Outcomes carry no WaitingOn tag because the LLM never
@@ -56,9 +59,9 @@ func NewChat(cfg ChatConfig, client *http.Client) *Chat {
 func (c *Chat) Complete(ctx context.Context, messages []Message) (string, capture.Outcome) {
 	payload, err := json.Marshal(struct {
 		Model       string    `json:"model"`
-		Temperature int       `json:"temperature"`
+		Temperature *float64  `json:"temperature,omitempty"`
 		Messages    []Message `json:"messages"`
-	}{c.cfg.Model, 0, messages})
+	}{c.cfg.Model, c.cfg.Temperature, messages})
 	if err != nil {
 		return "", capture.Permanent("build request")
 	}

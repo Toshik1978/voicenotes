@@ -46,6 +46,7 @@ The LLM step is enabled only when `LLM_BASE_URL` is set.
 | `LLM_DIGEST_SUMMARY` | no | `true` | no | One-line summaries in the digest |
 | `LLM_MAX_TAGS` | no | `3` | no | Upper bound on suggested tags; extra suggestions are dropped, `0` disables tags |
 | `LLM_TIMEOUT` | no | `60s` | no | Per-request timeout |
+| `LLM_TEMPERATURE` | no | unset | no | Sampling temperature `0`–`2`; unset sends none, so the model uses its default (some models accept only that) |
 
 ## Memos
 

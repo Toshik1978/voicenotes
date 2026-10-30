@@ -56,6 +56,7 @@ func TestParseDefaults(t *testing.T) {
 		{"LLMDigestSummary", c.LLMDigestSummary, true},
 		{"LLMMaxTags", c.LLMMaxTags, 3},
 		{"LLMTimeout", c.LLMTimeout, 60 * time.Second},
+		{"LLMTemperature unset", c.LLMTemperature == nil, true},
 		{"MemosPublicURL", c.MemosPublicURL, "http://memos.example.org:5230"},
 		{"MemosAPIPrefix", c.MemosAPIPrefix, "auto"},
 		{"MemosContentLimit", c.MemosContentLimit, 8192},
@@ -121,6 +122,33 @@ func TestParseOverridesAndDerived(t *testing.T) {
 	}
 }
 
+func TestParseLLMTemperature(t *testing.T) {
+	tests := []struct {
+		value string
+		want  *float64
+	}{
+		{"", nil},
+		{"0", new(0.0)},
+		{"1", new(1.0)},
+		{"0.2", new(0.2)},
+		{"2", new(2.0)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			c, err := Parse(with("LLM_TEMPERATURE", tt.value))
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			switch {
+			case tt.want == nil && c.LLMTemperature != nil:
+				t.Errorf("LLMTemperature = %v, want unset", *c.LLMTemperature)
+			case tt.want != nil && (c.LLMTemperature == nil || *c.LLMTemperature != *tt.want):
+				t.Errorf("LLMTemperature = %v, want %v", c.LLMTemperature, *tt.want)
+			}
+		})
+	}
+}
+
 func TestParseErrors(t *testing.T) {
 	tests := []struct {
 		name string
@@ -141,6 +169,10 @@ func TestParseErrors(t *testing.T) {
 		{"llm without model", with("LLM_BASE_URL", "http://llm.example.org/v1"), "config: LLM_MODEL: "},
 		{"bad llm url", with("LLM_BASE_URL", "nope", "LLM_MODEL", "m"), "config: LLM_BASE_URL: "},
 		{"bad max tags", with("LLM_MAX_TAGS", "-1"), "config: LLM_MAX_TAGS: "},
+		{"bad temperature", with("LLM_TEMPERATURE", "warm"), "config: LLM_TEMPERATURE: "},
+		{"negative temperature", with("LLM_TEMPERATURE", "-0.5"), "config: LLM_TEMPERATURE: "},
+		{"temperature too high", with("LLM_TEMPERATURE", "2.5"), "config: LLM_TEMPERATURE: "},
+		{"temperature NaN", with("LLM_TEMPERATURE", "NaN"), "config: LLM_TEMPERATURE: "},
 		{"bad bool", with("LLM_TIDY", "maybe"), "config: LLM_TIDY: "},
 		{"missing memos url", with("MEMOS_URL", "-"), "config: MEMOS_URL: "},
 		{"missing memos token", with("MEMOS_TOKEN", "-"), "config: MEMOS_TOKEN: "},
@@ -195,6 +227,7 @@ func TestErrorsNeverContainValues(t *testing.T) {
 		"LLM_API_KEY":            secretValue,
 		"LLM_TIDY":               secretValue,
 		"LLM_MAX_TAGS":           secretValue,
+		"LLM_TEMPERATURE":        secretValue,
 		"MEMOS_URL":              secretValue,
 		"MEMOS_TOKEN":            secretValue,
 		"MEMOS_PUBLIC_URL":       secretValue,
