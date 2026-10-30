@@ -90,12 +90,12 @@ Token `memos_pat_…`.
 
 | Purpose | Call |
 |---|---|
-| Resolve prefix and owner (startup, and again after errors) | `GET {MEMOS_URL}{P}/auth/me` → `user.name` (e.g. `users/1`). In `auto` mode, `/api` is tried first; 404 or 410 falls back to `/api/v1` |
+| Resolve prefix and owner (startup, and again after errors) | `GET {MEMOS_URL}{P}/auth/me` → `user.name` (`users/<username>`, e.g. `users/owner`). In `auto` mode, `/api` is tried first; 404 or 410 falls back to `/api/v1` |
 | Create note | `POST {P}/memos?memoId=vn-<capture-id>-<hash>` body `{"content": "...", "visibility": "PRIVATE", "createTime": "<received_at RFC3339>"}` → `name` = `memos/<uid>` |
 | Attach audio | `POST {P}/attachments` body `{"filename":"voice-<date>.ogg","type":"audio/ogg","content":"<base64>","memo":"memos/<uid>"}` |
-| Digest: list inbox | `GET {P}/memos?filter=<urlenc: "inbox" in tags && creator == "users/1">&pageSize=50&orderBy=create_time asc`, paging with `pageToken` (50 keeps a page of long notes under the 1 MiB response limit; a larger body fails as "response too large"). Uses `property.hasTaskList` for the ☑ marker |
+| Digest: list inbox | `GET {P}/memos?filter=<urlenc: "inbox" in tags && creator == "users/owner">&pageSize=50&orderBy=create_time asc`, paging with `pageToken` (50 keeps a page of long notes under the 1 MiB response limit; a larger body fails as "response too large"). Uses `property.hasTaskList` for the ☑ marker |
 
-- The deterministic `memoId` makes a retried create idempotent. On 409 (already exists; status code unverified, so any "already exists" error is treated the same),
+- The deterministic `memoId` makes a retried create idempotent. On 409 (already exists, gRPC code 6; verified on 0.31.0 and 26.10.0-rc.2, and any other "already exists" error is treated the same),
   VoiceNotes fetches `GET {P}/memos/<uid>` and continues. An attach is skipped if the memo
   already lists an attachment with that filename.
 - Links: `{MEMOS_PUBLIC_URL}/memos/<uid>`.

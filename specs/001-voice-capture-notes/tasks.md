@@ -260,11 +260,11 @@ packages are in `internal/` (see plan.md Structure).
 
 ## Phase 9: Polish & Cross-Cutting Concerns
 
-- [ ] T039 Run the full quickstart.md scenarios 1–13 against Memos v0.31.0 and a real speaches or OpenAI endpoint. Fix any findings, recording them in `specs/001-voice-capture-notes/quickstart.md`. Also:
+- [x] T039 Run the full quickstart.md scenarios 1–13 against Memos v0.31.0 and a real speaches or OpenAI endpoint. Fix any findings, recording them in `specs/001-voice-capture-notes/quickstart.md`. Also:
   - Record timings for SC-001 (≤15 s without the LLM, ≤30 s with it) and SC-003 (backlog drained ≤10 min after recovery).
   - Run the SC-007 10-clip action-item check (pass at ≥9 of 10).
   - Confirm the research R8 owner filter.
-- [ ] T040 Do the final hygiene and release prep:
+- [x] T040 Do the final hygiene and release prep:
   - Scan the repo and history for real hosts, tokens and IDs (Constitution VII).
   - Ensure `task lint` is clean, `task test:coverage` is ≥80% and `CGO_ENABLED=0` builds pass.
   - Update `CHANGELOG.md` via git-cliff for v0.1.0.

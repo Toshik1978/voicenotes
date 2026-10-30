@@ -174,7 +174,7 @@ func (c *Client) Attach(ctx context.Context, name, filename, mime string, data [
 	return capture.OK()
 }
 
-// Owner returns the token owner's user name (for example "users/1") from
+// Owner returns the token owner's user name (for example "users/owner") from
 // GET {P}/auth/me. It is cached after the first success, and is what the inbox
 // listing later filters on (research R8).
 func (c *Client) Owner(ctx context.Context) (string, capture.Outcome) {
@@ -379,7 +379,7 @@ func (c *Client) link(name string) string {
 
 // alreadyExists recognises the duplicate-memoId error: HTTP 409, or any error
 // status whose gRPC-gateway body carries code 6 (AlreadyExists) or says
-// "already exists" (the exact status Memos uses is unverified).
+// "already exists". Memos 0.31.0 and 26.10.0-rc.2 answer 409 with code 6.
 func alreadyExists(status int, raw []byte) bool {
 	if status == http.StatusConflict {
 		return true

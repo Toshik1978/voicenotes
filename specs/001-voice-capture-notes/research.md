@@ -99,6 +99,8 @@ against v0.9.0-rc.3 source.
   PUBLIC notes. Whether the filter takes `users/1` or `users/<username>` was not verified, so the
   value is taken from the API instead of being constructed. An integration test against a real
   Memos v0.31.0 container (quickstart) confirms it.
+- **Verified (2026-10-30)**: on v0.31.0 and 26.10.0-rc.2, `user.name` is `users/<username>`, and
+  the filter excludes other users' PUBLIC notes (quickstart, Validation results).
 
 ## R9. LLM output format
 
