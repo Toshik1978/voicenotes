@@ -1,8 +1,12 @@
 package capture
 
 import (
+	"context"
 	"errors"
+	"net/http"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestClassifyHTTP(t *testing.T) {
@@ -59,5 +63,37 @@ func TestOutcomeHelpers(t *testing.T) {
 		if c.String() == "" {
 			t.Error("empty class string")
 		}
+	}
+}
+
+func TestNetworkErrorOmitsURL(t *testing.T) {
+	req, err := http.NewRequestWithContext(
+		context.Background(), http.MethodGet, "http://user:secret@127.0.0.1:1/path?token=abc", http.NoBody,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := (&http.Client{Timeout: time.Second}).Do(req)
+	if err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("expected a transport error")
+	}
+	out := NetworkError(err)
+	if out.Class != ClassTemporary {
+		t.Fatalf("class = %v", out.Class)
+	}
+	for _, leak := range []string{"user", "secret", "127.0.0.1:1/", "token", "abc", "/path"} {
+		if strings.Contains(out.Reason, leak) {
+			t.Errorf("reason %q leaks %q", out.Reason, leak)
+		}
+	}
+	if !strings.HasPrefix(out.Reason, "Get") {
+		t.Errorf("reason %q should start with the url.Error Op", out.Reason)
+	}
+	if got := NetworkError(errors.New("boom")).Reason; got != "boom" {
+		t.Errorf("plain error reason = %q", got)
+	}
+	if NetworkError(nil).Class != ClassOK {
+		t.Error("nil must be OK")
 	}
 }

@@ -28,7 +28,7 @@ One incoming thought, from receipt until its note exists and the reply is final.
 | `note_name` | TEXT NULL | Memos `memos/<uid>`; set once written |
 | `note_url` | TEXT NULL | Public link |
 | `task_count` | INTEGER | For the confirmation line |
-| `reply_message_id` | INTEGER NULL | The ⏳ reply to edit; NULL until ⏳ has been sent (the download step sends it when ingest could not) |
+| `reply_message_id` | INTEGER NULL | The ⏳ reply to edit; NULL until ⏳ has been sent (the download step sends it when ingest could not). Ingest records it with a single-column write that keeps an existing value, and a full-row update with 0 keeps the stored value, so ingest and the worker cannot overwrite each other |
 | `step` | TEXT | Next step to run (see below) |
 | `status` | TEXT | `pending` \| `waiting` \| `done` |
 | `waiting_on` | TEXT NULL | `telegram` \| `stt` \| `memos`, used for the reply text and health |

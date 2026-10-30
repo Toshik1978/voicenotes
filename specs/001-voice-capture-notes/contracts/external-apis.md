@@ -14,7 +14,7 @@ match. Every client sets `User-Agent: VoiceNotes/<version>`.
 
 | Field | Value |
 |---|---|
-| `file` | Telegram audio bytes as-is (voice = Ogg/Opus, filename `capture-<id>.ogg`); no transcoding |
+| `file` | Telegram audio bytes as-is (voice = Ogg/Opus, filename `capture-<id>.ogg`; an audio file keeps its stored extension, for example `capture-<id>.mp3`); no transcoding |
 | `model` | `STT_MODEL` |
 | `response_format` | `STT_RESPONSE_FORMAT` (`verbose_json` default; `json` for gpt-4o transcribe models) |
 | `language` | Sent only when one language is forced: exactly one `SOURCE_LANGUAGES` entry, or the re-transcribe pass |

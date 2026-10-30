@@ -1,8 +1,10 @@
 package capture
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 )
 
 // Class is the result category of one step attempt (research R10).
@@ -79,10 +81,17 @@ func ClassifyHTTP(status int) Outcome {
 }
 
 // NetworkError marks a transport error or timeout as temporary. A nil error
-// yields OK.
+// yields OK. The reason is secret-free: a *url.Error is reduced to its Op and
+// underlying error, because its text embeds the request URL, which may carry
+// userinfo, a path or a query token.
 func NetworkError(err error) Outcome {
 	if err == nil {
 		return OK()
 	}
+	var ue *url.Error
+	if errors.As(err, &ue) && ue.Err != nil {
+		return Temporary(ue.Op + ": " + ue.Err.Error())
+	}
+
 	return Temporary(err.Error())
 }

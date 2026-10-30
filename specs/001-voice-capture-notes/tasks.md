@@ -89,20 +89,20 @@ packages are in `internal/` (see plan.md Structure).
 
 **Independent Test**: quickstart scenarios 1–4 with the LLM unset.
 
-- [ ] T012 [P] [US1] Implement the speech-to-text client in `internal/openai/transcribe.go`, using `POST {STT_BASE_URL}/audio/transcriptions` multipart as in contracts/external-apis.md §1.
+- [x] T012 [P] [US1] Implement the speech-to-text client in `internal/openai/transcribe.go`, using `POST {STT_BASE_URL}/audio/transcriptions` multipart as in contracts/external-apis.md §1.
   - Fields: `file` (bytes as-is, filename `capture-<id>.ogg`), `model`, `response_format`, optional `language`, `temperature=0`. Bearer header only if a key is set. `User-Agent: VoiceNotes/<version>`.
   - It returns `text` and the raw `language`. Errors map to Outcome classes per research R10: 5xx/408/429/network → Temporary; 401/403/404 → Misconfig; 400/413/415/422 → Permanent.
   - Tests use httptest.
-- [ ] T013 [P] [US1] Implement the Memos client in `internal/memos`. `NotesWriter.Create(ctx, Note) (name, url, error)` and `Attach(ctx, name, filename, mime, bytes)` follow contracts/external-apis.md §3.
+- [x] T013 [P] [US1] Implement the Memos client in `internal/memos`. `NotesWriter.Create(ctx, Note) (name, url, error)` and `Attach(ctx, name, filename, mime, bytes)` follow contracts/external-apis.md §3.
   - Prefix resolution: `auto` probes `{MEMOS_URL}/api/auth/me`, then `/api/v1/auth/me` on 404/410; an explicit prefix skips the probe. The owner's `user.name` is cached.
   - Create uses `memoId=vn-<capture-id>-<shorthash>` (≤36 chars, `^[a-zA-Z0-9]([a-zA-Z0-9-]{0,34}[a-zA-Z0-9])?$`), visibility `PRIVATE` and `createTime`=received_at. Any "already exists" response is treated as success by fetching `GET {P}/memos/<uid>`.
   - Attach uses inline base64 with `memo` set, and is skipped if an attachment with that filename already exists.
   - Links are `{MEMOS_PUBLIC_URL}/memos/<uid>`. Errors map to Outcome classes as in T012.
   - Tests use an httptest fake covering both the v0.31 and 26.10 prefixes.
-- [ ] T014 [P] [US1] Implement the basic note renderer in `internal/render`. `Render(in Input, limit int) string` produces the main text (transcript, or placeholder text for `failure`/empty transcript like `(no speech recognized)`), then a blank line, then the tags line `#inbox` (tag names from config).
+- [x] T014 [P] [US1] Implement the basic note renderer in `internal/render`. `Render(in Input, limit int) string` produces the main text (transcript, or placeholder text for `failure`/empty transcript like `(no speech recognized)`), then a blank line, then the tags line `#inbox` (tag names from config).
   - It is structured so the checklist, original quote and suggested tags slot in later (FR-022 order).
   - Table tests.
-- [ ] T015 [US1] Implement the Telegram adapter in `internal/telegram` with telebot.v4 long polling, `allowed_updates=["message"]`.
+- [x] T015 [US1] Implement the Telegram adapter in `internal/telegram` with telebot.v4 long polling, `allowed_updates=["message"]`.
   - Ingest handler:
     - Drop non-allowlisted senders silently (FR-002).
     - Voice/audio (including forwarded) becomes `kind=audio` with `file_id`, `mime_type` and `file_size`. A `file_size` over 20 MB gets the reply `⚠ too large for Telegram bots (max 20 MB) — not saved.` and no insert.
@@ -119,7 +119,7 @@ packages are in `internal/` (see plan.md Structure).
   - `Replier.Edit(chat, msgID, text)` falls back to a new silent reply if the edit is impossible. `Downloader.Download(file_id)` returns the bytes.
   - All sends and edits use `DisableNotification: true` (FR-026). Texts come from contracts/telegram-ux.md.
   - Logic is tested via small interfaces and a fake bot API.
-- [ ] T016 [US1] Implement the step handlers in `internal/pipeline/steps.go`.
+- [x] T016 [US1] Implement the step handlers in `internal/pipeline/steps.go`.
   - `download`: writes `$DATA_DIR/audio/<id>.ogg` and sets `audio_path`. If `reply_message_id` is NULL, it then sends the silent ⏳ and records the id, so the acknowledgement always follows local persistence (Constitution VI).
   - `transcribe`: no language rules yet; uses `SOURCE_LANGUAGES` only when it has exactly one entry.
   - `enrich`: pass-through with `llm_skipped='disabled'`.
@@ -127,7 +127,7 @@ packages are in `internal/` (see plan.md Structure).
   - `finalize_reply`: `✓ saved · open`, or `⚠ saved audio only — <reason> · open` when `failure` is set.
   - `cleanup`: deletes the audio file and NULLs `text`, `language`, `enriched_json`, `audio_path`, `file_id` (FR-012).
   - Tests use fakes.
-- [ ] T017 [US1] Wire `run` in `cmd/voicenotes/main.go` by explicit construction, with no fx: config → zap logger → store → clients → worker → Telegram poller, plus graceful shutdown on SIGTERM. `.env.dist` gets anonymised example values (example.org, fake token and IDs).
+- [x] T017 [US1] Wire `run` in `cmd/voicenotes/main.go` by explicit construction, with no fx: config → zap logger → store → clients → worker → Telegram poller, plus graceful shutdown on SIGTERM. `.env.dist` gets anonymised example values (example.org, fake token and IDs).
 
 **Checkpoint**: the MVP works end to end when all dependencies are up.
 

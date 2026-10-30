@@ -27,11 +27,20 @@ const DBFile = "voicenotes.db"
 // Sentinel errors.
 var (
 	// ErrDuplicate means a capture with the same (source, chat, message)
-	// identity already exists.
-	ErrDuplicate = errors.New("sqlite: duplicate capture")
+	// identity already exists. It reports Duplicate() true, which is how
+	// pipeline.Ingest recognises it without importing this package.
+	ErrDuplicate error = duplicateError{}
 	// ErrNotFound means the capture to update does not exist.
 	ErrNotFound = errors.New("sqlite: capture not found")
 )
+
+// duplicateError is the type of ErrDuplicate.
+type duplicateError struct{}
+
+func (duplicateError) Error() string { return "sqlite: duplicate capture" }
+
+// Duplicate marks the error as a duplicate insert.
+func (duplicateError) Duplicate() bool { return true }
 
 // Store is the capture queue used by ingest, the worker and health.
 // Optional columns map to the zero value of the field: NULL reads back as
@@ -49,8 +58,13 @@ type Store interface {
 	// empty queue OK is false and WakeAt is the zero time.
 	NextDue(ctx context.Context, now time.Time) (capture.Due, error)
 	// Update persists every mutable field of c, returning ErrNotFound if
-	// c.ID does not exist.
+	// c.ID does not exist. A zero ReplyMessageID keeps the stored one: a
+	// worker copy read before ingest recorded the reply must not erase it.
 	Update(ctx context.Context, c capture.Capture) error
+	// SetReplyMessageID records the reply to edit, touching no other
+	// column, so it cannot race the worker's step updates. A reply already
+	// recorded is kept. It returns ErrNotFound if id does not exist.
+	SetReplyMessageID(ctx context.Context, id, msgID int64) error
 	// OldestUnfinished returns the unfinished capture with the lowest ID,
 	// due or not; ok is false when the queue is empty.
 	OldestUnfinished(ctx context.Context) (c capture.Capture, ok bool, err error)
@@ -195,7 +209,7 @@ func (s *DB) Update(ctx context.Context, c capture.Capture) error {
 	res, err := s.db.ExecContext(ctx, `UPDATE captures SET
 kind=?, received_at=?, file_id=?, file_size=?, mime_type=?, audio_path=?, text=?,
 language=?, enriched_json=?, llm_skipped=?, failure=?, note_name=?, note_url=?,
-task_count=?, reply_message_id=?, step=?, status=?, waiting_on=?, attempts=?,
+task_count=?, reply_message_id=COALESCE(?, reply_message_id), step=?, status=?, waiting_on=?, attempts=?,
 next_attempt_at=?, updated_at=?, misconfig=?, last_error=?, queue_reply_edit=?,
 minimal_note=?, send_new_reply=?, enrich_started_at=?
 WHERE id=?`,
@@ -214,6 +228,23 @@ WHERE id=?`,
 	n, err := res.RowsAffected()
 	if err != nil {
 		return fmt.Errorf("sqlite: update capture %d: %w", c.ID, err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+
+	return nil
+}
+
+func (s *DB) SetReplyMessageID(ctx context.Context, id, msgID int64) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE captures SET reply_message_id=COALESCE(reply_message_id, ?) WHERE id=?`, msgID, id)
+	if err != nil {
+		return fmt.Errorf("sqlite: set reply of capture %d: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("sqlite: set reply of capture %d: %w", id, err)
 	}
 	if n == 0 {
 		return ErrNotFound

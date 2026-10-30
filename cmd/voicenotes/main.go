@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	"github.com/Toshik1978/voicenotes/internal/config"
 )
 
 // Set via -ldflags "-X main.Buildstamp=... -X main.Commit=...".
@@ -22,7 +24,7 @@ func main() {
 
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		_, _ = fmt.Fprintln(stderr, "usage: voicenotes <version|run> (run is not implemented yet)")
+		_, _ = fmt.Fprintln(stderr, "usage: voicenotes <version|run>")
 		return 2
 	}
 
@@ -30,6 +32,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "version":
 		_, _ = fmt.Fprintf(stdout, "VoiceNotes %s (commit %s, built %s)\n", Version, Commit, Buildstamp)
 		return 0
+	case "run":
+		ctx, stop := notifyContext()
+		defer stop()
+
+		return runService(ctx, config.Load, stderr)
 	default:
 		_, _ = fmt.Fprintf(stderr, "unknown command %q\nusage: voicenotes <version|run>\n", args[0])
 		return 2

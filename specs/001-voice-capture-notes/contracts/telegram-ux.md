@@ -13,8 +13,10 @@ only message sent with sound. All text is plain or HTML-escaped. Lines are kept 
 | Done with tasks | `✓ saved · 2 tasks · <a href="URL">open</a>` |
 | Done, LLM skipped | `✓ saved (no AI) · <a href="URL">open</a>` |
 | Done with placeholder (permanent failure) | `⚠ saved audio only — <short reason> · <a href="URL">open</a>` |
+| Done, audio could not be attached (Memos rejected it) | `⚠ saved, audio not attached — <short reason> · <a href="URL">open</a>` |
 | Unsupported message type | `VoiceNotes takes voice or text only.` |
 | File over 20 MB | `⚠ too large for Telegram bots (max 20 MB) — not saved.` |
+| Storing the capture failed (not a duplicate) | `⚠ not saved — please send it again.` |
 | Non-allowlisted sender | *(no reply)* |
 
 If the edit fails because the reply was deleted or is too old, a new silent reply is sent with the

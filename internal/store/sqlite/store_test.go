@@ -266,3 +266,68 @@ func TestDurablePragmas(t *testing.T) {
 		t.Fatalf("synchronous=%d, want 2 (FULL): commits must fsync", v)
 	}
 }
+
+func TestErrDuplicateReportsDuplicate(t *testing.T) {
+	d, ok := errors.AsType[interface {
+		error
+		Duplicate() bool
+	}](sqlite.ErrDuplicate)
+	if !ok || !d.Duplicate() {
+		t.Fatal("ErrDuplicate must expose Duplicate() true")
+	}
+}
+
+func TestSetReplyMessageID(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+
+	c := newCapture(t, 1)
+	if err := s.Insert(ctx, &c); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetReplyMessageID(ctx, c.ID, 77); err != nil {
+		t.Fatal(err)
+	}
+	// A second reply never replaces the first one.
+	if err := s.SetReplyMessageID(ctx, c.ID, 88); err != nil {
+		t.Fatal(err)
+	}
+	d, err := s.NextDue(ctx, ts0())
+	if err != nil || !d.OK {
+		t.Fatalf("ok=%v err=%v", d.OK, err)
+	}
+	if d.Capture.ReplyMessageID != 77 {
+		t.Fatalf("reply = %d, want 77", d.Capture.ReplyMessageID)
+	}
+	if err := s.SetReplyMessageID(ctx, 999, 1); !errors.Is(err, sqlite.ErrNotFound) {
+		t.Fatalf("unknown id: want ErrNotFound, got %v", err)
+	}
+}
+
+// TestUpdateKeepsReplyMessageID covers the ingest/worker race: the worker
+// may persist a copy read before ingest recorded the reply, and that stale
+// zero must not erase it.
+func TestUpdateKeepsReplyMessageID(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+
+	c := newCapture(t, 1)
+	if err := s.Insert(ctx, &c); err != nil {
+		t.Fatal(err)
+	}
+	stale := c
+	if err := s.SetReplyMessageID(ctx, c.ID, 77); err != nil {
+		t.Fatal(err)
+	}
+	stale.Step = capture.StepTranscribe
+	if err := s.Update(ctx, stale); err != nil {
+		t.Fatal(err)
+	}
+	d, err := s.NextDue(ctx, ts0())
+	if err != nil || !d.OK {
+		t.Fatalf("ok=%v err=%v", d.OK, err)
+	}
+	if d.Capture.ReplyMessageID != 77 || d.Capture.Step != capture.StepTranscribe {
+		t.Fatalf("got reply %d step %s, want 77 transcribe", d.Capture.ReplyMessageID, d.Capture.Step)
+	}
+}

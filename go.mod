@@ -5,6 +5,7 @@ go 1.27
 require (
 	github.com/caarlos0/env/v11 v11.4.1
 	go.uber.org/zap v1.28.0
+	gopkg.in/telebot.v4 v4.0.0-beta.10
 	modernc.org/sqlite v1.61.0
 )
 

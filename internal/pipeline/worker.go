@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -61,7 +62,7 @@ func steps() []capture.Step {
 }
 
 // Worker is the single pipeline loop. Run must be called at most once at a
-// time; Wake and Alive are safe from any goroutine.
+// time; Wake, HoldAck and Alive are safe from any goroutine.
 type Worker struct {
 	store    Store
 	clock    Clock
@@ -71,6 +72,9 @@ type Worker struct {
 
 	wake  chan struct{}
 	alive atomic.Bool
+	// holds are the acknowledgements in flight (see HoldAck).
+	holdsMu sync.Mutex
+	holds   map[*ackHold]struct{}
 
 	// pending is a step result that could not be persisted yet. It is
 	// retried before any new step runs, so a completed step is never re-run
@@ -116,6 +120,7 @@ func New(
 		handlers: hs,
 		log:      log,
 		wake:     make(chan struct{}, 1),
+		holds:    map[*ackHold]struct{}{},
 	}, nil
 }
 
@@ -126,6 +131,47 @@ func (w *Worker) Wake() {
 	select {
 	case w.wake <- struct{}{}:
 	default:
+	}
+}
+
+// AckHoldLimit bounds how long HoldAck keeps the worker off a capture. It
+// exceeds one Bot API call (a minute) plus a single-row write, so a live
+// acknowledgement always finishes first; it only matters if one hangs.
+const AckHoldLimit = 2 * time.Minute
+
+// sourceKey is a capture's source identity, known before its row exists.
+type sourceKey struct {
+	source        string
+	chat, message int64
+}
+
+func keyOf(c capture.Capture) sourceKey {
+	return sourceKey{source: c.Source, chat: c.SourceChatID, message: c.SourceMessageID}
+}
+
+// ackHold is one in-flight acknowledgement.
+type ackHold struct {
+	key   sourceKey
+	until time.Time
+}
+
+// HoldAck keeps the worker off the capture with c's source identity while
+// its acknowledgement is in flight, so finalize_reply edits that reply
+// instead of sending a second one (FR-025). Call it before the insert, so no
+// scan sees the row unheld. The hold ends when release is called (which
+// wakes the worker) or after AckHoldLimit. Holds live only in memory, so a
+// restart cannot leave a capture blocked.
+func (w *Worker) HoldAck(c capture.Capture) (release func()) {
+	h := &ackHold{key: keyOf(c), until: w.clock.Now().Add(AckHoldLimit)}
+	w.holdsMu.Lock()
+	w.holds[h] = struct{}{}
+	w.holdsMu.Unlock()
+
+	return func() {
+		w.holdsMu.Lock()
+		delete(w.holds, h)
+		w.holdsMu.Unlock()
+		w.Wake()
 	}
 }
 
@@ -172,6 +218,12 @@ func (w *Worker) iterate(ctx context.Context) time.Duration {
 	}
 
 	c := due.Capture
+	if d := w.heldFor(c, now); d > 0 {
+		// Its acknowledgement is in flight; release wakes the worker.
+		w.log.Debug("waiting for the acknowledgement", zap.Int64("capture", c.ID))
+
+		return d
+	}
 	next, out := w.run(ctx, c)
 	next.ID, next.Step = c.ID, c.Step
 	if ctx.Err() != nil {
@@ -245,4 +297,20 @@ func (w *Worker) sleep(ctx context.Context, d time.Duration) bool {
 	}
 
 	return true
+}
+
+// heldFor returns how long c is still held, or 0 when it is free.
+func (w *Worker) heldFor(c capture.Capture, now time.Time) time.Duration {
+	w.holdsMu.Lock()
+	defer w.holdsMu.Unlock()
+
+	var d time.Duration
+	key := keyOf(c)
+	for h := range w.holds {
+		if h.key == key {
+			d = max(d, h.until.Sub(now))
+		}
+	}
+
+	return d
 }
