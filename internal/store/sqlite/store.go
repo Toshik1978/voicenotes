@@ -270,6 +270,30 @@ func (s *DB) OldestUnfinished(ctx context.Context) (capture.Capture, bool, error
 		" FROM captures WHERE status != 'done' ORDER BY id LIMIT 1")
 }
 
+// AudioPaths returns the audio file names referenced by any capture row,
+// finished or not, in insertion order.
+func (s *DB) AudioPaths(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		"SELECT audio_path FROM captures WHERE audio_path IS NOT NULL AND audio_path != '' ORDER BY id")
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: list audio paths: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, fmt.Errorf("sqlite: list audio paths: %w", err)
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlite: list audio paths: %w", err)
+	}
+
+	return out, nil
+}
+
 func (s *DB) PurgeDone(ctx context.Context, olderThan time.Time) (int64, error) {
 	res, err := s.db.ExecContext(ctx,
 		"DELETE FROM captures WHERE status = 'done' AND updated_at < ?", ts(olderThan))

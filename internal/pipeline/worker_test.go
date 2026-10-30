@@ -440,3 +440,70 @@ func TestHandlerCannotChangeIdentityOrStep(t *testing.T) {
 		})
 	}
 }
+
+func TestWorkerQueuesReplyEditOnceAndClearsFlag(t *testing.T) {
+	c := textCapture(t, 1)
+	c.Step, c.ReplyMessageID = capture.StepWriteNote, 42
+	store := newFakeStore(c)
+	clock := newFakeClock(t0())
+	h := allSteps(func(_ context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
+		return c, capture.Temporary("down").On(capture.WaitingMemos)
+	})
+	w := newWorker(t, store, clock, h)
+	var notified []capture.Capture
+	var mu sync.Mutex
+	w.SetQueueNotifier(func(_ context.Context, c capture.Capture) capture.Capture {
+		mu.Lock()
+		notified = append(notified, c)
+		mu.Unlock()
+		c.QueueReplyEdit = false
+
+		return c
+	})
+	start(t, w)
+
+	first := store.awaitUpdate(t)
+	if !first.QueueReplyEdit || first.Status != capture.StatusWaiting {
+		t.Fatalf("first update = %+v, want waiting with the flag persisted first", first)
+	}
+	if second := store.awaitUpdate(t); second.QueueReplyEdit {
+		t.Fatal("flag not cleared durably after the edit")
+	}
+	// Advance only once the retry timer exists, or it never fires.
+	clock.awaitSleep(t)
+
+	// A later retry stays waiting and must not edit again.
+	clock.Advance(10 * time.Minute)
+	if u := store.awaitUpdate(t); u.QueueReplyEdit || u.Attempts != 2 {
+		t.Fatalf("retry update = %+v, want attempt 2 without a new edit", u)
+	}
+	store.awaitIdle(t)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(notified) != 1 {
+		t.Errorf("notifier calls = %d, want 1", len(notified))
+	}
+}
+
+func TestWorkerCatchesUpQueuedEditAfterRestart(t *testing.T) {
+	c := textCapture(t, 1)
+	c.Status, c.QueueReplyEdit, c.WaitingOn = capture.StatusWaiting, true, capture.WaitingSTT
+	store := newFakeStore(c)
+	rec := &recorder{}
+	w := newWorker(t, store, newFakeClock(t0()), rec.handlers())
+	calls := 0
+	w.SetQueueNotifier(func(_ context.Context, c capture.Capture) capture.Capture {
+		calls++
+		c.QueueReplyEdit = false
+
+		return c
+	})
+	start(t, w)
+
+	if u := store.awaitUpdate(t); u.QueueReplyEdit {
+		t.Fatal("flag not cleared")
+	}
+	if calls != 1 {
+		t.Errorf("notifier calls = %d, want 1", calls)
+	}
+}

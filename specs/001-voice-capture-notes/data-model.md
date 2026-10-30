@@ -61,6 +61,10 @@ text:                          enrich → write_note → finalize_reply → clea
 - `cleanup` deletes the audio file and NULLs `text`, `language`, `enriched_json`, `audio_path`,
   `file_id`. The row (IDs only) remains for dedupe.
 - **Purge**: rows with `status='done'` and `updated_at < now − 30 days` are deleted daily.
+- **Orphan audio sweep**: at startup, before the worker and the Telegram poller run, files in
+  `$DATA_DIR/audio` that no row references via `audio_path` and that are older than 1 hour are
+  deleted. A crash between writing a file and committing its row (or between the temp file and
+  its rename) leaves such files; only counts are logged.
 - **Ingest invariant** (Constitution VI, research R2): for audio, the file is written and the row
   committed with `audio_path` set *before* ⏳ is sent. If the Telegram download fails, the row is
   committed with only `file_id` at `step=download` and no reply is sent; the `download` step sends

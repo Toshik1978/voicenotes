@@ -21,7 +21,12 @@ func TestRender(t *testing.T) {
 		{
 			"failure",
 			func(i Input) Input { i.Text = "ignored"; i.Failure = "speech-to-text rejected the audio"; return i },
-			"(audio saved without text: speech-to-text rejected the audio)\n\n#inbox",
+			"(not transcribed: speech-to-text rejected the audio)\n\n#inbox",
+		},
+		{
+			"failure without audio",
+			func(i Input) Input { i.Failure, i.NoAudio = "audio unavailable from Telegram", true; return i },
+			"(no audio or text: audio unavailable from Telegram)\n\n#inbox",
 		},
 		{"custom inbox tag", func(i Input) Input { i.Text = "x"; i.InboxTag = "capture"; return i }, "x\n\n#capture"},
 		{"checklist and todo tag", func(i Input) Input {

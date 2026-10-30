@@ -554,8 +554,18 @@ func TestFinalizeReply(t *testing.T) {
 		{"one task", func(c *capture.Capture) { c.TaskCount = 1 }, "✓ saved · 1 task · " + link},
 		{
 			"failure",
-			func(c *capture.Capture) { c.Failure = "http 415 <x>" },
+			func(c *capture.Capture) { c.Failure, c.AudioPath = "http 415 <x>", "5.ogg" },
 			"⚠ saved audio only — http 415 &lt;x&gt; · " + link,
+		},
+		{
+			"failure without audio",
+			func(c *capture.Capture) { c.Failure = "audio unavailable <x>" },
+			"⚠ audio not kept — audio unavailable &lt;x&gt; · please send it again · " + link,
+		},
+		{
+			"failure with audio dropped by a minimal note",
+			func(c *capture.Capture) { c.Failure, c.AudioPath, c.MinimalNote = "http 415", "5.ogg", true },
+			"⚠ audio not kept — http 415 · please send it again · " + link,
 		},
 	}
 	for _, tt := range tests {
@@ -756,6 +766,137 @@ func TestAttachFailureKeepsTextAndSaysSo(t *testing.T) {
 	})
 }
 
+func TestQueuedText(t *testing.T) {
+	tests := []struct {
+		on   capture.WaitingOn
+		want string
+	}{
+		{capture.WaitingSTT, "⏳ queued — speech-to-text unavailable, will retry"},
+		{capture.WaitingMemos, "⏳ queued — notes unavailable, will retry"},
+		{capture.WaitingTelegram, "⏳ queued — Telegram unavailable, will retry"},
+		{"", "⏳ queued — will retry"},
+	}
+	for _, tt := range tests {
+		if got := pipeline.QueuedText(tt.on); got != tt.want {
+			t.Errorf("QueuedText(%q) = %q, want %q", tt.on, got, tt.want)
+		}
+	}
+}
+
+func TestQueueNotifier(t *testing.T) {
+	waiting := func() capture.Capture {
+		return capture.Capture{
+			ID: 1, SourceChatID: 5, ReplyMessageID: 42, Status: capture.StatusWaiting,
+			WaitingOn: capture.WaitingSTT, QueueReplyEdit: true,
+		}
+	}
+	t.Run("edits the hourglass and clears the flag", func(t *testing.T) {
+		rep := &fakeReplier{}
+		got := pipeline.NewQueueNotifier(rep, nil)(context.Background(), waiting())
+		if len(rep.edits) != 1 || rep.edits[0].msg != 42 || rep.edits[0].chat != 5 ||
+			rep.edits[0].text != "⏳ queued — speech-to-text unavailable, will retry" {
+			t.Fatalf("edits = %+v", rep.edits)
+		}
+		if got.QueueReplyEdit || got.ReplyMessageID != 42 {
+			t.Errorf("got flag=%v reply=%d", got.QueueReplyEdit, got.ReplyMessageID)
+		}
+	})
+	t.Run("records the id of a fallback reply", func(t *testing.T) {
+		rep := &fakeReplier{editID: 99}
+		got := pipeline.NewQueueNotifier(rep, nil)(context.Background(), waiting())
+		if got.ReplyMessageID != 99 {
+			t.Errorf("reply = %d, want 99", got.ReplyMessageID)
+		}
+	})
+	t.Run("failed edit is dropped and flag cleared", func(t *testing.T) {
+		rep := &fakeReplier{editErr: errors.New("boom")}
+		got := pipeline.NewQueueNotifier(rep, nil)(context.Background(), waiting())
+		if got.QueueReplyEdit || got.ReplyMessageID != 42 {
+			t.Errorf("got flag=%v reply=%d", got.QueueReplyEdit, got.ReplyMessageID)
+		}
+	})
+	t.Run("no reply to edit", func(t *testing.T) {
+		rep := &fakeReplier{}
+		c := waiting()
+		c.ReplyMessageID = 0
+		got := pipeline.NewQueueNotifier(rep, nil)(context.Background(), c)
+		if len(rep.edits)+len(rep.sends) != 0 || got.QueueReplyEdit {
+			t.Errorf("edits=%v sends=%v flag=%v", rep.edits, rep.sends, got.QueueReplyEdit)
+		}
+	})
+}
+
+// drive runs the real handlers through the real Policy until the capture is
+// done or maxRuns attempts have passed, returning the final capture.
+func (r *rig) drive(c capture.Capture, maxRuns int) capture.Capture {
+	pol := capture.Policy{MaxInterval: time.Minute}
+	now := c.ReceivedAt
+	c.Step = capture.StepDownload
+	for i := 0; i < maxRuns && c.Step != capture.StepDone; i++ {
+		got, out := r.run(c.Step, c)
+		c = pol.Next(got, out, now)
+		now = now.Add(time.Hour)
+	}
+
+	return c
+}
+
+func TestPermanentFailurePlaceholder(t *testing.T) {
+	t.Run("transcribe permanent keeps audio and names the failure", func(t *testing.T) {
+		r := newRig(t)
+		r.tr.out = capture.Permanent("http 415").On(capture.WaitingSTT)
+		got := r.drive(base(), 10)
+		if got.Step != capture.StepDone || len(r.notes.created) != 1 {
+			t.Fatalf("step %v notes %d", got.Step, len(r.notes.created))
+		}
+		if c := r.notes.created[0].Content; !strings.Contains(c, "http 415") || !strings.Contains(c, "#inbox") {
+			t.Errorf("content %q", c)
+		}
+		if len(r.notes.attached) != 1 || string(r.notes.attached[0].data) != "OGG" {
+			t.Errorf("attached %+v", r.notes.attached)
+		}
+		if len(r.rep.edits) != 1 || !strings.HasPrefix(r.rep.edits[0].text, "⚠ saved audio only — http 415") {
+			t.Errorf("edits %+v", r.rep.edits)
+		}
+	})
+	t.Run("download permanent has no audio to attach", testDownloadPermanentPlaceholder)
+}
+
+func TestPermanentWriteNote(t *testing.T) {
+	t.Run("write_note permanent retries once as minimal then waits", func(t *testing.T) {
+		r := newRig(t)
+		r.tr.res = pipeline.TranscribeResult{Text: "buy milk"}
+		r.notes.createOut = capture.Permanent("http 400").On(capture.WaitingMemos)
+		got := r.drive(base(), 6)
+		if got.Step != capture.StepWriteNote || got.Status != capture.StatusWaiting ||
+			got.WaitingOn != capture.WaitingMemos {
+			t.Fatalf("got step %v status %v on %v", got.Step, got.Status, got.WaitingOn)
+		}
+		if !got.MinimalNote || len(r.notes.created) < 2 || len(r.notes.attached) != 0 {
+			t.Errorf("minimal %v created %d attached %d", got.MinimalNote, len(r.notes.created), len(r.notes.attached))
+		}
+	})
+	t.Run("placeholder minimal note has no attachment and says so", func(t *testing.T) {
+		r := newRig(t)
+		r.tr.out = capture.Permanent("http 415").On(capture.WaitingSTT)
+		r.notes.attachOut = capture.Permanent("http 413").On(capture.WaitingMemos)
+		got := r.drive(base(), 10)
+		if got.Step != capture.StepDone || len(r.notes.created) != 2 {
+			t.Fatalf("step %v created %d", got.Step, len(r.notes.created))
+		}
+		last := r.notes.created[1].Content
+		if !strings.Contains(last, "http 415") || !strings.Contains(last, "#inbox") || len(r.notes.attached) != 1 {
+			t.Errorf("content %q attached %d", last, len(r.notes.attached))
+		}
+		if len(r.rep.edits) != 1 || !strings.HasPrefix(r.rep.edits[0].text, "⚠ audio not kept — http 415") {
+			t.Errorf("edits %+v", r.rep.edits)
+		}
+		if first := r.notes.created[0].Content; !strings.HasPrefix(first, "(not transcribed: http 415)") {
+			t.Errorf("full note content %q", first)
+		}
+	})
+}
+
 func TestTranscribeSendsTheStoredExtension(t *testing.T) {
 	for _, tt := range []struct{ path, want string }{{"5.mp3", ".mp3"}, {"5.ogg", ".ogg"}} {
 		r := newRig(t)
@@ -765,6 +906,72 @@ func TestTranscribeSendsTheStoredExtension(t *testing.T) {
 		if _, out := r.run(capture.StepTranscribe, c); out.Class != capture.ClassOK || r.tr.req.Ext != tt.want {
 			t.Errorf("%s: out %+v ext %q, want %q", tt.path, out, r.tr.req.Ext, tt.want)
 		}
+	}
+}
+
+// TestPlaceholderWithoutAudio covers the permanent failures that leave no
+// audio anywhere: the note and the reply must not claim it was kept.
+func TestPlaceholderWithoutAudio(t *testing.T) {
+	t.Run("download permanent", func(t *testing.T) {
+		r := newRig(t)
+		r.dl.err = pipeline.ErrRejected
+		got := r.drive(base(), 10)
+		if got.Step != capture.StepDone || len(r.notes.created) != 1 || len(r.notes.attached) != 0 {
+			t.Fatalf("step %v created %d attached %d", got.Step, len(r.notes.created), len(r.notes.attached))
+		}
+		want := "(no audio or text: audio unavailable from Telegram)\n\n#inbox"
+		if c := r.notes.created[0].Content; c != want {
+			t.Errorf("content %q, want %q", c, want)
+		}
+		if len(r.rep.sends) != 1 ||
+			!strings.HasPrefix(
+				r.rep.sends[0].text,
+				"⚠ audio not kept — audio unavailable from Telegram · please send it again · ",
+			) {
+			t.Errorf("sends %+v", r.rep.sends)
+		}
+	})
+	t.Run("audio file missing at transcribe forgets the path", func(t *testing.T) {
+		r := newRig(t)
+		r.audio.files = map[string][]byte{}
+		c := base()
+		c.AudioPath = "5.ogg"
+		got, out := r.run(capture.StepTranscribe, c)
+		if out.Class != capture.ClassPermanent || got.AudioPath != "" {
+			t.Errorf("out %+v path %q", out, got.AudioPath)
+		}
+	})
+	t.Run("stale path with a permanent download forgets the path", func(t *testing.T) {
+		r := newRig(t)
+		r.dl.err = pipeline.ErrFileTooLarge
+		c := base()
+		c.AudioPath = "5.ogg"
+		got, out := r.run(capture.StepDownload, c)
+		if out.Class != capture.ClassPermanent || got.AudioPath != "" {
+			t.Errorf("out %+v path %q", out, got.AudioPath)
+		}
+	})
+	t.Run("audio file missing at attach forgets the path", func(t *testing.T) {
+		r := newRig(t)
+		c := base()
+		c.AudioPath, c.Failure = "5.ogg", "http 415"
+		got, out := r.run(capture.StepWriteNote, c)
+		if out.Class != capture.ClassOK || got.AudioPath != "" || len(r.notes.attached) != 0 {
+			t.Errorf("out %+v path %q attached %d", out, got.AudioPath, len(r.notes.attached))
+		}
+	})
+}
+
+func testDownloadPermanentPlaceholder(t *testing.T) {
+	r := newRig(t)
+	r.dl.err = pipeline.ErrFileTooLarge
+	got := r.drive(base(), 10)
+	if got.Step != capture.StepDone || len(r.notes.created) != 1 || len(r.notes.attached) != 0 {
+		t.Fatalf("step %v created %d attached %d", got.Step, len(r.notes.created), len(r.notes.attached))
+	}
+	if !strings.Contains(r.notes.created[0].Content, "audio too large") ||
+		!strings.Contains(r.notes.created[0].Content, "#inbox") {
+		t.Errorf("content %q", r.notes.created[0].Content)
 	}
 }
 

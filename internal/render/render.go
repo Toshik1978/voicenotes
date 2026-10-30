@@ -31,6 +31,9 @@ type Input struct {
 	// Failure is a short reason for a permanent step failure. When set, the
 	// main text becomes a placeholder naming it and Text is ignored.
 	Failure string
+	// NoAudio marks a note that carries no audio attachment. With Failure
+	// set, the placeholder then says that neither audio nor text was kept.
+	NoAudio bool
 	// InboxTag and TodoTag are tag names without "#", from configuration.
 	InboxTag string
 	TodoTag  string
@@ -91,8 +94,11 @@ func Render(in Input, limit int) string {
 }
 
 func mainText(in Input) string {
+	if in.Failure != "" && in.NoAudio {
+		return "(no audio or text: " + in.Failure + ")"
+	}
 	if in.Failure != "" {
-		return "(audio saved without text: " + in.Failure + ")"
+		return "(not transcribed: " + in.Failure + ")"
 	}
 	if t := strings.TrimSpace(in.Text); t != "" {
 		return t

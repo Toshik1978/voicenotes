@@ -69,6 +69,7 @@ type Worker struct {
 	policy   capture.Policy
 	handlers map[capture.Step]Handler
 	log      *zap.Logger
+	notify   QueueNotifier
 
 	wake  chan struct{}
 	alive atomic.Bool
@@ -123,6 +124,10 @@ func New(
 		holds:    map[*ackHold]struct{}{},
 	}, nil
 }
+
+// SetQueueNotifier installs the hook that edits the reply of a capture that
+// just went into waiting. Call it before Run; without one no edit happens.
+func (w *Worker) SetQueueNotifier(n QueueNotifier) { w.notify = n }
 
 // Wake asks the worker to re-check the queue now, typically after ingest
 // inserted a capture. It never blocks, and wakes that arrive while one is
@@ -224,6 +229,17 @@ func (w *Worker) iterate(ctx context.Context) time.Duration {
 
 		return d
 	}
+	if c.QueueReplyEdit && w.notify != nil {
+		// The edit was owed but the service stopped before it was sent.
+		return w.queueNotice(ctx, c)
+	}
+
+	return w.step(ctx, c)
+}
+
+// step runs the capture's current step, applies the policy and persists the
+// result, then sends the queued notice if the capture just went into waiting.
+func (w *Worker) step(ctx context.Context, c capture.Capture) time.Duration {
 	next, out := w.run(ctx, c)
 	next.ID, next.Step = c.ID, c.Step
 	if ctx.Err() != nil {
@@ -236,6 +252,24 @@ func (w *Worker) iterate(ctx context.Context) time.Duration {
 		zap.Int64("capture", c.ID), zap.Stringer("step", c.Step),
 		zap.Stringer("outcome", out.Class), zap.String("reason", out.Reason))
 	w.pending = &res
+	if d := w.persist(ctx); d != 0 || !res.QueueReplyEdit || w.notify == nil {
+		return d
+	}
+
+	return w.queueNotice(ctx, res)
+}
+
+// queueNotice edits the reply of a capture whose waiting state, with
+// QueueReplyEdit set, is already persisted, then persists the cleared flag
+// so retries and restarts do not edit again. A failed edit is not retried
+// (see QueueNotifier), so it can never block or lose the capture.
+func (w *Worker) queueNotice(ctx context.Context, c capture.Capture) time.Duration {
+	done := w.notify(ctx, c)
+	done.ID, done.Step, done.QueueReplyEdit = c.ID, c.Step, false
+	if ctx.Err() != nil {
+		return 0
+	}
+	w.pending = &done
 
 	return w.persist(ctx)
 }

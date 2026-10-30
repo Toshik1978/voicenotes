@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -23,14 +22,6 @@ import (
 	"github.com/Toshik1978/voicenotes/internal/pipeline"
 	"github.com/Toshik1978/voicenotes/internal/store/sqlite"
 	"github.com/Toshik1978/voicenotes/internal/telegram"
-)
-
-const (
-	// doneRetention is how long finished captures stay for dedupe
-	// (data-model "Purge").
-	doneRetention = 30 * 24 * time.Hour
-	// purgeInterval is how often done rows are purged (daily).
-	purgeInterval = 24 * time.Hour
 )
 
 // runService loads the configuration, wires the service and runs it until
@@ -122,6 +113,11 @@ func build(cfg config.Config, log *zap.Logger) (*service, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open store: %w", err)
 	}
+	// Before the worker and the poller start, so nothing writes audio yet.
+	// Best effort: a failure deletes nothing and never blocks startup.
+	if _, serr := pipeline.SweepOrphanAudio(context.Background(), audioDir, db, time.Now(), log); serr != nil {
+		log.Warn("orphan audio sweep skipped", zap.Error(serr))
+	}
 	svc, err := wire(cfg, log, db, audioDir)
 	if err != nil {
 		_ = db.Close()
@@ -164,6 +160,7 @@ func wire(cfg config.Config, log *zap.Logger, db *sqlite.DB, audioDir string) (*
 	if err != nil {
 		return nil, fmt.Errorf("worker: %w", err)
 	}
+	worker.SetQueueNotifier(pipeline.NewQueueNotifier(tg, log))
 	ingester, err := pipeline.NewIngester(db, worker)
 	if err != nil {
 		return nil, fmt.Errorf("ingester: %w", err)
@@ -184,43 +181,8 @@ func wire(cfg config.Config, log *zap.Logger, db *sqlite.DB, audioDir string) (*
 	return &service{goroutines: []func(context.Context){
 		func(ctx context.Context) { tg.Run(ctx, handler) },
 		worker.Run,
-		func(ctx context.Context) { purgeLoop(ctx, db, purgeInterval, time.Now, log) },
+		func(ctx context.Context) { pipeline.PurgeLoop(ctx, db, pipeline.PurgeInterval, time.Now, log) },
 	}}, nil
-}
-
-// purger deletes finished captures last updated before a cutoff.
-type purger interface {
-	PurgeDone(ctx context.Context, olderThan time.Time) (int64, error)
-}
-
-// purgeLoop purges done rows older than doneRetention once at start and then
-// every interval, until ctx is cancelled. A nil log means no logging.
-func purgeLoop(ctx context.Context, p purger, interval time.Duration, now func() time.Time, log *zap.Logger) {
-	if log == nil {
-		log = zap.NewNop()
-	}
-	purge := func() {
-		n, err := p.PurgeDone(ctx, now().Add(-doneRetention))
-		switch {
-		case errors.Is(err, context.Canceled):
-		case err != nil:
-			log.Error("purge failed", zap.Error(err))
-		case n > 0:
-			log.Info("purged finished captures", zap.Int64("count", n))
-		}
-	}
-
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	purge()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			purge()
-		}
-	}
 }
 
 // newClients builds the STT and Memos clients; each http.Client carries its

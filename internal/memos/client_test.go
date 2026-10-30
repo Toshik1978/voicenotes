@@ -629,3 +629,45 @@ func TestExplicitPrefixNeverReprobed(t *testing.T) {
 		t.Errorf("explicit prefix was probed: %v", f.calls)
 	}
 }
+
+// TestCreateRetriedAfterTimeoutYieldsOneNote covers a create the server
+// applied but whose response never reached the client: the retry must not
+// produce a second note.
+func TestCreateRetriedAfterTimeoutYieldsOneNote(t *testing.T) {
+	f := newFake("/api/v1")
+	release := make(chan struct{})
+	var first sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		slow := false
+		if r.Method == http.MethodPost && r.URL.Path == "/api/v1/memos" {
+			first.Do(func() { slow = true })
+		}
+		f.ServeHTTP(w, r) // stores the memo
+		if slow {
+			<-release // the response is lost: the client times out first
+		}
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+
+	c := NewClient(Config{
+		BaseURL: srv.URL, PublicURL: "https://memos.example.org/", Token: fakeToken,
+		APIPrefix: "/api/v1", Version: "1.2.3",
+	}, &http.Client{Timeout: 200 * time.Millisecond})
+	n := Note{CaptureID: 9, Content: "x", ReceivedAt: receivedAt()}
+
+	_, _, out := c.Create(ctx(), n)
+	if out.Class != capture.ClassTemporary {
+		t.Fatalf("timed-out create = %+v, want temporary", out)
+	}
+	name, _, out := c.Create(ctx(), n)
+	uid := MemoID(9, receivedAt())
+	if out.Class != capture.ClassOK || name != "memos/"+uid {
+		t.Fatalf("retry: name=%q out=%+v", name, out)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.memos) != 1 {
+		t.Errorf("memos = %d, want 1", len(f.memos))
+	}
+}

@@ -331,3 +331,25 @@ func TestUpdateKeepsReplyMessageID(t *testing.T) {
 		t.Fatalf("got reply %d step %s, want 77 transcribe", d.Capture.ReplyMessageID, d.Capture.Step)
 	}
 }
+
+func TestAudioPaths(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+
+	a, b, none := newCapture(t, 1), newCapture(t, 2), newCapture(t, 3)
+	a.AudioPath, b.AudioPath = "tg--1001234567890-1-42.ogg", "2.ogg"
+	b.Status, b.Step = capture.StatusDone, capture.StepDone // done rows still count
+	for _, c := range []*capture.Capture{&a, &b, &none} {
+		if err := s.Insert(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.AudioPaths(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"tg--1001234567890-1-42.ogg", "2.ogg"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("AudioPaths = %v, want %v", got, want)
+	}
+}

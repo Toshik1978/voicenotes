@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
 	"github.com/Toshik1978/voicenotes/internal/config"
@@ -67,55 +70,6 @@ func TestServeReportsCloseError(t *testing.T) {
 	}
 }
 
-type fakePurger struct {
-	mu     sync.Mutex
-	cutoff []time.Time
-}
-
-func (f *fakePurger) PurgeDone(_ context.Context, olderThan time.Time) (int64, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.cutoff = append(f.cutoff, olderThan)
-
-	return 1, nil
-}
-
-func (f *fakePurger) count() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	return len(f.cutoff)
-}
-
-func TestPurgeLoopRunsAtStartAndOnTick(t *testing.T) {
-	p := &fakePurger{}
-	now := time.Date(2026, 5, 31, 12, 0, 0, 0, time.UTC)
-	ctx, cancel := context.WithCancel(context.Background())
-	finished := make(chan struct{})
-	go func() {
-		purgeLoop(ctx, p, 5*time.Millisecond, func() time.Time { return now }, nil)
-		close(finished)
-	}()
-	deadline := time.After(2 * time.Second)
-	for p.count() < 3 {
-		select {
-		case <-deadline:
-			t.Fatalf("only %d purges", p.count())
-		case <-time.After(time.Millisecond):
-		}
-	}
-	cancel()
-	<-finished
-
-	want := now.Add(-doneRetention)
-	if got := p.cutoff[0]; !got.Equal(want) {
-		t.Errorf("cutoff = %v, want %v", got, want)
-	}
-	if doneRetention != 30*24*time.Hour {
-		t.Errorf("retention = %v, want 30 days", doneRetention)
-	}
-}
-
 func TestRunServiceInvalidConfig(t *testing.T) {
 	var stderr bytes.Buffer
 	load := func() (config.Config, error) { return config.Parse(map[string]string{}) }
@@ -150,5 +104,43 @@ func TestNewLogger(t *testing.T) {
 	}
 	if _, err := newLogger("loud"); err == nil {
 		t.Error("want error for an unknown level")
+	}
+}
+
+func TestBuildSweepsAgedOrphanAudio(t *testing.T) {
+	dir := t.TempDir()
+	audio := filepath.Join(dir, "audio")
+	if err := os.MkdirAll(audio, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	orphan := filepath.Join(audio, "tg-1-2-3.ogg")
+	if err := os.WriteFile(orphan, []byte("audio"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(orphan, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.Parse(map[string]string{
+		"TELEGRAM_BOT_TOKEN":     "123456:FAKE-TOKEN",
+		"TELEGRAM_ALLOWED_USERS": "111",
+		"STT_BASE_URL":           "http://stt.example.org:8000/v1",
+		"STT_MODEL":              "whisper-1",
+		"MEMOS_URL":              "http://memos.example.org:5230",
+		"MEMOS_TOKEN":            "memos_pat_FAKE",
+		"DATA_DIR":               dir,
+	})
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	svc, err := build(cfg, zap.NewNop())
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	t.Cleanup(func() { _ = svc.closeStore() })
+
+	if _, err := os.Stat(orphan); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("aged orphan survived build: %v", err)
 	}
 }

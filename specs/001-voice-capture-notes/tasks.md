@@ -139,12 +139,12 @@ packages are in `internal/` (see plan.md Structure).
 
 **Independent Test**: quickstart scenarios 5, 6 and 8 (LLM part in US4).
 
-- [ ] T018 [US2] Implement the waiting reply edits in `internal/pipeline`. On the first transition into `waiting`, edit the reply to `⏳ queued — <speech-to-text|notes|Telegram> unavailable, will retry`, mapping `WaitingOn` to these words, then finalise later. Do not edit again on later retries. Misconfig outcomes wait like Temporary ones and never produce a placeholder (research R10).
-- [ ] T019 [US2] Implement placeholder handling for permanent failures in `internal/pipeline/steps.go`, following data-model.md:
+- [x] T018 [US2] Implement the waiting reply edits in `internal/pipeline`. On the first transition into `waiting`, edit the reply to `⏳ queued — <speech-to-text|notes|Telegram> unavailable, will retry`, mapping `WaitingOn` to these words, then finalise later. Do not edit again on later retries. Misconfig outcomes wait like Temporary ones and never produce a placeholder (research R10).
+- [x] T019 [US2] Implement placeholder handling for permanent failures in `internal/pipeline/steps.go`, following data-model.md:
   - A Permanent outcome in download, transcribe or enrich produces a note with the audio attached (when available) and a placeholder text naming the failure (FR-010).
   - A Permanent outcome in `write_note` retries once with a minimal note (placeholder plus `#inbox`, no attachment), then treats the failure as Temporary.
-- [ ] T020 [US2] Implement restart resume and dedupe guarantees in `internal/pipeline` and `internal/store/sqlite`. Unfinished captures resume at their stored step after restart. A duplicate Telegram update gets no second row and no reply. A memo create retried after a timeout yields one note (deterministic `memoId`). Tests simulate a crash between steps on a temp DB.
-- [ ] T021 [US2] Implement the daily purge in `internal/pipeline/purge.go`. It deletes `status='done'` rows whose `updated_at` is older than 30 days and runs at startup and every 24 h (FR-012).
+- [x] T020 [US2] Implement restart resume and dedupe guarantees in `internal/pipeline` and `internal/store/sqlite`. Unfinished captures resume at their stored step after restart. A duplicate Telegram update gets no second row and no reply. A memo create retried after a timeout yields one note (deterministic `memoId`). Tests simulate a crash between steps on a temp DB.
+- [x] T021 [US2] Implement the daily purge in `internal/pipeline/purge.go`. It deletes `status='done'` rows whose `updated_at` is older than 30 days and runs at startup and every 24 h (FR-012).
 
 **Checkpoint**: US1 plus outage tolerance; this is the deployable baseline.
 

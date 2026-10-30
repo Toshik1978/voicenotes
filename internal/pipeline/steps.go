@@ -176,11 +176,13 @@ func (s *stepRunner) download(ctx context.Context, c capture.Capture) (capture.C
 		data, err := s.d.Downloader.Download(ctx, c.FileID)
 		if errors.Is(err, ErrFileTooLarge) {
 			s.log(c, "audio too large to download", err)
+			c.AudioPath = "" // nothing is held: the placeholder must say so
 
 			return c, capture.Permanent("audio too large for Telegram bots")
 		}
 		if errors.Is(err, ErrRejected) {
 			s.log(c, "audio download rejected", err)
+			c.AudioPath = ""
 
 			return c, capture.Permanent("audio unavailable from Telegram")
 		}
@@ -218,6 +220,7 @@ func (s *stepRunner) transcribe(ctx context.Context, c capture.Capture) (capture
 	data, err := s.d.Audio.Read(c.AudioPath)
 	if errors.Is(err, fs.ErrNotExist) {
 		s.log(c, "audio file missing", err)
+		c.AudioPath = "" // nothing is held: the placeholder must say so
 
 		return c, capture.Permanent("audio file missing")
 	}
@@ -252,7 +255,10 @@ func (s *stepRunner) enrich(_ context.Context, c capture.Capture) (capture.Captu
 // MinimalNote keeps the text (truncated to the limit) and drops only the
 // attachment; LLM output is not rendered yet.
 func (s *stepRunner) writeNote(ctx context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
-	in := render.Input{Text: c.Text, Failure: c.Failure, InboxTag: s.cfg.InboxTag, TodoTag: s.cfg.TodoTag}
+	in := render.Input{
+		Text: c.Text, Failure: c.Failure, NoAudio: !holdsAudio(c),
+		InboxTag: s.cfg.InboxTag, TodoTag: s.cfg.TodoTag,
+	}
 	if c.MinimalNote && c.AudioPath != "" && c.Failure == "" {
 		// The full note was rejected (typically the attachment): the text
 		// stays in the note, the audio does not, and the reply says so.
@@ -292,6 +298,7 @@ func (s *stepRunner) attach(ctx context.Context, c capture.Capture) (capture.Cap
 	data, err := s.d.Audio.Read(c.AudioPath)
 	if errors.Is(err, fs.ErrNotExist) {
 		s.log(c, "audio file missing, note saved without attachment", err)
+		c.AudioPath = "" // the reply must not claim the audio was kept
 
 		return c, capture.OK()
 	}
@@ -348,6 +355,53 @@ func (s *stepRunner) reply(ctx context.Context, c capture.Capture) (capture.Capt
 	return c, capture.OK()
 }
 
+// QueueNotifier edits the reply of a capture that has just gone into waiting
+// and returns the capture with QueueReplyEdit cleared and ReplyMessageID
+// updated. It never fails: the edit is cosmetic, so an error is logged and
+// dropped rather than retried (finalize_reply replaces the text anyway).
+type QueueNotifier func(ctx context.Context, c capture.Capture) capture.Capture
+
+// NewQueueNotifier builds the QueueNotifier that edits the hourglass to the
+// queued text. A capture with no reply yet has nothing to edit; download
+// sends the hourglass later and finalize_reply covers the rest. A nil log
+// means no logging.
+func NewQueueNotifier(r Replier, log *zap.Logger) QueueNotifier {
+	if log == nil {
+		log = zap.NewNop()
+	}
+
+	return func(ctx context.Context, c capture.Capture) capture.Capture {
+		c.QueueReplyEdit = false
+		if c.ReplyMessageID == 0 {
+			return c
+		}
+		id, err := r.Edit(ctx, c.SourceChatID, c.ReplyMessageID, QueuedText(c.WaitingOn))
+		if err != nil {
+			log.Warn("queued notice failed, skipping it", zap.Int64("capture", c.ID), zap.Error(err))
+
+			return c
+		}
+		c.ReplyMessageID = id
+
+		return c
+	}
+}
+
+// QueuedText is the reply for a capture waiting on a dependency
+// (contracts/telegram-ux.md). An unknown dependency drops the name.
+func QueuedText(on capture.WaitingOn) string {
+	switch on {
+	case capture.WaitingSTT:
+		return "⏳ queued — speech-to-text unavailable, will retry"
+	case capture.WaitingMemos:
+		return "⏳ queued — notes unavailable, will retry"
+	case capture.WaitingTelegram:
+		return "⏳ queued — Telegram unavailable, will retry"
+	}
+
+	return "⏳ queued — will retry"
+}
+
 // cleanup removes the audio and the content (FR-012); the identity needed
 // for dedupe stays. Policy.Next clears SendNewReply when finalize_reply fails
 // permanently and the step advances, so the new reply it asked for is
@@ -371,11 +425,22 @@ func (s *stepRunner) cleanup(ctx context.Context, c capture.Capture) (capture.Ca
 	return c, capture.OK()
 }
 
+// holdsAudio reports whether the note carries (or will carry) the audio: a
+// local file is known and the note is not a minimal one, which drops it.
+func holdsAudio(c capture.Capture) bool {
+	return c.AudioPath != "" && !c.MinimalNote
+}
+
 // replyText builds the final reply (contracts/telegram-ux.md), HTML-escaped.
 func replyText(c capture.Capture) string {
 	link := `<a href="` + html.EscapeString(c.NoteURL) + `">open</a>`
 	if reason, ok := strings.CutPrefix(c.Failure, attachFailedMark); ok {
 		return fmt.Sprintf("⚠ saved, audio not attached — %s · %s", html.EscapeString(reason), link)
+	}
+	if c.Failure != "" && !holdsAudio(c) {
+		// Neither text nor audio was kept: ask the owner to send it again,
+		// since Telegram never redelivers it.
+		return fmt.Sprintf("⚠ audio not kept — %s · please send it again · %s", html.EscapeString(c.Failure), link)
 	}
 	if c.Failure != "" {
 		return fmt.Sprintf("⚠ saved audio only — %s · %s", html.EscapeString(c.Failure), link)
