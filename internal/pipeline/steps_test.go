@@ -103,6 +103,10 @@ type fakeTranscriber struct {
 	res  pipeline.TranscribeResult
 	out  capture.Outcome
 	call int
+	// later, when set, answers the second and later calls instead of res/out.
+	later    *pipeline.TranscribeResult
+	laterOut capture.Outcome
+	reqs     []pipeline.TranscribeRequest
 }
 
 func (f *fakeTranscriber) Transcribe(
@@ -110,7 +114,12 @@ func (f *fakeTranscriber) Transcribe(
 	r pipeline.TranscribeRequest,
 ) (pipeline.TranscribeResult, capture.Outcome) {
 	f.req = r
+	f.reqs = append(f.reqs, r)
 	f.call++
+	if f.call > 1 && f.later != nil {
+		return *f.later, f.laterOut
+	}
+
 	return f.res, f.out
 }
 
@@ -401,8 +410,12 @@ func TestTranscribe(t *testing.T) {
 			if r.tr.req.Language != tt.wantLang || r.tr.req.ID != "5" || string(r.tr.req.Audio) != "A" {
 				t.Errorf("req %+v", r.tr.req)
 			}
-			if got.Language != tt.res.Language {
-				t.Errorf("language %q", got.Language)
+			wantStored := tt.res.Language
+			if wantStored == "" {
+				wantStored = tt.wantLang // forced and nothing reported
+			}
+			if got.Language != wantStored {
+				t.Errorf("language %q want %q", got.Language, wantStored)
 			}
 		})
 	}
@@ -1194,6 +1207,183 @@ func TestReplyNoAIOnlyWhenSkipped(t *testing.T) {
 		if got := r.rep.edits[len(r.rep.edits)-1].text; !strings.HasPrefix(got, want) {
 			t.Errorf("%q: got %q want prefix %q", skipped, got, want)
 		}
+	}
+}
+
+func TestTranscribeLanguageRules(t *testing.T) {
+	audio := func() capture.Capture { c := base(); c.AudioPath = "5.ogg"; return c }
+	res := func(text, lang string) *pipeline.TranscribeResult {
+		return &pipeline.TranscribeResult{Text: text, Language: lang}
+	}
+	tests := []struct {
+		name      string
+		langs     []string
+		first     pipeline.TranscribeResult
+		later     *pipeline.TranscribeResult
+		laterOut  capture.Outcome
+		wantCalls int
+		wantSent  []string
+		wantClass capture.Class
+		wantText  string
+		wantLang  string
+	}{
+		{
+			"full name is normalised",
+			nil,
+			*res("a", "Russian"),
+			nil,
+			capture.OK(),
+			1,
+			[]string{""},
+			capture.ClassOK,
+			"a",
+			"ru",
+		},
+		{
+			"unknown language stored empty",
+			nil,
+			*res("a", "klingon"),
+			nil,
+			capture.OK(),
+			1,
+			[]string{""},
+			capture.ClassOK,
+			"a",
+			"",
+		},
+		{
+			"json format reports none, no recheck",
+			[]string{"ru", "en"},
+			*res("a", ""),
+			nil,
+			capture.OK(),
+			1,
+			[]string{""},
+			capture.ClassOK,
+			"a",
+			"",
+		},
+		{
+			"listed language accepted",
+			[]string{"ru", "en"},
+			*res("a", "english"),
+			nil,
+			capture.OK(),
+			1,
+			[]string{""},
+			capture.ClassOK,
+			"a",
+			"en",
+		},
+		{
+			"unlisted language rechecked",
+			[]string{"ru", "en"},
+			*res("a", "german"),
+			res("b", "russian"),
+			capture.OK(),
+			2,
+			[]string{"", "ru"},
+			capture.ClassOK,
+			"b",
+			"ru",
+		},
+		{
+			"recheck result is final even if still unlisted",
+			[]string{"ru", "en"},
+			*res("a", "german"),
+			res("b", "ukrainian"),
+			capture.OK(),
+			2,
+			[]string{"", "ru"},
+			capture.ClassOK,
+			"b",
+			"uk",
+		},
+		{
+			"recheck temporary",
+			[]string{"ru", "en"},
+			*res("a", "german"),
+			res("", ""),
+			capture.Temporary("503").On(capture.WaitingSTT),
+			2,
+			[]string{"", "ru"},
+			capture.ClassTemporary,
+			"",
+			"",
+		},
+		{
+			"recheck permanent",
+			[]string{"ru", "en"},
+			*res("a", "german"),
+			res("", ""),
+			capture.Permanent("415").On(capture.WaitingSTT),
+			2,
+			[]string{"", "ru"},
+			capture.ClassPermanent,
+			"",
+			"",
+		},
+		{
+			"single source forced, none reported stores the forced language",
+			[]string{"RU"},
+			*res("a", ""),
+			nil,
+			capture.OK(),
+			1,
+			[]string{"ru"},
+			capture.ClassOK,
+			"a",
+			"ru",
+		},
+		{
+			"recheck reports none stores the first source",
+			[]string{"ru", "en"},
+			*res("a", "german"),
+			res("b", ""),
+			capture.OK(),
+			2,
+			[]string{"", "ru"},
+			capture.ClassOK,
+			"b",
+			"ru",
+		},
+		{
+			"single source forced, language stored normalised",
+			[]string{"RU"},
+			*res("a", "russian"),
+			nil,
+			capture.OK(),
+			1,
+			[]string{"ru"},
+			capture.ClassOK,
+			"a",
+			"ru",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := newRig(t, tt.langs...)
+			r.audio.files = map[string][]byte{"5.ogg": []byte("A")}
+			r.tr.res, r.tr.later, r.tr.laterOut = tt.first, tt.later, tt.laterOut
+			got, out := r.run(capture.StepTranscribe, audio())
+			if out.Class != tt.wantClass {
+				t.Fatalf("class %v want %v", out.Class, tt.wantClass)
+			}
+			if r.tr.call != tt.wantCalls {
+				t.Fatalf("calls %d want %d", r.tr.call, tt.wantCalls)
+			}
+			for i, want := range tt.wantSent {
+				if r.tr.reqs[i].Language != want {
+					t.Errorf("call %d sent %q want %q", i, r.tr.reqs[i].Language, want)
+				}
+			}
+			if tt.wantClass != capture.ClassOK {
+				return
+			}
+			if got.Text != tt.wantText || got.Language != tt.wantLang {
+				t.Errorf("got text %q language %q", got.Text, got.Language)
+			}
+		})
 	}
 }
 

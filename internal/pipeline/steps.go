@@ -15,6 +15,7 @@ import (
 
 	"github.com/Toshik1978/voicenotes/internal/capture"
 	"github.com/Toshik1978/voicenotes/internal/enrich"
+	"github.com/Toshik1978/voicenotes/internal/language"
 	"github.com/Toshik1978/voicenotes/internal/render"
 )
 
@@ -225,7 +226,9 @@ func (s *stepRunner) download(ctx context.Context, c capture.Capture) (capture.C
 }
 
 // transcribe sends the audio to speech-to-text. The language is forced only
-// when exactly one source language is configured. An empty transcript is a
+// when exactly one source language is configured; a reported language outside
+// several configured sources is rechecked once. The stored language is the
+// normalised ISO-639-1 code, or empty when unknown. An empty transcript is a
 // result, not an error. A missing audio file is permanent: it cannot be
 // recovered, so the capture degrades to a placeholder note.
 func (s *stepRunner) transcribe(ctx context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
@@ -241,15 +244,35 @@ func (s *stepRunner) transcribe(ctx context.Context, c capture.Capture) (capture
 
 		return c, capture.Temporary("audio store: " + err.Error())
 	}
+	forced, isForced := language.Plan(s.cfg.SourceLanguages)
 	req := TranscribeRequest{ID: strconv.FormatInt(c.ID, 10), Ext: path.Ext(c.AudioPath), Audio: data}
-	if len(s.cfg.SourceLanguages) == 1 {
-		req.Language = s.cfg.SourceLanguages[0]
+	if isForced {
+		req.Language = forced
 	}
 	res, out := s.d.Transcriber.Transcribe(ctx, req)
 	if out.Class != capture.ClassOK {
 		return c, out
 	}
-	c.Text, c.Language = res.Text, res.Language
+	// A reported language outside the configured sources is retried once with
+	// the first source. The step's result is persisted only after it returns,
+	// so a restart between the two calls re-runs the whole step rather than
+	// adding a third call; the retry result is final, never checked again.
+	if with, again := language.Recheck(s.cfg.SourceLanguages, res.Language); again {
+		req.Language = with
+		if res, out = s.d.Transcriber.Transcribe(ctx, req); out.Class != capture.ClassOK {
+			return c, out
+		}
+	}
+	c.Text = res.Text
+	c.Language = ""
+	reported := res.Language
+	if strings.TrimSpace(reported) == "" {
+		// Nothing reported (json format): a forced language is still known.
+		reported = req.Language
+	}
+	if iso, ok := language.Normalize(reported); ok {
+		c.Language = iso
+	}
 
 	return c, capture.OK()
 }

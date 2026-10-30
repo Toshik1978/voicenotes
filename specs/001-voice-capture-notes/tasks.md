@@ -223,12 +223,12 @@ packages are in `internal/` (see plan.md Structure).
 
 **Independent Test**: spec US5 scenarios 1–4 against an httptest STT fake.
 
-- [ ] T032 [P] [US5] Implement pure language rules in `internal/language`.
+- [x] T032 [P] [US5] Implement pure language rules in `internal/language`.
   - `Normalize(raw string) (iso string, ok bool)` maps whisper full names (e.g. `"russian"`) and ISO-639-1 codes to ISO-639-1, using an embedded table of Whisper's languages.
   - `Plan(sources []string)` returns either a forced language or auto-detect.
   - `Recheck(sources, detected) (retranscribeWith string, ok bool)` encodes research R4: empty list → accept; one → forced; several and detected not listed → re-transcribe once with `sources[0]`; no detected language → accept.
   - Table tests.
-- [ ] T033 [US5] Apply the language rules in the `transcribe` step in `internal/pipeline/steps.go`. Store the normalized `language` and pass it to enrich and render. `STT_RESPONSE_FORMAT=json` (no language reported) skips the recheck. Tests use a fake transcriber.
+- [x] T033 [US5] Apply the language rules in the `transcribe` step in `internal/pipeline/steps.go`. Store the normalized `language` and pass it to enrich and render. `STT_RESPONSE_FORMAT=json` (no language reported) skips the recheck. Tests use a fake transcriber.
 
 ---
 
