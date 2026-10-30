@@ -49,8 +49,11 @@ CI (`ci.yml`) runs lint, the tests with the 80% coverage gate, and a
 `CGO_ENABLED=0` build; it never publishes. On pushes to `main` it updates the
 Tests and Coverage README badges in a public gist (repository secrets
 `GIST_ID` and `GIST_SECRET_TOKEN`, a token with the `gist` scope); on pull
-requests it posts a sticky coverage comment. `commit-lint.yml` re-runs the
-commit-msg hook over the pushed or PR range and must never gain a path filter.
+requests it posts a sticky coverage comment. `release.yml` runs only on `v*` tags:
+it builds the release body from `CHANGELOG.md` via
+`.github/scripts/extract-changelog.sh`, pushes the multi-arch image as
+`<version>` and `latest`, and creates the GitHub release. `commit-lint.yml` re-runs the commit-msg hook over the
+pushed or PR range and must never gain a path filter.
 
 ## Commits
 

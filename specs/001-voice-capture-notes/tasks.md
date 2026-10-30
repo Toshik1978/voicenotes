@@ -238,17 +238,17 @@ packages are in `internal/` (see plan.md Structure).
 
 **Independent Test**: quickstart scenarios 11–13 and a fresh-instance run from the README alone.
 
-- [ ] T034 [P] [US6] Implement pure health status in `internal/health`. Inputs: the oldest unfinished capture age, its `waiting_on`, the last successful Telegram poll, worker liveness, store health and the last digest date.
+- [x] T034 [P] [US6] Implement pure health status in `internal/health`. Inputs: the oldest unfinished capture age, its `waiting_on`, the last successful Telegram poll, worker liveness, store health and the last digest date.
   - `ok`, or `degraded` (200) when the oldest capture is older than `HEALTH_PENDING_THRESHOLD` or polling has failed longer than that.
   - `unhealthy` (503) when the store is unusable or the worker has stopped.
   - The `GET /healthz` handler returns the JSON body from contracts/health.md.
   - Table tests and httptest.
-- [ ] T035 [US6] Wire health in `cmd/voicenotes/main.go`.
+- [x] T035 [US6] Wire health in `cmd/voicenotes/main.go`.
   - An HTTP listener on `HTTP_ADDR` serves `/healthz`; the Telegram adapter reports the last poll time.
   - Add the subcommand `voicenotes health [--strict]`, which GETs `http://127.0.0.1:<port>/healthz`. It exits 0 on 200 and 1 otherwise; `--strict` also exits 1 on `degraded`. It prints the body.
-- [ ] T036 [P] [US6] Create `Dockerfile` modelled on tgshd: a builder pinned to `$BUILDPLATFORM` cross-compiling with `CGO_ENABLED=0` and ldflags, then `gcr.io/distroless/static-debian12:nonroot` with `/app/voicenotes`, `USER 65532:65532`, `VOLUME /data`, `EXPOSE 8080`, `HEALTHCHECK CMD ["/app/voicenotes","health"]`, `ENTRYPOINT ["/app/voicenotes"]`.
-- [ ] T037 [P] [US6] Add image publishing to the CI workflow in `.github/workflows/ci.yml`, or a separate release workflow. It builds multi-arch (amd64, arm64) and pushes `ghcr.io/toshik1978/voicenotes`: `latest` on main, `vX.Y.Z` on tags, `sha-<short>`.
-- [ ] T038 [US6] Write `README.md`:
+- [x] T036 [P] [US6] Create `Dockerfile` modelled on tgshd: a builder pinned to `$BUILDPLATFORM` cross-compiling with `CGO_ENABLED=0` and ldflags, then `gcr.io/distroless/static-debian12:nonroot` with `/app/voicenotes`, `USER 65532:65532`, `VOLUME /data`, `EXPOSE 8080`, `HEALTHCHECK CMD ["/app/voicenotes","health"]`, `ENTRYPOINT ["/app/voicenotes"]`.
+- [x] T037 [P] [US6] Add image publishing to the CI workflow in `.github/workflows/ci.yml`, or a separate release workflow. It builds multi-arch (amd64, arm64) and pushes `ghcr.io/toshik1978/voicenotes`: `latest` on main, `vX.Y.Z` on tags, `sha-<short>`.
+- [x] T038 [US6] Write `README.md`:
   - What VoiceNotes is and the flow.
   - Quick start with docker run and `.env`.
   - The full env var table, copied from contracts/configuration.md and marking required, defaults and secrets.
@@ -289,3 +289,15 @@ T012 internal/openai/transcribe.go   T013 internal/memos   T014 internal/render
 1. **MVP** = Phases 1–3 (US1): working captures when everything is up.
 2. **Deployable baseline** = adding US2 (no loss) and US3 (digest). This is the full P1 scope, and the deploy contract is final at this point.
 3. Then US4 (AI), US5 (languages), US6 (health, image, README). The image (T036/T037) can be pulled forward if the deployment wants to try the MVP early.
+
+## Phase 10: Convergence
+
+- [x] T041 Make the minimal-note retry in `internal/pipeline/steps.go` (`writeNote`/`noteInput`) render only the raw text or transcript plus `#inbox`, with no LLM output and no attachment, so a permanently rejected create is retried with a different payload. Add a test for a text capture with `EnrichedJSON` per data-model.md "Steps" and ruling vn-jmb.3.5 (a) (contradicts)
+- [x] T042 Report misconfiguration (401/403/404) as `degraded` health. Carry `Capture.Misconfig` through `cmd/voicenotes/adapters.go` (`healthQueue.OldestUnfinished`), `internal/health/source.go` and `internal/health/health.go` `Compute`, with table and collector tests, per research.md R10 and contracts/external-apis.md failure classes (partial)
+- [x] T043 Name Memos audio attachments `voice-<received_at local date>.<ext>` instead of the local temp file name in `internal/pipeline/steps.go` (`attach`), keeping the existing-attachment check idempotent, per contracts/external-apis.md §3 Attach audio (contradicts)
+- [x] T044 Treat a bare `voicenotes` invocation as `run` in `cmd/voicenotes/main.go`, keeping `run` as an alias, and update `cmd/voicenotes/main_test.go` per plan.md Project Structure (contradicts)
+- [x] T045 Replace the misleading `memos_pat_FAKE` examples for `STT_API_KEY` and `LLM_API_KEY` in `.env.dist` with neutral fake keys per contracts/configuration.md (unrequested)
+
+## Phase 11: Convergence
+
+- [x] T046 Prevent the final reply from racing the ingest ⏳ in `internal/telegram/handler.go`, `internal/pipeline/ingest.go` and `internal/pipeline/steps.go` (`finalizeReply`). A capture whose ⏳ send is still in flight must have that same ⏳ edited, never a second reply sent. Add a test where the worker reaches `finalize_reply` before `SetReplyMessageID`, per FR-025, US1 AS1/AS5 and contracts/telegram-ux.md (contradicts)

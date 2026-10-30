@@ -507,3 +507,25 @@ func TestWorkerCatchesUpQueuedEditAfterRestart(t *testing.T) {
 		t.Errorf("notifier calls = %d, want 1", calls)
 	}
 }
+
+func TestStoreOKTracksStoreOutage(t *testing.T) {
+	store := newFakeStore(textCapture(t, 1))
+	store.nextErrs = 1
+	clock := newFakeClock(t0())
+	w := newWorker(t, store, clock, (&recorder{}).handlers())
+	if !w.StoreOK() {
+		t.Error("StoreOK() = false before any store error")
+	}
+	start(t, w)
+
+	clock.awaitSleep(t)
+	if w.StoreOK() {
+		t.Error("StoreOK() = true during a store outage")
+	}
+	clock.Advance(5 * time.Second)
+	store.awaitUpdate(t)
+	store.awaitIdle(t)
+	if !w.StoreOK() {
+		t.Error("StoreOK() = false after the store recovered")
+	}
+}

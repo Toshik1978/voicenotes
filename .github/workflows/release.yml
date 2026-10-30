@@ -1,0 +1,130 @@
+name: Release
+
+# Releases are cut by pushing a tag:
+#
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# The tag is the version. This workflow only reads the repository — it never
+# commits, bumps, or pushes anything back. It is the only place an image is
+# published: ci.yml lints, tests and builds but never pushes.
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # The release gate: the very jobs ci.yml runs, so a tag cannot publish an
+  # image that fails lint, tests, the coverage floor or the build.
+  ci:
+    uses: ./.github/workflows/ci.yml
+    # A called workflow gets at most what the caller grants, and ci.yml's test
+    # job asks for pull-requests: write (its PR coverage comment, skipped on
+    # tags). Granting less would make the whole run invalid.
+    permissions:
+      contents: read
+      pull-requests: write
+
+  release:
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Lowercase image name
+        run: echo "IMAGE_NAME=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
+
+      # Runs before anything is pushed, so a tag without release notes fails
+      # the job while it is still a no-op.
+      - name: Build release body from CHANGELOG
+        run: |
+          bash .github/scripts/extract-changelog.sh "$GITHUB_REF_NAME" > release-body.md
+          {
+            echo
+            # No '---' here: the extracted section already ends with the
+            # separator rule (the .cliff.toml body template appends it), so
+            # emitting one would render two rules in a row.
+            echo
+            echo '### Docker'
+            echo
+            echo '```bash'
+            echo "docker pull ${REGISTRY}/${IMAGE_NAME}:${GITHUB_REF_NAME#v}"
+            echo '```'
+          } >> release-body.md
+          cat release-body.md
+
+      # The Dockerfile's VERSION, COMMIT and BUILDSTAMP build args feed the
+      # binary's -ldflags (.git is not in the build context). VERSION is the
+      # tag without its leading v.
+      - name: Build arguments
+        id: args
+        run: |
+          {
+            echo "version=${GITHUB_REF_NAME#v}"
+            echo "commit=${GITHUB_SHA::7}"
+            echo "buildstamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # No QEMU: the Dockerfile pins its builder to $BUILDPLATFORM and
+      # cross-compiles the CGO-free binary for each target.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        env:
+          # Stamp OCI annotations onto the image index (manifest list) so the
+          # description/source show up on the GHCR package page for the
+          # multi-arch image — without this they only attach to child manifests.
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          build-args: |
+            VERSION=${{ steps.args.outputs.version }}
+            COMMIT=${{ steps.args.outputs.commit }}
+            BUILDSTAMP=${{ steps.args.outputs.buildstamp }}
+
+      - name: Generate build provenance attestation
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          body_path: release-body.md
+          token: ${{ secrets.GITHUB_TOKEN }}

@@ -27,24 +27,38 @@ func TestRunVersion(t *testing.T) {
 	}
 }
 
-func TestRunNoSubcommand(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	code := run(nil, &stdout, &stderr)
+func TestDispatchStartsServiceByDefault(t *testing.T) {
+	for _, args := range [][]string{nil, {"run"}} {
+		var stdout, stderr bytes.Buffer
+		started := false
+		code := dispatch(args, &stdout, &stderr, func() int {
+			started = true
+			return 7
+		})
 
-	if code == 0 {
-		t.Error("exit code = 0, want non-zero")
-	}
-	if stdout.Len() != 0 {
-		t.Errorf("stdout = %q, want empty", stdout.String())
-	}
-	if !strings.Contains(stderr.String(), "usage") {
-		t.Errorf("stderr %q should contain usage", stderr.String())
+		if !started {
+			t.Errorf("args %v: service not started", args)
+		}
+		if code != 7 {
+			t.Errorf("args %v: exit code = %d, want the service's 7", args, code)
+		}
+		if stdout.Len() != 0 || stderr.Len() != 0 {
+			t.Errorf("args %v: unexpected output %q %q", args, stdout.String(), stderr.String())
+		}
 	}
 }
 
 func TestRunUnknownSubcommand(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if code := run([]string{"bogus"}, &stdout, &stderr); code == 0 {
-		t.Error("exit code = 0, want non-zero")
+	code := dispatch([]string{"bogus"}, &stdout, &stderr, func() int {
+		t.Error("service must not start for an unknown command")
+		return 0
+	})
+
+	if code != 2 {
+		t.Errorf("exit code = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "usage: voicenotes [run|health|version]") {
+		t.Errorf("stderr %q should contain usage", stderr.String())
 	}
 }

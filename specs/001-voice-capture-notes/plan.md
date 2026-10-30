@@ -134,7 +134,7 @@ internal/
 ├── telegram/            # telebot ingest + Replier + Downloader adapter
 ├── openai/              # OpenAI-compatible transcription + chat HTTP clients (httptest)
 └── memos/               # NotesWriter/NotesReader over Memos REST (httptest)
-.github/workflows/       # ci.yml (lint, test:coverage, build, image), commit-lint.yml, release
+.github/workflows/       # ci.yml (lint, test:coverage, build), commit-lint.yml, release.yml (image on v* tags)
 Dockerfile  Taskfile.yml  .golangci.yml  .mise.toml  .pre-commit-config.yaml  .cliff.toml
 .env.dist  .dockerignore  README.md  CHANGELOG.md  LICENSE  CLAUDE.md
 ```

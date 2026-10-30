@@ -153,7 +153,7 @@ func TestBuildSweepsAgedOrphanAudio(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	svc, err := build(cfg, zap.NewNop())
+	svc, err := build(cfg, zap.NewNop(), time.Now())
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}

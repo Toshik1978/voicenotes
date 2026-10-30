@@ -1,9 +1,15 @@
 name: Lint, Test & Build
+
+# Lints, tests and builds; never publishes. Images are published only by
+# release.yml, from v* tags.
 on:
   push:
     branches:
       - main
   pull_request:
+  # Lets release.yml gate publishing on the same lint, test and build, so a
+  # v* tag push is checked there rather than by a second run of this file.
+  workflow_call:
 
 permissions:
   contents: read

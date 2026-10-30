@@ -270,6 +270,17 @@ func (s *DB) OldestUnfinished(ctx context.Context) (capture.Capture, bool, error
 		" FROM captures WHERE status != 'done' ORDER BY id LIMIT 1")
 }
 
+// CountUnfinished returns the number of captures that are not done.
+func (s *DB) CountUnfinished(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, "SELECT count(*) FROM captures WHERE status != 'done'").Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("sqlite: count unfinished: %w", err)
+	}
+
+	return n, nil
+}
+
 // AudioPaths returns the audio file names referenced by any capture row,
 // finished or not, in insertion order.
 func (s *DB) AudioPaths(ctx context.Context) ([]string, error) {

@@ -358,6 +358,29 @@ func TestDigestRunRecordAndLast(t *testing.T) {
 	}
 }
 
+func TestLastSentDigestDate(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+
+	if d, ok, err := s.LastSentDigestDate(ctx); err != nil || ok || d != "" {
+		t.Fatalf("empty LastSentDigestDate = %q ok %v err %v", d, ok, err)
+	}
+	runs := []digest.Run{
+		{LocalDate: "2026-10-28", Status: digest.StatusSent, SentAt: ts0()},
+		{LocalDate: "2026-10-29", Status: digest.StatusSent, SentAt: ts0()},
+		{LocalDate: "2026-10-30", Status: digest.StatusEmpty, SentAt: ts0()},
+		{LocalDate: "2026-10-31", Status: digest.StatusSkipped, SentAt: ts0()},
+	}
+	for _, r := range runs {
+		if err := s.RecordDigestRun(ctx, r); err != nil {
+			t.Fatalf("RecordDigestRun: %v", err)
+		}
+	}
+	if d, ok, err := s.LastSentDigestDate(ctx); err != nil || !ok || d != "2026-10-29" {
+		t.Errorf("LastSentDigestDate = %q ok %v err %v, want 2026-10-29", d, ok, err)
+	}
+}
+
 func TestRecordDigestRunKeepsFirstPerDay(t *testing.T) {
 	ctx := context.Background()
 	s := open(t, t.TempDir())
@@ -417,6 +440,28 @@ func TestMarkSeenEmptyInboxClearsAll(t *testing.T) {
 	got, err := s.SeenNotes(ctx)
 	if err != nil || len(got) != 0 {
 		t.Errorf("SeenNotes = %v, %v; want empty", got, err)
+	}
+}
+
+func TestCountUnfinished(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+
+	if n, err := s.CountUnfinished(ctx); err != nil || n != 0 {
+		t.Fatalf("empty: n=%d err=%v", n, err)
+	}
+	a, b, c := newCapture(t, 1), newCapture(t, 2), newCapture(t, 3)
+	for _, x := range []*capture.Capture{&a, &b, &c} {
+		if err := s.Insert(ctx, x); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a.Status, a.Step = capture.StatusDone, capture.StepDone
+	if err := s.Update(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.CountUnfinished(ctx); err != nil || n != 2 {
+		t.Fatalf("n=%d err=%v, want 2", n, err)
 	}
 }
 

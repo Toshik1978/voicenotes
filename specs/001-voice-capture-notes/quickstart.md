@@ -23,8 +23,13 @@ CGO_ENABLED=0 task build
 docker run -d --name memos -p 5230:5230 neosmemo/memos:0.31.0
 # create the owner account in the UI → Settings → Access Tokens → new token, expiry "Never"
 cp .env.dist .env   # fill TELEGRAM_*, STT_*, MEMOS_URL=http://localhost:5230, MEMOS_TOKEN, DIGEST_TIME=<now+2m>
-task run            # or: docker run --env-file .env -v $PWD/data:/data -p 8080:8080 ghcr.io/toshik1978/voicenotes
+task run            # or: docker run --stop-timeout 90 --env-file .env -v $PWD/data:/data -p 8080:8080 ghcr.io/toshik1978/voicenotes
 ```
+
+Deploy with a 90 s stop grace period (`--stop-timeout 90`, compose `stop_grace_period: 90s`), not
+Docker's default 10 s: on SIGTERM an in-flight Telegram file download may take up to 60 s (the Bot
+API HTTP timeout) before its capture is stored, and recording a delivered digest is retried for up
+to 30 s. See the README quick start.
 
 Variables are listed in [contracts/configuration.md](contracts/configuration.md).
 

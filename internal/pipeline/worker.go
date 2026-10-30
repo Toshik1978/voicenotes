@@ -76,6 +76,8 @@ type Worker struct {
 	// holds are the acknowledgements in flight (see HoldAck).
 	holdsMu sync.Mutex
 	holds   map[*ackHold]struct{}
+	// storeDown is true from a failed store call until the next success.
+	storeDown atomic.Bool
 
 	// pending is a step result that could not be persisted yet. It is
 	// retried before any new step runs, so a completed step is never re-run
@@ -186,6 +188,11 @@ func (w *Worker) HoldAck(c capture.Capture) (release func()) {
 // service unhealthy when it is false ("the worker loop has stopped").
 func (w *Worker) Alive() bool { return w.alive.Load() }
 
+// StoreOK reports whether the worker's last store operation succeeded. It is
+// false while the worker is backing off after a store error, which health
+// reports as unhealthy ("local store unusable").
+func (w *Worker) StoreOK() bool { return !w.storeDown.Load() }
+
 // Run processes due captures until ctx is cancelled. It never exits on a
 // store or step error: those are retried with backoff (Constitution V). When
 // nothing is due it sleeps until the head capture's next attempt or a Wake;
@@ -214,6 +221,7 @@ func (w *Worker) iterate(ctx context.Context) time.Duration {
 		return w.storeFailed(ctx, "next due", err)
 	}
 	w.failures = 0
+	w.storeDown.Store(false)
 	if !due.OK {
 		if due.WakeAt.IsZero() {
 			return forever
@@ -297,6 +305,7 @@ func (w *Worker) persist(ctx context.Context) time.Duration {
 	}
 	w.pending = nil
 	w.failures = 0
+	w.storeDown.Store(false)
 
 	return 0
 }
@@ -306,6 +315,7 @@ func (w *Worker) storeFailed(ctx context.Context, op string, err error) time.Dur
 		return 0
 	}
 	w.failures++
+	w.storeDown.Store(true)
 	d := capture.Backoff(w.failures, w.policy.MaxInterval, w.policy.Rand)
 	w.log.Warn("store error, retrying",
 		zap.String("op", op), zap.Int("failures", w.failures), zap.Duration("retry_in", d), zap.Error(err))

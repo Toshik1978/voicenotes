@@ -19,6 +19,7 @@ import (
 	"github.com/Toshik1978/voicenotes/internal/config"
 	"github.com/Toshik1978/voicenotes/internal/digest"
 	"github.com/Toshik1978/voicenotes/internal/enrich"
+	"github.com/Toshik1978/voicenotes/internal/health"
 	"github.com/Toshik1978/voicenotes/internal/memos"
 	"github.com/Toshik1978/voicenotes/internal/openai"
 	"github.com/Toshik1978/voicenotes/internal/pipeline"
@@ -41,7 +42,7 @@ func runService(ctx context.Context, load func() (config.Config, error), stderr 
 	}
 	defer func() { _ = log.Sync() }()
 
-	svc, err := build(cfg, log)
+	svc, err := build(cfg, log, time.Now())
 	if err != nil {
 		log.Error("startup failed", zap.Error(err))
 		_, _ = fmt.Fprintln(stderr, "startup failed:", err)
@@ -106,7 +107,7 @@ func serve(ctx context.Context, goroutines []func(context.Context), closeStore f
 
 // build wires the components with plain constructors: data dir, store,
 // clients, handlers, worker, Telegram poller, purge ticker.
-func build(cfg config.Config, log *zap.Logger) (*service, error) {
+func build(cfg config.Config, log *zap.Logger, started time.Time) (*service, error) {
 	audioDir := filepath.Join(cfg.DataDir, "audio")
 	if err := os.MkdirAll(audioDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
@@ -120,7 +121,7 @@ func build(cfg config.Config, log *zap.Logger) (*service, error) {
 	if _, serr := pipeline.SweepOrphanAudio(context.Background(), audioDir, db, time.Now(), log); serr != nil {
 		log.Warn("orphan audio sweep skipped", zap.Error(serr))
 	}
-	svc, err := wire(cfg, log, db, audioDir)
+	svc, err := wire(cfg, log, db, audioDir, started)
 	if err != nil {
 		_ = db.Close()
 		return nil, err
@@ -130,7 +131,9 @@ func build(cfg config.Config, log *zap.Logger) (*service, error) {
 	return svc, nil
 }
 
-func wire(cfg config.Config, log *zap.Logger, db *sqlite.DB, audioDir string) (*service, error) {
+func wire(
+	cfg config.Config, log *zap.Logger, db *sqlite.DB, audioDir string, started time.Time,
+) (*service, error) {
 	transcriber, notes := newClients(cfg)
 
 	tg, err := telegram.NewAPI(telegram.APIConfig{Token: cfg.BotToken, Log: log})
@@ -169,9 +172,21 @@ func wire(cfg config.Config, log *zap.Logger, db *sqlite.DB, audioDir string) (*
 	if err != nil {
 		return nil, err
 	}
+	ln, err := listenHealth(cfg.HTTPAddr)
+	if err != nil {
+		return nil, err
+	}
+	collector := health.NewCollector(health.CollectorConfig{
+		Queue: healthQueue{db: db}, Worker: worker, LastPoll: tg.LastPoll,
+		Clock: time.Now, Started: started, Threshold: cfg.HealthPendingThreshold,
+	})
+	mux := http.NewServeMux()
+	mux.Handle("/healthz", health.Handler(collector))
+
 	goroutines := append([]func(context.Context){
 		func(ctx context.Context) { tg.Run(ctx, handler) },
 		worker.Run,
+		func(ctx context.Context) { serveHTTP(ctx, ln, mux, log) },
 		func(ctx context.Context) { pipeline.PurgeLoop(ctx, db, pipeline.PurgeInterval, time.Now, log) },
 	}, digestRun...)
 

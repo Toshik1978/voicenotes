@@ -32,6 +32,23 @@ func (s *DB) LastDigestRun(ctx context.Context) (r digest.Run, ok bool, err erro
 	}
 }
 
+// LastSentDigestDate returns the local date of the latest day whose digest
+// was actually sent; empty and skipped days do not count. ok is false when no
+// digest has been sent yet.
+func (s *DB) LastSentDigestDate(ctx context.Context) (date string, ok bool, err error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT local_date FROM digest_runs WHERE status = ?
+		 ORDER BY local_date DESC LIMIT 1`, string(digest.StatusSent))
+	switch err = row.Scan(&date); {
+	case err == nil:
+		return date, true, nil
+	case errors.Is(err, sql.ErrNoRows):
+		return "", false, nil
+	default:
+		return "", false, fmt.Errorf("sqlite: last sent digest: %w", err)
+	}
+}
+
 // RecordDigestRun stores the outcome of a local day. It is idempotent: a day
 // already recorded keeps its first row (FR-027, at most one per day).
 func (s *DB) RecordDigestRun(ctx context.Context, r digest.Run) error {

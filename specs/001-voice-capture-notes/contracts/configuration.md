@@ -73,7 +73,7 @@ The LLM step is enabled only when `LLM_BASE_URL` is set.
 | Variable | Req. | Default | Secret | Meaning |
 |---|---|---|---|---|
 | `DATA_DIR` | no | `/data` | no | SQLite file and queued audio; mount a persistent volume here |
-| `HTTP_ADDR` | no | `:8080` | no | Health listener |
+| `HTTP_ADDR` | no | `:8080` | no | Health listener; must listen on loopback (`:port` or `0.0.0.0:port`) for `voicenotes health` |
 | `HEALTH_PENDING_THRESHOLD` | no | `30m` | no | Oldest unfinished capture older than this → `degraded` |
 | `RETRY_MAX_INTERVAL` | no | `5m` | no | Backoff cap for dependency retries |
 | `LOG_LEVEL` | no | `info` | no | `debug` \| `info` \| `warn` \| `error` |
@@ -81,8 +81,9 @@ The LLM step is enabled only when `LLM_BASE_URL` is set.
 
 ## Container facts
 
-- Image: `ghcr.io/toshik1978/voicenotes`. Tags: `latest` (main), `vX.Y.Z` (releases),
-  `sha-<short>`. Platforms: linux/amd64 and linux/arm64.
+- Image: `ghcr.io/toshik1978/voicenotes`. Tags: `X.Y.Z` (the release tag without its `v`, for
+  example `0.1.0`) and `latest`, both published only from `vX.Y.Z` tags by `release.yml`.
+  Platforms: linux/amd64 and linux/arm64.
 - User 65532:65532 (distroless nonroot). `DATA_DIR` must be writable by that UID.
 - Volume: `/data`. Contents are a few KiB of SQLite, plus audio only while captures are queued.
 - Port: `8080/tcp` (health only; no public ingress needed).
