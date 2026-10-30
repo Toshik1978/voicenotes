@@ -60,21 +60,21 @@ packages are in `internal/` (see plan.md Structure).
 
 **⚠️ CRITICAL**: no user story work begins until this phase is complete.
 
-- [ ] T008 Implement `internal/config`: a `Config` struct parsed from env with caarlos0/env, covering every variable in `contracts/configuration.md` with the defaults listed there.
+- [x] T008 Implement `internal/config`: a `Config` struct parsed from env with caarlos0/env, covering every variable in `contracts/configuration.md` with the defaults listed there.
   - Validation returns errors shaped `config: <VAR>: <problem>` and never includes a secret value (`TELEGRAM_BOT_TOKEN`, `STT_API_KEY`, `LLM_API_KEY`, `MEMOS_TOKEN`).
   - Derived values: `DigestChatID` defaults to the first `TELEGRAM_ALLOWED_USERS` entry. `LLMEnabled` is true when `LLM_BASE_URL` is set, and then `LLM_MODEL` is required.
   - `DIGEST_TIME` must match `HH:MM`. `DIGEST_TZ` is loaded via `time.LoadLocation`, with `time/tzdata` imported in main.
   - Language codes must be ISO-639-1. `MEMOS_API_PREFIX` must be one of `auto|/api|/api/v1`.
   - Table tests in `internal/config/config_test.go`.
-- [ ] T009 [P] Implement the pure capture model in `internal/capture`. It defines `Capture`, `Kind` (`audio`|`text`), `Step` (`download → transcribe → enrich → write_note → finalize_reply → cleanup → done`, where text captures start at `enrich`), `Status` (`pending|waiting|done`) and `Outcome` (`OK|Temporary|Misconfig|Permanent` with reason and `WaitingOn`). It also provides `Next(c, outcome, now) Capture`.
+- [x] T009 [P] Implement the pure capture model in `internal/capture`. It defines `Capture`, `Kind` (`audio`|`text`), `Step` (`download → transcribe → enrich → write_note → finalize_reply → cleanup → done`, where text captures start at `enrich`), `Status` (`pending|waiting|done`) and `Outcome` (`OK|Temporary|Misconfig|Permanent` with reason and `WaitingOn`). It also provides `Next(c, outcome, now) Capture`.
   - `Next` applies the transitions from data-model.md "Steps": permanent in download/transcribe/enrich sets `failure` and jumps to `write_note`; a first entry into `waiting` flags that the reply needs a "queued" edit.
   - Backoff: 5 s, doubling, ±20% jitter via an injected rand, capped by `RETRY_MAX_INTERVAL` (research R11).
   - Table tests.
-- [ ] T010 [P] Implement `internal/store/sqlite`, with `Store` interface methods `Insert` (dedupe on UNIQUE(source, source_chat_id, source_message_id) returns `ErrDuplicate`), `NextDue(now)` (lowest `id` with `status!='done'`), `Update`, `OldestUnfinished`, and `PurgeDone(olderThan)`.
+- [x] T010 [P] Implement `internal/store/sqlite`, with `Store` interface methods `Insert` (dedupe on UNIQUE(source, source_chat_id, source_message_id) returns `ErrDuplicate`), `NextDue(now)` (lowest `id` with `status!='done'`), `Update`, `OldestUnfinished`, and `PurgeDone(olderThan)`.
   - Embedded `migrations/001_init.sql` creates `captures`, `digest_runs` and `digest_seen` exactly as in data-model.md.
   - Migrations apply forward-only, one transaction each, tracked by `PRAGMA user_version` (research R5). WAL is on, and the database is `$DATA_DIR/voicenotes.db`.
   - Tests use `t.TempDir()`.
-- [ ] T011 Implement the worker loop in `internal/pipeline`.
+- [x] T011 Implement the worker loop in `internal/pipeline`.
   - `Worker` takes a `Store`, a clock and a map of step handlers (`func(ctx, Capture) (Capture, capture.Outcome)`). It processes `NextDue` captures strictly in `id` order (FR-011), applies `capture.Next`, persists after **every** step (FR-008), sleeps until the next due time or a wake signal, and stops on ctx cancel.
   - It exposes `Wake()`, which ingest calls, and `Alive()`, which health uses.
   - Tests use a fake store and a fake clock.
