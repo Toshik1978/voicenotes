@@ -1,6 +1,6 @@
 // Package memos is a thin client for the Memos REST API (v0.31.0 under
-// /api/v1, 26.10+ under /api). It writes notes and attachments; reading the
-// inbox arrives with the digest and reuses the prefix and owner cache here.
+// /api/v1, 26.10+ under /api). It writes notes and attachments; it also lists the
+// inbox for the digest, reusing the prefix and owner cache.
 package memos
 
 import (
@@ -45,6 +45,8 @@ type Config struct {
 	Token string
 	// APIPrefix is "auto" (or empty), "/api" or "/api/v1".
 	APIPrefix string
+	// InboxTag is the tag the inbox listing filters on; empty means "inbox".
+	InboxTag string
 	// Version is used for "User-Agent: VoiceNotes/<version>".
 	Version string
 }

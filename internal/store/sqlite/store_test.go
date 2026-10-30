@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Toshik1978/voicenotes/internal/capture"
+	"github.com/Toshik1978/voicenotes/internal/digest"
 	"github.com/Toshik1978/voicenotes/internal/store/sqlite"
 )
 
@@ -329,6 +330,93 @@ func TestUpdateKeepsReplyMessageID(t *testing.T) {
 	}
 	if d.Capture.ReplyMessageID != 77 || d.Capture.Step != capture.StepTranscribe {
 		t.Fatalf("got reply %d step %s, want 77 transcribe", d.Capture.ReplyMessageID, d.Capture.Step)
+	}
+}
+
+func TestDigestRunRecordAndLast(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+
+	if _, ok, err := s.LastDigestRun(ctx); err != nil || ok {
+		t.Fatalf("empty LastDigestRun = ok %v err %v", ok, err)
+	}
+
+	first := digest.Run{LocalDate: "2026-10-29", Status: digest.StatusSent, SentAt: ts0(), NoteCount: 3}
+	second := digest.Run{LocalDate: "2026-10-30", Status: digest.StatusEmpty, SentAt: ts0().Add(time.Hour)}
+	for _, r := range []digest.Run{second, first} {
+		if err := s.RecordDigestRun(ctx, r); err != nil {
+			t.Fatalf("RecordDigestRun: %v", err)
+		}
+	}
+
+	got, ok, err := s.LastDigestRun(ctx)
+	if err != nil || !ok {
+		t.Fatalf("LastDigestRun = ok %v err %v", ok, err)
+	}
+	if !reflect.DeepEqual(got, second) {
+		t.Errorf("LastDigestRun = %+v, want %+v", got, second)
+	}
+}
+
+func TestRecordDigestRunKeepsFirstPerDay(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+
+	first := digest.Run{LocalDate: "2026-10-30", Status: digest.StatusSent, SentAt: ts0(), NoteCount: 2}
+	again := digest.Run{LocalDate: "2026-10-30", Status: digest.StatusSkipped, SentAt: ts0().Add(time.Hour)}
+	for _, r := range []digest.Run{first, again} {
+		if err := s.RecordDigestRun(ctx, r); err != nil {
+			t.Fatalf("RecordDigestRun: %v", err)
+		}
+	}
+
+	got, _, err := s.LastDigestRun(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, first) {
+		t.Errorf("LastDigestRun = %+v, want the first record %+v", got, first)
+	}
+}
+
+func TestMarkSeenInsertsKeepsFirstShownAndPrunes(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+
+	listed, inbox := []string{"memos/a", "memos/b"}, []string{"memos/a", "memos/b"}
+	if err := s.MarkSeen(ctx, listed, "2026-10-29", inbox); err != nil {
+		t.Fatalf("MarkSeen: %v", err)
+	}
+	// b left the inbox, c is new, a is listed again.
+	listed, inbox = []string{"memos/a", "memos/c"}, []string{"memos/a", "memos/c"}
+	if err := s.MarkSeen(ctx, listed, "2026-10-30", inbox); err != nil {
+		t.Fatalf("MarkSeen: %v", err)
+	}
+
+	got, err := s.SeenNotes(ctx)
+	if err != nil {
+		t.Fatalf("SeenNotes: %v", err)
+	}
+	want := map[string]string{"memos/a": "2026-10-29", "memos/c": "2026-10-30"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("SeenNotes = %v, want %v", got, want)
+	}
+}
+
+func TestMarkSeenEmptyInboxClearsAll(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+
+	if err := s.MarkSeen(ctx, []string{"memos/a"}, "2026-10-29", []string{"memos/a"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkSeen(ctx, nil, "2026-10-30", nil); err != nil {
+		t.Fatalf("MarkSeen: %v", err)
+	}
+
+	got, err := s.SeenNotes(ctx)
+	if err != nil || len(got) != 0 {
+		t.Errorf("SeenNotes = %v, %v; want empty", got, err)
 	}
 }
 

@@ -156,25 +156,25 @@ packages are in `internal/` (see plan.md Structure).
 
 **Independent Test**: quickstart scenarios 9 and 10.
 
-- [ ] T022 [P] [US3] Implement `NotesReader.ListInbox(ctx) ([]NoteSummary, error)` in `internal/memos`.
+- [x] T022 [P] [US3] Implement `NotesReader.ListInbox(ctx) ([]NoteSummary, error)` in `internal/memos`.
   - Request: `GET {P}/memos` with filter `"<INBOX_TAG>" in tags && creator == "<auth/me user.name>"`, `orderBy=create_time asc`, `pageSize=200`, paging via `pageToken` (research R8).
   - Each summary carries name, url, content, createTime and `property.hasTaskList`.
   - Tests use httptest.
-- [ ] T023 [P] [US3] Implement pure digest composition in `internal/digest/compose.go`. `Compose(notes, seen set, summaries map, max int) (text string, ok bool)` builds the layout in contracts/telegram-ux.md:
+- [x] T023 [P] [US3] Implement pure digest composition in `internal/digest/compose.go`. `Compose(notes, seen set, summaries map, max int) (text string, ok bool)` builds the layout in contracts/telegram-ux.md:
   - The header reads `☀️ VoiceNotes — N new, M from earlier`.
   - The new notes come first, then `From earlier (M)`, each section oldest first.
   - `☑` marks notes with a task list. Each line has an `open` link.
   - The fallback summary is the first non-empty line with tags stripped, at most 80 chars.
   - The list is capped at `DIGEST_MAX_NOTES` with `…and N more`, and split at 4096 UTF-16 units.
   - It returns `ok=false` when there are no notes.
-- [ ] T024 [P] [US3] Implement pure scheduling in `internal/digest/schedule.go`:
+- [x] T024 [P] [US3] Implement pure scheduling in `internal/digest/schedule.go`:
   - `NextRun(now, hhmm, loc) time.Time`.
   - `ShouldCatchUp(now, hhmm, loc, window, lastRunDate) bool` (research R6).
   - Table tests cover DST transition days in `Europe/Berlin` and `America/New_York`.
-- [ ] T025 [US3] Add digest bookkeeping to `internal/store/sqlite`:
+- [x] T025 [US3] Add digest bookkeeping to `internal/store/sqlite`:
   - `digest_runs` (`local_date` PK, `status sent|empty|skipped`, `sent_at`, `note_count`).
   - `digest_seen` (`note_name` PK, `first_shown`): insert listed notes and delete rows no longer in the inbox.
-- [ ] T026 [US3] Implement the digest runner in `internal/digest/runner.go`.
+- [x] T026 [US3] Implement the digest runner in `internal/digest/runner.go`.
   - A stdlib timer loop with a catch-up check at startup.
   - When it fires: ListInbox → Compose → send **with sound** to `DIGEST_CHAT_ID` → record the run and seen notes.
   - No notes gives status `empty` and no message. If Memos is unreachable, it retries within `DIGEST_CATCHUP`, then records `skipped`.

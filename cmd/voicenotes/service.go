@@ -17,6 +17,7 @@ import (
 
 	"github.com/Toshik1978/voicenotes/internal/capture"
 	"github.com/Toshik1978/voicenotes/internal/config"
+	"github.com/Toshik1978/voicenotes/internal/digest"
 	"github.com/Toshik1978/voicenotes/internal/memos"
 	"github.com/Toshik1978/voicenotes/internal/openai"
 	"github.com/Toshik1978/voicenotes/internal/pipeline"
@@ -77,7 +78,7 @@ func newLogger(level string) (*zap.Logger, error) {
 // service is the wired application.
 type service struct {
 	// goroutines run until ctx is cancelled; they are the Telegram poller,
-	// the worker and the purge ticker.
+	// the worker, the purge ticker and, when enabled, the morning digest.
 	goroutines []func(context.Context)
 	closeStore func() error
 }
@@ -136,8 +137,8 @@ func wire(cfg config.Config, log *zap.Logger, db *sqlite.DB, audioDir string) (*
 		return nil, fmt.Errorf("telegram: %w", err)
 	}
 
-	// Later tasks (LLM enrich, morning digest): when cfg.LLMEnabled / cfg.DigestEnabled, build the
-	// LLM enrich handler and the morning digest here with plain conditionals.
+	// Later task (LLM enrich): when cfg.LLMEnabled, build the LLM enrich handler here with a
+	// plain conditional.
 	handlers, err := pipeline.NewHandlers(pipeline.Deps{
 		Transcriber: sttShim{t: transcriber},
 		Notes:       notesShim{c: notes},
@@ -178,11 +179,41 @@ func wire(cfg config.Config, log *zap.Logger, db *sqlite.DB, audioDir string) (*
 		return nil, fmt.Errorf("telegram handler: %w", err)
 	}
 
-	return &service{goroutines: []func(context.Context){
+	digestRun, err := digestGoroutines(cfg, log, notes, db, tg)
+	if err != nil {
+		return nil, err
+	}
+	goroutines := append([]func(context.Context){
 		func(ctx context.Context) { tg.Run(ctx, handler) },
 		worker.Run,
 		func(ctx context.Context) { pipeline.PurgeLoop(ctx, db, pipeline.PurgeInterval, time.Now, log) },
-	}}, nil
+	}, digestRun...)
+
+	return &service{goroutines: goroutines}, nil
+}
+
+// digestGoroutines returns the morning digest runner, or nothing when the
+// digest is disabled. T031 (LLM summaries) will call SetSummarizer on the
+// runner when cfg.LLMDigestSummary.
+func digestGoroutines(
+	cfg config.Config, log *zap.Logger, notes digest.NotesReader, store digest.Store, sender digest.Sender,
+) ([]func(context.Context), error) {
+	if !cfg.DigestEnabled {
+		return nil, nil
+	}
+	runner, err := digest.New(digest.Config{
+		ChatID:   cfg.DigestChatID,
+		Time:     cfg.DigestTime,
+		Loc:      cfg.Location,
+		Catchup:  cfg.DigestCatchup,
+		MaxNotes: cfg.DigestMaxNotes,
+		Log:      log,
+	}, notes, store, sender)
+	if err != nil {
+		return nil, fmt.Errorf("digest: %w", err)
+	}
+
+	return []func(context.Context){runner.Run}, nil
 }
 
 // newClients builds the STT and Memos clients; each http.Client carries its
@@ -201,6 +232,7 @@ func newClients(cfg config.Config) (*openai.Transcriber, *memos.Client) {
 		PublicURL: cfg.MemosPublicURL,
 		Token:     cfg.MemosToken,
 		APIPrefix: cfg.MemosAPIPrefix,
+		InboxTag:  cfg.InboxTag,
 		Version:   Version,
 	}, nil)
 

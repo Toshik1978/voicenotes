@@ -165,6 +165,19 @@ func (a *API) Send(ctx context.Context, chatID, replyTo int64, text string) (int
 	return int64(m.ID), nil
 }
 
+// SendWithSound sends text to chatID in HTML mode WITH a notification sound.
+// It is for the morning digest only; every other bot message is silent.
+func (a *API) SendWithSound(ctx context.Context, chatID int64, text string) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("telegram: send: %w", err)
+	}
+	if _, err := a.bot.Send(tele.ChatID(chatID), text, &tele.SendOptions{ParseMode: tele.ModeHTML}); err != nil {
+		return wrapAPI("send", err)
+	}
+
+	return nil
+}
+
 // Edit replaces the text of msgID silently. An unchanged text counts as
 // success. If Telegram refuses the edit (the message was deleted or is too
 // old), a new silent reply with the same text is sent and its ID returned.

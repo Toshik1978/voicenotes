@@ -107,6 +107,25 @@ func TestNewLogger(t *testing.T) {
 	}
 }
 
+func TestDigestGoroutinesOnlyWhenEnabled(t *testing.T) {
+	cfg := config.Config{
+		DigestChatID: 1, DigestTime: "07:30", Location: time.UTC,
+		DigestCatchup: time.Hour, DigestMaxNotes: 5,
+	}
+	got, err := digestGoroutines(cfg, zap.NewNop(), nil, nil, nil)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("disabled: %d goroutines, %v", len(got), err)
+	}
+	cfg.DigestEnabled = true
+	if got, err = digestGoroutines(cfg, zap.NewNop(), nil, nil, nil); err != nil || len(got) != 1 {
+		t.Fatalf("enabled: %d goroutines, %v", len(got), err)
+	}
+	cfg.DigestTime = "bad"
+	if _, err = digestGoroutines(cfg, zap.NewNop(), nil, nil, nil); err == nil {
+		t.Fatal("bad config: want error")
+	}
+}
+
 func TestBuildSweepsAgedOrphanAudio(t *testing.T) {
 	dir := t.TempDir()
 	audio := filepath.Join(dir, "audio")

@@ -509,3 +509,34 @@ func TestRejectedErrorsAreClassified(t *testing.T) {
 		})
 	}
 }
+
+func TestSendWithSoundIsLoudHTML(t *testing.T) {
+	f := newFakeAPI(t)
+	f.on("sendMessage", message(502))
+	a := newAPI(t, f)
+
+	if err := a.SendWithSound(context.Background(), chat, "<b>digest</b>"); err != nil {
+		t.Fatal(err)
+	}
+	p := f.call(t, "sendMessage")
+	if p["disable_notification"] == "true" || p["parse_mode"] != "HTML" ||
+		p["chat_id"] != strconv.FormatInt(chat, 10) || p["text"] != "<b>digest</b>" {
+		t.Fatalf("params %v: want HTML with sound", p)
+	}
+}
+
+func TestSendWithSoundErrors(t *testing.T) {
+	f := newFakeAPI(t)
+	f.on("sendMessage", apiError(http.StatusForbidden, "Forbidden: bot was blocked by the user"))
+	a := newAPI(t, f)
+
+	err := a.SendWithSound(context.Background(), chat, "x")
+	if err == nil || strings.Contains(err.Error(), "FAKE-TOKEN") {
+		t.Fatalf("want token-free error, got %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := a.SendWithSound(ctx, chat, "x"); err == nil {
+		t.Fatal("cancelled ctx: want error")
+	}
+}

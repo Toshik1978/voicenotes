@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -47,6 +48,7 @@ type fakeMemos struct {
 	lastUA       string
 	lastCreate   map[string]any
 	lastAttach   map[string]any
+	list         func(http.ResponseWriter, url.Values) // serves GET /memos
 }
 
 func newFake(prefix string) *fakeMemos {
@@ -78,6 +80,8 @@ func (f *fakeMemos) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_, _ = io.WriteString(w, `{"user":{"name":"users/7"}}`)
+	case p == "/memos" && r.Method == http.MethodGet && f.list != nil:
+		f.list(w, r.URL.Query())
 	case p == "/memos" && r.Method == http.MethodPost:
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
@@ -533,6 +537,9 @@ func TestResponseTooLarge(t *testing.T) {
 	if out.Class != capture.ClassTemporary || out.Reason != "response too large" ||
 		out.WaitingOn != capture.WaitingMemos {
 		t.Errorf("oversized response = %+v", out)
+	}
+	if _, err := c.ListInbox(ctx()); err == nil || !strings.Contains(err.Error(), "response too large") {
+		t.Errorf("ListInbox error = %v", err)
 	}
 
 	fits := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

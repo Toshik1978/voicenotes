@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	_ "time/tzdata" // embed zoneinfo: the distroless image ships none.
 
 	"github.com/Toshik1978/voicenotes/internal/config"
 )
