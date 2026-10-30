@@ -9,6 +9,18 @@ Versions follow [semver](https://semver.org). Commits follow
 
 ---
 
+## v0.1.1 — 2026-10-30
+
+Highlights:
+
+- The LLM step now works with models that accept only their default temperature, such as Claude Haiku behind LiteLLM: VoiceNotes always sent `temperature: 0`, which those models reject, so every note was saved without AI. No temperature is sent now unless the new optional `LLM_TEMPERATURE` (0–2) sets one.
+
+### Bug Fixes
+
+- fix(llm): send no temperature unless LLM_TEMPERATURE is set ([0dbec65](https://github.com/Toshik1978/voicenotes/commit/0dbec65935ef831d1eb46c682720190d76512780))
+
+---
+
 ## v0.1.0 — 2026-10-30
 
 First release.
