@@ -31,6 +31,11 @@ const (
 // it onto capture.SkippedInvalidOutput.
 var ErrInvalidOutput = errors.New("invalid LLM output")
 
+// ErrNotTranslated marks an otherwise valid answer that kept a foreign text
+// untranslated although translation is enabled. The model is not
+// deterministic, so the caller asks again rather than skipping the LLM.
+var ErrNotTranslated = errors.New("LLM answer not translated")
+
 var tagPattern = regexp.MustCompile(`^[a-z0-9_-]{1,32}$`)
 
 // Message is one chat message; Role is "system" or "user".
@@ -91,11 +96,15 @@ func BuildRequest(o Options, text, detectedLang string) []Message {
 	sys.WriteString(
 		"You process a voice note transcript. Answer with one JSON object only, no prose and no code fences.\n",
 	)
-	shape := []string{`"language": detected ISO-639-1 code of the input`, `"text": string`}
+	shape := []string{`"language": detected ISO-639-1 code of the input`, textKey(o)}
 
 	sys.WriteString("Functions:\n")
 	if o.Translate {
-		sys.WriteString("- Translate the text to the target language if it differs; otherwise keep it as is.\n")
+		fmt.Fprintf(&sys,
+			"- Translate: \"text\" must be in %[1]s. If the input is in any other language, translate all of it "+
+				"into %[1]s, even when it is short or has no action items. Only an input already in %[1]s stays "+
+				"in its language.\n",
+			o.Target)
 	}
 	if o.Tidy {
 		sys.WriteString("- Tidy punctuation, casing and paragraphs without changing the meaning.\n")
@@ -104,7 +113,10 @@ func BuildRequest(o Options, text, detectedLang string) []Message {
 		sys.WriteString("- Return the text unchanged.\n")
 	}
 	if o.Translate {
-		shape = append(shape, `"translated": true if you translated the text, else false`)
+		shape = append(
+			shape,
+			`"translated": true if the input was not in `+o.Target+` and you translated it, else false`,
+		)
 	}
 	if o.Tidy && o.MaxTags > 0 {
 		fmt.Fprintf(
@@ -126,9 +138,33 @@ func BuildRequest(o Options, text, detectedLang string) []Message {
 		sys.WriteString("- " + s + "\n")
 	}
 
-	user := fmt.Sprintf("Detected language: %s\nTarget language: %s\nText:\n%s", detectedLang, o.Target, text)
+	user := fmt.Sprintf("Detected language: %s\nTarget language: %s\n%sText:\n%s",
+		detectedLang, o.Target, translateLine(o, detectedLang), text)
 
 	return []Message{{Role: "system", Content: sys.String()}, {Role: "user", Content: user}}
+}
+
+// textKey describes the "text" key, naming the target language when the
+// answer must be in it.
+func textKey(o Options) string {
+	if o.Translate {
+		return `"text": the whole note in ` + o.Target
+	}
+
+	return `"text": string`
+}
+
+// translateLine repeats the translate instruction next to the text: the
+// system prompt alone left notes with nothing to act on in their language.
+func translateLine(o Options, detected string) string {
+	switch {
+	case !o.Translate || detected == o.Target:
+		return ""
+	case detected == "":
+		return fmt.Sprintf("Translate the whole text below into %[1]s unless it is already in %[1]s.\n", o.Target)
+	default:
+		return fmt.Sprintf("Translate the whole text below from %s into %s.\n", detected, o.Target)
+	}
 }
 
 type rawResult struct {
@@ -141,10 +177,13 @@ type rawResult struct {
 
 // Parse extracts the first JSON object from raw and validates it against the
 // contract. input is the text that was sent; it bounds the answer length.
-// Keys of disabled functions are ignored. Suggested tags are normalised
-// leniently (see normaliseTags) and never fail the answer; any other violation
-// yields ErrInvalidOutput.
-func Parse(raw, input string, o Options) (Result, error) {
+// detected is its ISO-639-1 language, or empty when unknown. Keys of disabled
+// functions are ignored. Suggested tags are normalised leniently (see
+// normaliseTags) and never fail the answer. With translation enabled, an
+// answer for a known language other than the target that is not marked
+// translated yields ErrNotTranslated; any other violation yields
+// ErrInvalidOutput.
+func Parse(raw, input, detected string, o Options) (Result, error) {
 	var r rawResult
 	if err := decodeFirstObject(raw, &r); err != nil {
 		return Result{}, err
@@ -160,7 +199,12 @@ func Parse(raw, input string, o Options) (Result, error) {
 		return Result{}, invalid("text too long")
 	}
 
-	return finish(r, text, o)
+	res, err := finish(r, text, o)
+	if err == nil && o.Translate && detected != "" && detected != o.Target && !res.Translated {
+		return Result{}, ErrNotTranslated
+	}
+
+	return res, err
 }
 
 // finish applies the optional keys of the enabled functions.

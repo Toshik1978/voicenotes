@@ -296,7 +296,14 @@ func (s *stepRunner) enrich(ctx context.Context, c capture.Capture) (capture.Cap
 	if out.Class != capture.ClassOK {
 		return c, out
 	}
-	res, err := enrich.Parse(raw, c.Text, s.cfg.Enrich)
+	res, err := enrich.Parse(raw, c.Text, c.Language, s.cfg.Enrich)
+	if errors.Is(err, enrich.ErrNotTranslated) {
+		// A sampled answer can keep the source text; ask again within the
+		// LLM budget, which then skips the step as unavailable.
+		s.log(c, "LLM answer not translated, retrying", nil)
+
+		return c, capture.Temporary("LLM answer not translated")
+	}
 	if err != nil {
 		s.log(c, "LLM answer rejected", err)
 

@@ -57,7 +57,8 @@ text:                          enrich → write_note → finalize_reply → clea
   - `permanent` in `finalize_reply` (message deleted or not editable): send a new silent reply
     instead, then treat the step as `ok`.
 - The LLM step has a bounded budget: after 3 attempts or 2 minutes it becomes `ok` with
-  `llm_skipped='unavailable'`.
+  `llm_skipped='unavailable'`. An answer that keeps a foreign text untranslated while translation
+  is on counts as `temporary` and uses this budget (contracts/external-apis.md §2).
 - `cleanup` deletes the audio file and NULLs `text`, `language`, `enriched_json`, `audio_path`,
   `file_id`. The row (IDs only) remains for dedupe.
 - **Purge**: rows with `status='done'` and `updated_at < now − 30 days` are deleted daily.

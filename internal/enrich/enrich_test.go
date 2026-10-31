@@ -32,6 +32,17 @@ func TestBuildRequest(t *testing.T) {
 			nil,
 		},
 		{
+			// Without this the model kept short or task-free notes in their
+			// language (measured with the live repeat test).
+			"translation is unconditional for another language",
+			func(*Options) {},
+			[]string{
+				"must be in en", "translate all of it into en", "no action items", "already in en",
+				`"text": the whole note in en`,
+			},
+			[]string{"if it differs"},
+		},
+		{
 			"translate only",
 			func(o *Options) { o.Tidy, o.Tasks = false, false },
 			[]string{"Translate", `"translated"`},
@@ -83,20 +94,57 @@ func TestBuildRequest(t *testing.T) {
 	}
 }
 
+// The instruction to translate also sits next to the text, where the model
+// heeds it for notes that hold nothing to act on (measured with the live
+// repeat test), and only when the text needs it.
+func TestBuildRequestUserInstruction(t *testing.T) {
+	tests := []struct {
+		name     string
+		detected string
+		mod      func(*Options)
+		want     string
+		notWant  string
+	}{
+		{"foreign source", "ru", nil, "Translate the whole text below from ru into en.", ""},
+		{"unknown source", "", nil, "Translate the whole text below into en unless it is already in en.", ""},
+		{"source is the target", "en", nil, "", "Translate"},
+		{"translation off", "ru", func(o *Options) { o.Translate = false }, "", "Translate"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			o := opts()
+			if tc.mod != nil {
+				tc.mod(&o)
+			}
+			user := BuildRequest(o, "hello world", tc.detected)[1].Content
+			if tc.want != "" && !strings.Contains(user, tc.want+"\nText:\nhello world") {
+				t.Errorf("user content %q lacks %q before the text", user, tc.want)
+			}
+			if tc.notWant != "" && strings.Contains(user, tc.notWant) {
+				t.Errorf("user content %q has %q", user, tc.notWant)
+			}
+		})
+	}
+}
+
 func TestParse(t *testing.T) {
 	long := strings.Repeat("x", 201)
 	tests := []struct {
-		name    string
-		raw     string
-		input   string
-		mod     func(*Options)
-		want    Result
-		invalid bool
+		name     string
+		raw      string
+		input    string
+		detected string
+		mod      func(*Options)
+		want     Result
+		invalid  bool
+		// notTranslated expects ErrNotTranslated.
+		notTranslated bool
 	}{
 		{
-			name:  "full",
-			raw:   `{"language":"ru","text":"Call the dentist.","translated":true,"tasks":["Call the dentist"],"tags":["garden","health"]}`,
-			input: "Позвонить врачу",
+			name:     "full",
+			raw:      `{"language":"ru","text":"Call the dentist.","translated":true,"tasks":["Call the dentist"],"tags":["garden","health"]}`,
+			input:    "Позвонить врачу",
+			detected: "ru",
 			want: Result{
 				Language:   "ru",
 				Text:       "Call the dentist.",
@@ -225,6 +273,35 @@ func TestParse(t *testing.T) {
 			want:  Result{Text: "x"},
 		},
 		{name: "language not string", raw: `{"text":"x","language":3}`, input: "x", invalid: true},
+		{
+			name:  "source in the target language needs no translation",
+			raw:   `{"text":"Call the dentist.","translated":false}`,
+			input: "call the dentist", detected: "en",
+			want: Result{Text: "Call the dentist."},
+		},
+		{
+			name:  "unknown source language is not checked",
+			raw:   `{"text":"Позвонить врачу.","translated":false}`,
+			input: "позвонить врачу",
+			want:  Result{Text: "Позвонить врачу."},
+		},
+		{
+			name:  "translation disabled is not checked",
+			raw:   `{"text":"Позвонить врачу.","translated":false}`,
+			input: "позвонить врачу", detected: "ru",
+			mod:  func(o *Options) { o.Translate = false },
+			want: Result{Text: "Позвонить врачу."},
+		},
+		{
+			name:  "foreign source kept as is",
+			raw:   `{"language":"ru","text":"Позвонить врачу.","translated":false,"tasks":["Позвонить врачу"]}`,
+			input: "позвонить врачу", detected: "ru", notTranslated: true,
+		},
+		{
+			name:  "foreign source without the translated key",
+			raw:   `{"text":"Позвонить врачу."}`,
+			input: "позвонить врачу", detected: "ru", notTranslated: true,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -232,7 +309,13 @@ func TestParse(t *testing.T) {
 			if tc.mod != nil {
 				tc.mod(&o)
 			}
-			got, err := Parse(tc.raw, tc.input, o)
+			got, err := Parse(tc.raw, tc.input, tc.detected, o)
+			if tc.notTranslated {
+				if !errors.Is(err, ErrNotTranslated) || errors.Is(err, ErrInvalidOutput) {
+					t.Fatalf("err = %v, want ErrNotTranslated only", err)
+				}
+				return
+			}
 			if tc.invalid {
 				if !errors.Is(err, ErrInvalidOutput) {
 					t.Fatalf("err = %v, want ErrInvalidOutput", err)

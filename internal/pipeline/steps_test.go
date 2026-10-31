@@ -1093,11 +1093,16 @@ type fakeEnricher struct {
 	out   capture.Outcome
 	calls int
 	got   []enrich.Message
+	// seq, when set, answers the calls in order; the last answer repeats.
+	seq []string
 }
 
 func (f *fakeEnricher) Complete(_ context.Context, m []enrich.Message) (string, capture.Outcome) {
 	f.calls++
 	f.got = m
+	if len(f.seq) > 0 {
+		return f.seq[min(f.calls, len(f.seq))-1], capture.OK()
+	}
 
 	return f.raw, f.out
 }
@@ -1249,6 +1254,68 @@ func TestWriteNoteLogsLLMUse(t *testing.T) {
 			}
 		}
 	}
+}
+
+// The model sometimes keeps a foreign transcript as is. That answer is asked
+// again within the LLM budget instead of producing a note that silently looks
+// like the LLM never ran.
+func TestEnrichRetriesAnUntranslatedAnswer(t *testing.T) {
+	const (
+		echo = `{"language":"ru","text":"Купить молоко и позвонить Бобу.","translated":false,"tasks":[],"tags":[]}`
+		good = `{"language":"ru","text":"Buy milk and call Bob.","translated":true,"tasks":["Buy milk","Call Bob"],"tags":["home"]}`
+	)
+	drive := func(e *fakeEnricher) (capture.Capture, *fakeNotes, *fakeReplier) {
+		notes, rep := &fakeNotes{}, &fakeReplier{}
+		h, err := pipeline.NewHandlers(pipeline.Deps{
+			Transcriber: &fakeTranscriber{}, Notes: notes, Replier: rep,
+			Downloader: &fakeDownloader{}, Audio: newFakeAudio(), Enricher: e,
+		}, pipeline.StepsConfig{
+			InboxTag: "inbox", TodoTag: "todo", NoteLimit: 1000,
+			Enrich: enrich.Options{Translate: true, Tidy: true, Tasks: true, Target: "en", MaxTags: 3},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		pol := capture.Policy{MaxInterval: time.Minute}
+		c := base()
+		c.Text, c.Language, c.ReplyMessageID, c.Step = "Купить молоко и позвонить Бобу.", "ru", 9, capture.StepEnrich
+		now := c.ReceivedAt
+		for i := 0; i < 10 && c.Step != capture.StepDone; i++ {
+			got, out := h[c.Step](context.Background(), c)
+			c = pol.Next(got, out, now)
+			now = now.Add(time.Second)
+		}
+
+		return c, notes, rep
+	}
+
+	t.Run("a second answer that translates is used", func(t *testing.T) {
+		e := &fakeEnricher{seq: []string{echo, good}}
+		c, notes, rep := drive(e)
+		if e.calls != 2 || c.Step != capture.StepDone || c.LLMSkipped != "" || c.TaskCount != 2 {
+			t.Fatalf("calls %d capture %+v", e.calls, c)
+		}
+		if body := notes.created[0].Content; !strings.HasPrefix(body, "Buy milk and call Bob.") ||
+			!strings.Contains(body, "#todo #home") {
+			t.Errorf("note %q", body)
+		}
+		if len(rep.edits) != 1 || !strings.HasPrefix(rep.edits[0].text, "✓ saved · 2 tasks · ") {
+			t.Errorf("edits %+v", rep.edits)
+		}
+	})
+	t.Run("an answer that never translates is reported as no AI", func(t *testing.T) {
+		e := &fakeEnricher{seq: []string{echo}}
+		c, notes, rep := drive(e)
+		if e.calls != 3 || c.Step != capture.StepDone || c.LLMSkipped != capture.SkippedUnavailable {
+			t.Fatalf("calls %d capture %+v", e.calls, c)
+		}
+		if body := notes.created[0].Content; body != "Купить молоко и позвонить Бобу.\n\n#inbox" {
+			t.Errorf("note %q", body)
+		}
+		if len(rep.edits) != 1 || !strings.HasPrefix(rep.edits[0].text, "✓ saved (no AI) · ") {
+			t.Errorf("edits %+v", rep.edits)
+		}
+	})
 }
 
 func TestEnrichBudgetViaPolicy(t *testing.T) {

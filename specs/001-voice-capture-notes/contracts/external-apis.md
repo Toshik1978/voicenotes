@@ -40,7 +40,7 @@ Verified compatible:
   "temperature": <LLM_TEMPERATURE>,
   "messages": [
     {"role": "system", "content": "<instructions for the enabled functions + JSON schema>"},
-    {"role": "user", "content": "<capture text, detected language, target language>"}
+    {"role": "user", "content": "<detected language, target language, a translate instruction when the text needs one, capture text>"}
   ]
 }
 ```
@@ -73,6 +73,12 @@ Validation:
   itself) and duplicates are dropped, order is kept, and the list is cut to `LLM_MAX_TAGS`.
   A `tags` value that is not an array yields no tags; the rest of the answer is kept.
   `LLM_MAX_TAGS=0` disables tags.
+- With `LLM_TRANSLATE` on and a detected source language other than `TARGET_LANGUAGE`, an
+  answer not marked `"translated": true` is asked again: the model is not deterministic and
+  sometimes keeps the source text, which would otherwise yield a note that silently looks as if
+  the LLM never ran. The LLM budget (3 attempts or 2 minutes) bounds the retries; when it runs
+  out, the capture is saved without LLM output (`unavailable`, reply `✓ saved (no AI)`). An
+  unknown source language is not checked.
 - If validation of any other key fails, the capture is saved without LLM output
   (`invalid_output`).
 
