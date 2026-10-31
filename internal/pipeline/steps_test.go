@@ -10,6 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
+
 	"github.com/Toshik1978/voicenotes/internal/capture"
 	"github.com/Toshik1978/voicenotes/internal/enrich"
 	"github.com/Toshik1978/voicenotes/internal/pipeline"
@@ -1166,6 +1169,85 @@ func TestEnrichWithLLM(t *testing.T) {
 				t.Errorf("language missing from request: %q", e.got[1].Content)
 			}
 		})
+	}
+}
+
+// The accepted answer's shape is logged at debug so a live deploy can tell a
+// dropped result from a model that kept the text as is; its text never is.
+func TestEnrichLogsAnswerShape(t *testing.T) {
+	raw := `{"language":"ru","text":"Buy milk and call Bob.","translated":true,"tasks":["Buy milk","Call Bob"],"tags":["home"]}`
+	core, logs := observer.New(zap.DebugLevel)
+	h, err := pipeline.NewHandlers(pipeline.Deps{
+		Transcriber: &fakeTranscriber{}, Notes: &fakeNotes{}, Replier: &fakeReplier{},
+		Downloader: &fakeDownloader{}, Audio: newFakeAudio(), Enricher: &fakeEnricher{raw: raw, out: capture.OK()},
+		Log: zap.New(core),
+	}, pipeline.StepsConfig{
+		InboxTag: "inbox", TodoTag: "todo", NoteLimit: 1000,
+		Enrich: enrich.Options{Translate: true, Tidy: true, Tasks: true, Target: "en", MaxTags: 3},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := base()
+	c.Text, c.Language = "kupi moloko i pozvoni Bobu", "ru"
+	if _, out := h[capture.StepEnrich](context.Background(), c); out.Class != capture.ClassOK {
+		t.Fatalf("out %+v", out)
+	}
+	entries := logs.FilterMessage("LLM answer accepted").All()
+	if len(entries) != 1 || entries[0].Level != zap.DebugLevel {
+		t.Fatalf("entries %+v", logs.All())
+	}
+	f := entries[0].ContextMap()
+	want := map[string]any{
+		"capture": int64(5), "detected": "ru", "language": "ru", "translated": true,
+		"tasks": int64(2), "tags": int64(1), "input_runes": int64(26), "text_runes": int64(22),
+	}
+	for k, v := range want {
+		if f[k] != v {
+			t.Errorf("field %s = %v (%T), want %v", k, f[k], f[k], v)
+		}
+	}
+	for k, v := range f {
+		if s, ok := v.(string); ok && (strings.Contains(s, "milk") || strings.Contains(s, "moloko")) {
+			t.Errorf("field %s leaks text: %q", k, s)
+		}
+	}
+}
+
+// writeNote logs at debug whether the note carries the LLM result.
+func TestWriteNoteLogsLLMUse(t *testing.T) {
+	core, logs := observer.New(zap.DebugLevel)
+	h, err := pipeline.NewHandlers(pipeline.Deps{
+		Transcriber: &fakeTranscriber{}, Notes: &fakeNotes{}, Replier: &fakeReplier{},
+		Downloader: &fakeDownloader{}, Audio: newFakeAudio(), Log: zap.New(core),
+	}, pipeline.StepsConfig{InboxTag: "inbox", TodoTag: "todo", NoteLimit: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := base()
+	c.Text = "kupi moloko"
+	c.EnrichedJSON = `{"text":"Buy milk","tasks":["Buy milk"]}`
+	if _, out := h[capture.StepWriteNote](context.Background(), c); out.Class != capture.ClassOK {
+		t.Fatalf("out %+v", out)
+	}
+	c.EnrichedJSON = ""
+	if _, out := h[capture.StepWriteNote](context.Background(), c); out.Class != capture.ClassOK {
+		t.Fatalf("out %+v", out)
+	}
+	entries := logs.FilterMessage("note rendered").All()
+	if len(entries) != 2 {
+		t.Fatalf("entries %+v", logs.All())
+	}
+	for i, want := range []map[string]any{
+		{"capture": int64(5), "llm": true, "stored_result": true, "minimal": false, "failure": false, "actions": int64(1)},
+		{"capture": int64(5), "llm": false, "stored_result": false, "minimal": false, "failure": false, "actions": int64(0)},
+	} {
+		f := entries[i].ContextMap()
+		for k, v := range want {
+			if f[k] != v {
+				t.Errorf("entry %d field %s = %v, want %v", i, k, f[k], v)
+			}
+		}
 	}
 }
 

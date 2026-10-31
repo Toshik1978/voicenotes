@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"go.uber.org/zap"
 
@@ -308,6 +309,13 @@ func (s *stepRunner) enrich(ctx context.Context, c capture.Capture) (capture.Cap
 		return c, capture.Permanent("LLM output not storable")
 	}
 	c.EnrichedJSON, c.TaskCount = stored, len(res.Tasks)
+	// Only the answer's shape: never the transcript or the answer itself.
+	s.d.Log.Debug("LLM answer accepted",
+		zap.Int64("capture", c.ID), zap.String("detected", c.Language),
+		zap.String("language", res.Language), zap.Bool("translated", res.Translated),
+		zap.Int("tasks", len(res.Tasks)), zap.Int("tags", len(res.Tags)),
+		zap.Int("input_runes", utf8.RuneCountInString(c.Text)),
+		zap.Int("text_runes", utf8.RuneCountInString(res.Text)))
 
 	return c, capture.OK()
 }
@@ -363,6 +371,7 @@ func (s *stepRunner) writeNote(ctx context.Context, c capture.Capture) (capture.
 	if strings.HasPrefix(c.Failure, attachFailedMark) {
 		in.Failure = ""
 	}
+	s.logRendered(c, in)
 	name, link, out := s.d.Notes.Create(ctx, NoteInput{
 		CaptureID:  c.ID,
 		Content:    render.Render(in, s.cfg.NoteLimit),
@@ -380,6 +389,16 @@ func (s *stepRunner) writeNote(ctx context.Context, c capture.Capture) (capture.
 	}
 
 	return s.attach(ctx, c)
+}
+
+// logRendered records at debug whether the note carries the LLM result, so a
+// live deploy can tell a dropped result from an answer that kept the text.
+func (s *stepRunner) logRendered(c capture.Capture, in render.Input) {
+	llm := in.Text != c.Text || len(in.Actions) > 0 || len(in.SuggestedTags) > 0
+	s.d.Log.Debug("note rendered",
+		zap.Int64("capture", c.ID), zap.Bool("stored_result", c.EnrichedJSON != ""),
+		zap.Bool("llm", llm), zap.Bool("minimal", c.MinimalNote), zap.Bool("failure", in.Failure != ""),
+		zap.Int("actions", len(in.Actions)))
 }
 
 // attach uploads the audio to the note. A missing file is not an error: the
