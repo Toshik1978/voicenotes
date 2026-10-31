@@ -127,11 +127,11 @@ func BuildRequest(o Options, text, detectedLang string) []Message {
 		shape = append(shape, `"tags": array of strings`)
 	}
 	if o.Tasks {
-		sys.WriteString(
-			"- Extract action items the speaker must do as short imperative sentences " +
-				"(at most 10, each under 200 characters), in the language of \"text\".\n",
-		)
-		shape = append(shape, `"tasks": array of strings, empty if none`)
+		fmt.Fprintf(&sys,
+			"- Extract action items the speaker must do as short imperative sentences "+
+				"(at most 10, each under 200 characters), in %s.\n",
+			tasksLanguage(o))
+		shape = append(shape, tasksKey(o))
 	}
 	sys.WriteString("JSON keys:\n")
 	for _, s := range shape {
@@ -152,6 +152,24 @@ func textKey(o Options) string {
 	}
 
 	return `"text": string`
+}
+
+// tasksLanguage names the language of the action items: the target when
+// translating, since "the language of text" left them in the input's.
+func tasksLanguage(o Options) string {
+	if o.Translate {
+		return o.Target
+	}
+
+	return "the language of the input"
+}
+
+func tasksKey(o Options) string {
+	if o.Translate {
+		return `"tasks": array of strings in ` + o.Target + `, empty if none`
+	}
+
+	return `"tasks": array of strings, empty if none`
 }
 
 // translateLine repeats the translate instruction next to the text: the

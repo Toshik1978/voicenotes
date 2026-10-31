@@ -43,6 +43,19 @@ func TestBuildRequest(t *testing.T) {
 			[]string{"if it differs"},
 		},
 		{
+			// "In the language of text" left tasks in the input's language.
+			"tasks follow the target language when translating",
+			func(*Options) {},
+			[]string{"each under 200 characters), in en.", `"tasks": array of strings in en`},
+			[]string{`in the language of "text"`},
+		},
+		{
+			"tasks keep the note's language without translation",
+			func(o *Options) { o.Translate = false },
+			[]string{"in the language of the input"},
+			[]string{"in en"},
+		},
+		{
 			"translate only",
 			func(o *Options) { o.Tidy, o.Tasks = false, false },
 			[]string{"Translate", `"translated"`},

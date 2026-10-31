@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -57,6 +58,12 @@ func builtinLLMCases() []llmCase {
 				"магазин, купить краску и кисти. А в понедельник записаться к стоматологу.",
 		},
 		{"ru short", "ru", true, "Купить хлеб."},
+		{
+			"ru one task",
+			"ru",
+			true,
+			"У нас появились отличные идеи насчёт сотрудничества. До пятницы надо написать Ивану и предложить созвон.",
+		},
 		{"ru mixed en", "ru", true, "Надо обсудить с командой deadline по release и написать follow-up в Slack."},
 		{"en tasks", "en", true, "Remind me to renew the car insurance next week and call the plumber about the leak."},
 		{"en no tasks", "en", false, "Just an idea: a small app that tracks how often I water the plants."},
@@ -70,7 +77,9 @@ type llmTally struct {
 	// flagOnly counts untranslated answers whose text is nevertheless in the
 	// target language: the model translated but said it did not.
 	flagOnly int
-	reasons  map[string]int
+	// foreignTasks counts answers with an action item not in the target.
+	foreignTasks int
+	reasons      map[string]int
 }
 
 func TestLLMRepeatIntegration(t *testing.T) {
@@ -107,7 +116,8 @@ func TestLLMRepeatIntegration(t *testing.T) {
 	for _, c := range cases {
 		tl := runLLMCase(chat, opts, c, runs)
 		t.Logf(
-			"%-22s ok %2d/%d · call errors %d · invalid %d · untranslated %d (flag only %d) · no tasks %d · no tags %d %v",
+			"%-22s ok %2d/%d · call errors %d · invalid %d · untranslated %d (flag only %d) · foreign tasks %d · "+
+				"no tasks %d · no tags %d %v",
 			c.name,
 			tl.ok,
 			runs,
@@ -115,6 +125,7 @@ func TestLLMRepeatIntegration(t *testing.T) {
 			tl.invalid,
 			tl.untranslated,
 			tl.flagOnly,
+			tl.foreignTasks,
 			tl.noTasks,
 			tl.noTags,
 			tl.reasons,
@@ -160,6 +171,8 @@ func runLLMCase(chat *Chat, opts enrich.Options, c llmCase, runs int) llmTally {
 				tl.reasons[strings.TrimPrefix(err.Error(), enrich.ErrInvalidOutput.Error()+": ")]++
 			case c.lang != opts.Target && !res.Translated:
 				tl.untranslated++
+			case slices.ContainsFunc(res.Tasks, func(task string) bool { return !mostlyASCII(task) }):
+				tl.foreignTasks++
 			case c.wantTasks && len(res.Tasks) == 0:
 				tl.noTasks++
 			case len(res.Tags) == 0:
