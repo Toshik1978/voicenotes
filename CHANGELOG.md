@@ -9,6 +9,24 @@ Versions follow [semver](https://semver.org). Commits follow
 
 ---
 
+## v0.1.2 — 2026-10-31
+
+Highlights:
+
+- Notes in another language are now translated reliably. The prompt treated translation as optional, so a note with no action items often stayed in its language and silently looked as if the LLM never ran: measured over 30 runs per case, a Russian note without tasks stayed Russian 29 times and a German one 22 times. The prompt now requires the target language and repeats the instruction next to the note; every measured case gives a full note 30 times out of 30.
+- If the model still keeps a foreign text, the LLM step asks again within its budget, and the reply says "(no AI)" rather than "✓ saved" when it never translates.
+- At `LOG_LEVEL=debug`, the shape of each LLM answer (language, translated, task and tag counts) and whether the note used it are logged, never the text.
+
+### Features
+
+- feat(pipeline): log the shape of the LLM answer at debug ([6faeea9](https://github.com/Toshik1978/voicenotes/commit/6faeea97a938fb0b892a2abd5f3bb3613efd3962))
+
+### Bug Fixes
+
+- fix(llm): translate every note reliably ([a9edd2e](https://github.com/Toshik1978/voicenotes/commit/a9edd2efd96324797db491f5e21843cf74351bdc))
+
+---
+
 ## v0.1.1 — 2026-10-30
 
 Highlights:
