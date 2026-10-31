@@ -9,6 +9,18 @@ Versions follow [semver](https://semver.org). Commits follow
 
 ---
 
+## v0.1.3 — 2026-10-31
+
+Highlights:
+
+- Action items of a translated note are now in the target language too. The prompt asked for them "in the language of the text", which the model read as the original language, so an English note could carry a Russian checklist.
+
+### Bug Fixes
+
+- fix(llm): write action items in the target language ([0509646](https://github.com/Toshik1978/voicenotes/commit/050964655cfa210071443b7902bdf4c432b47c73))
+
+---
+
 ## v0.1.2 — 2026-10-31
 
 Highlights:
