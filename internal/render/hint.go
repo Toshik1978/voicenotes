@@ -24,6 +24,12 @@ const hintMaxRunes = 160
 // imageMarker is the placeholder docling leaves where a picture was.
 const imageMarker = "<!-- image -->"
 
+// StripImageMarkers removes docling's picture placeholders from text and trims
+// the result, so text that held only pictures comes back empty.
+func StripImageMarkers(text string) string {
+	return strings.TrimSpace(strings.ReplaceAll(text, imageMarker, ""))
+}
+
 // FileSummary is what the renderer needs to know about one kept file.
 type FileSummary struct {
 	// Kind is KindImage, KindDocument or another kind (treated as a file).
@@ -41,7 +47,8 @@ type FileSummary struct {
 // FallbackHint builds the hint used when the LLM step is off or failed: the
 // first two cleaned lines of the first extracted text, capped at 160 runes.
 // Without extracted text it returns a placeholder naming the item, followed by
-// " — <reason>" when every file failed. It returns "" for no files.
+// " — <reason>" when every file failed or " — no text found" when every file
+// came back empty. It returns "" for no files.
 func FallbackHint(files []FileSummary) string {
 	if len(files) == 0 {
 		return ""
@@ -84,8 +91,14 @@ func itemPlaceholder(files []FileSummary) string {
 	}
 }
 
-// failureSuffix is " — <reason>" when every file failed with a reason.
+// failureSuffix is " — <reason>" when every file failed with a reason, or
+// " — no text found" when every file came back empty. Empty means a reader ran
+// and found nothing; a file no reader was configured for is skipped instead,
+// so it keeps the plain placeholder (FR-129).
 func failureSuffix(files []FileSummary) string {
+	if allInState(files, StateEmpty) {
+		return " — no text found"
+	}
 	reason := ""
 	for _, f := range files {
 		if f.State != StateFailed {
@@ -100,6 +113,16 @@ func failureSuffix(files []FileSummary) string {
 	}
 
 	return " — " + reason
+}
+
+func allInState(files []FileSummary, state string) bool {
+	for _, f := range files {
+		if f.State != state {
+			return false
+		}
+	}
+
+	return len(files) > 0
 }
 
 // cleanLines drops markdown noise and blank lines from extracted text.

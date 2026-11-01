@@ -184,9 +184,11 @@ func (w *Worker) Wake() {
 }
 
 // AckHoldLimit bounds how long HoldAck keeps the worker off a capture. It
-// exceeds one Bot API call (a minute) plus a single-row write, so a live
-// acknowledgement always finishes first; it only matters if one hangs.
-const AckHoldLimit = 2 * time.Minute
+// exceeds a batch's first-item download (ArrivalDownloadLimit), one Bot API
+// call (a minute) and the row writes, and so the Telegram handler's own
+// three-minute bound, so a live acknowledgement always finishes first; it
+// only matters if one hangs.
+const AckHoldLimit = 4 * time.Minute
 
 // sourceKey is a capture's source identity, known before its row exists.
 type sourceKey struct {

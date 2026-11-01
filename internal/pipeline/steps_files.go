@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"path"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -35,24 +36,65 @@ func (s *stepRunner) collect(_ context.Context, c capture.Capture) (capture.Capt
 // and files already settled (failed downloads among them) are left alone.
 func skipUnreadFiles(files []capture.File, reader, vision bool) {
 	for i := range files {
-		f := &files[i]
-		if f.State != capture.FilePending {
-			continue
-		}
-		switch f.Kind {
-		case capture.FileVideo:
-			f.State = capture.FileSkipped
-		case capture.FileDocument:
-			if !reader {
-				f.State = capture.FileSkipped
-			}
-		case capture.FileImage:
-			if !reader && !vision {
-				f.State = capture.FileSkipped
-			}
-		case capture.FileAudio:
+		if files[i].State == capture.FilePending && !readable(files[i], reader, vision) {
+			files[i].State = capture.FileSkipped
 		}
 	}
+}
+
+// readable reports whether some wired reader can take the pending file f.
+// Plain text needs none (FR-129); audio is never skipped here.
+func readable(f capture.File, reader, vision bool) bool {
+	switch f.Kind {
+	case capture.FileVideo:
+		return false
+	case capture.FileDocument:
+		return reader || isPlainText(f)
+	case capture.FileImage:
+		return reader || vision
+	case capture.FileAudio:
+	}
+
+	return true
+}
+
+// isPlainText reports whether f is a plain-text document (text/plain or a
+// .txt name). A standard docling-serve has no plain-text input format
+// (from_formats lists no txt, as of v1.38.2), so these are read locally and
+// need no reader (FR-110, FR-129).
+func isPlainText(f capture.File) bool {
+	if f.Kind != capture.FileDocument {
+		return false
+	}
+	mimeType, _, _ := strings.Cut(f.MimeType, ";")
+	if strings.EqualFold(strings.TrimSpace(mimeType), "text/plain") {
+		return true
+	}
+
+	return strings.EqualFold(path.Ext(f.FileName), ".txt")
+}
+
+// readPlainText records the text of the plain-text document c.Files[i] as it
+// is: UTF-8 with invalid bytes replaced, cut to the excerpt budget. It never
+// goes to the document reader. Content is never logged.
+func (s *stepRunner) readPlainText(c *capture.Capture, i int) capture.Outcome {
+	data, out, ok := s.readHeld(c, i)
+	if !ok {
+		return out
+	}
+	f := &c.Files[i]
+	text := strings.ToValidUTF8(string(data), "\uFFFD")
+	if n := s.cfg.Enrich.ExcerptRunes; n > 0 && len(text) > n {
+		if r := []rune(text); len(r) > n {
+			text = string(r[:n])
+		}
+	}
+	f.Text, f.TextSource, f.State = text, capture.TextLocal, capture.FileDone
+	if strings.TrimSpace(text) == "" {
+		f.Text, f.State = "", capture.FileEmpty
+	}
+
+	return capture.OK()
 }
 
 // readHeld reads the local copy of c.Files[i]. A missing copy fails the file
@@ -88,7 +130,9 @@ func (s *stepRunner) readDocument(ctx context.Context, c *capture.Capture, i int
 		return out
 	}
 	f := &c.Files[i]
-	name := cmp.Or(SanitizeFileName(f.FileName), path.Base(f.LocalPath))
+	// The attachment name: the original name when there is one, otherwise
+	// e.g. photo-<date>-<n>.jpg, so a nameless photo still has an extension.
+	name := s.attachmentName(*c, *f)
 	start := time.Now()
 	res, out := s.d.Extractor.Convert(ctx, name, f.MimeType, data)
 	s.d.Log.Debug("document read",
@@ -107,9 +151,12 @@ func (s *stepRunner) readDocument(ctx context.Context, c *capture.Capture, i int
 	if out.Class != capture.ClassOK {
 		return out.On(capture.WaitingDocling)
 	}
-	f.Text, f.TextSource, f.State = res.Markdown, capture.TextDocling, capture.FileDone
-	if strings.TrimSpace(res.Markdown) == "" {
-		f.Text, f.State = "", capture.FileEmpty
+	// Picture placeholders are not text: a photo that holds only them is empty,
+	// so the "no text found" hint applies, the LLM never sees a marker-only
+	// excerpt and the vision model still gets its turn.
+	f.Text, f.TextSource, f.State = render.StripImageMarkers(res.Markdown), capture.TextDocling, capture.FileDone
+	if f.Text == "" {
+		f.State = capture.FileEmpty
 	}
 
 	return capture.OK()
@@ -285,35 +332,38 @@ func attachMime(f capture.File) string {
 	return f.MimeType
 }
 
+// maxNamedItems bounds how many failed items a reply names; the rest are
+// summarised as "and N more", which keeps the Telegram reply short when a
+// large album fails.
+const maxNamedItems = 3
+
 // filesReplyText builds the final reply of a files capture
-// (contracts/telegram-ux.md). "Not kept" wins over "not attached", and the
-// reason named is the first such failure's.
+// (contracts/telegram-ux.md). "Not kept" wins over "not attached". It names
+// the failed items, each with its own reason (FR-126).
 func filesReplyText(c capture.Capture, link string) string {
 	t := tallyFiles(c.Files)
 	n := len(c.Files)
 	switch {
-	case n > 0 && t.notKept == n:
-		return fmt.Sprintf("⚠ files not kept — %s · please send them again · %s",
-			html.EscapeString(t.keptReason), link)
-	case t.notKept > 0:
-		return fmt.Sprintf("⚠ saved, %d of %d not kept — %s · %s",
-			t.notKept, n, html.EscapeString(t.keptReason), link)
-	case t.notAttached > 0:
+	case n > 0 && len(t.notKept) == n:
+		return fmt.Sprintf("⚠ files not kept — %s · please send them again · %s", nameItems(t.notKept), link)
+	case len(t.notKept) > 0:
+		return fmt.Sprintf("⚠ saved, %d of %d not kept — %s · %s", len(t.notKept), n, nameItems(t.notKept), link)
+	case len(t.notAttached) > 0:
 		return fmt.Sprintf("⚠ saved, %d of %d not attached — %s · %s",
-			t.notAttached, n, html.EscapeString(t.attachReason), link)
+			len(t.notAttached), n, nameItems(t.notAttached), link)
 	}
 
 	return savedText(c, link)
 }
 
-// fileTally counts the files the reply must report, with the first reason
-// of each kind.
-type fileTally struct {
-	notKept, notAttached     int
-	keptReason, attachReason string
-}
+// failedItem is one file the reply must report: how the user knows it and
+// why it failed.
+type failedItem struct{ label, reason string }
 
-// tallyFiles counts the files with no local copy (not kept: the download
+// fileTally lists the files the reply must report, by kind of failure.
+type fileTally struct{ notKept, notAttached []failedItem }
+
+// tallyFiles collects the files with no local copy (not kept: the download
 // failed, or the copy went missing) and those the notes store refused (not
 // attached).
 func tallyFiles(files []capture.File) fileTally {
@@ -322,17 +372,47 @@ func tallyFiles(files []capture.File) fileTally {
 		f := &files[i]
 		switch {
 		case f.LocalPath == "":
-			t.notKept++
-			if t.keptReason == "" {
-				t.keptReason = cmp.Or(f.Failure, "file missing")
-			}
+			t.notKept = append(t.notKept, failedItem{itemLabel(f, i+1), cmp.Or(f.Failure, "file missing")})
 		case f.AttachFailure != "":
-			t.notAttached++
-			if t.attachReason == "" {
-				t.attachReason = f.AttachFailure
-			}
+			t.notAttached = append(t.notAttached, failedItem{itemLabel(f, i+1), f.AttachFailure})
 		}
 	}
 
 	return t
+}
+
+// itemLabel is how the user knows file n (1-based) of the capture: its
+// sanitised name, as the note's attachment shows it, or "photo 3", "video 3",
+// "voice 3" or "file 3" by place when it has none.
+func itemLabel(f *capture.File, n int) string {
+	if name := SanitizeFileName(f.FileName); name != "" {
+		return name
+	}
+	kind := "file"
+	switch f.Kind {
+	case capture.FileImage:
+		kind = "photo"
+	case capture.FileVideo:
+		kind = "video"
+	case capture.FileAudio:
+		kind = "voice"
+	case capture.FileDocument:
+	}
+
+	return kind + " " + strconv.Itoa(n)
+}
+
+// nameItems renders up to maxNamedItems failed items as "label (reason)",
+// HTML-escaped, then "and N more" for the rest.
+func nameItems(items []failedItem) string {
+	parts := make([]string, 0, maxNamedItems)
+	for _, it := range items[:min(len(items), maxNamedItems)] {
+		parts = append(parts, html.EscapeString(it.label)+" ("+html.EscapeString(it.reason)+")")
+	}
+	out := strings.Join(parts, ", ")
+	if more := len(items) - maxNamedItems; more > 0 {
+		out += fmt.Sprintf(" and %d more", more)
+	}
+
+	return out
 }

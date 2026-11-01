@@ -238,7 +238,7 @@ func newPipeline(cfg config.Config, log *zap.Logger, db *sqlite.DB, deps pipelin
 	docsWorker.SetQueueNotifier(notifier)
 
 	ingester, err := pipeline.NewIngester(db, wakeAll{mainWorker, docsWorker},
-		pipeline.WithFiles(db, cfg.BatchQuietPeriod))
+		pipeline.WithFiles(db, cfg.BatchQuietPeriod, deps.Downloader, deps.Files), pipeline.WithLog(log))
 	if err != nil {
 		return nil, fmt.Errorf("ingester: %w", err)
 	}

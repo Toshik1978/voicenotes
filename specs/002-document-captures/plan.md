@@ -107,7 +107,7 @@ The new adapter `internal/docling` is outside the gate (I/O only), but its tests
 | III. Dependency discipline | ✅ | No new dependency. |
 | IV. Static, CGO-free | ✅ | No cgo. No new binary or shell in the image: docling runs as the owner's separate service. |
 | V. Fail fast on config, degrade on dependencies | ✅ | New settings validated at startup, naming the variable, never the value. Docling and vision are wired only when configured, with plain conditionals in `main()`. An unreachable docling makes captures wait (`waiting_on=docling`) and health degraded; the process never exits. |
-| VI. No capture lost | ✅ | Every file is written and fsynced before the batch row or file row commits and before ⏳. Extraction records per-file results, one file per attempt, so a crash never repeats a finished file. Permanent failures degrade to a note with the attachments and a placeholder hint. Local files are deleted only after the note is saved. |
+| VI. No capture lost | ✅ | Every item's row commits on arrival. The item that creates a batch is then downloaded, written and fsynced, and its local path recorded, before its ⏳; if that download fails it stays stored without data, no ⏳ is sent on arrival, and the download step sends the ⏳ once it holds the file. Joining items stay row-first and are downloaded by the pipeline: the ⏳ acknowledges the capture as it exists then (the first item, on disk), and later items are confirmed by the final reply after the note. The quiet period restarts after the ack, so a slow first download cannot split an album. Extraction records per-file results, one file per attempt, so a crash never repeats a finished file. Permanent failures degrade to a note with the attachments and a placeholder hint. Local files are deleted only after the note is saved. |
 | VII. Public repo hygiene | ✅ | Docs and examples use `docling.example.org`, `llm.example.org` and fake keys. No real endpoints or model deployments. |
 | VIII. Conventional Commits | ✅ | Unchanged workflow. Commits like `feat(capture): …` and `feat(docling): …`. |
 
@@ -142,7 +142,8 @@ No violations. Complexity Tracking stays empty.
 - **Batching rule** (`capture.JoinBatch`): an incoming file item joins the chat's open batch when
   the batch is at `collect` and either its `NextAttemptAt` (last item + quiet period) is after
   `now`, or the item's album ID equals the batch's album ID. Joining pushes `NextAttemptAt` to
-  `now + quiet`. Otherwise the item starts a new batch. The rule is pure, and the store applies
+  `now + quiet`. After the creating item's ⏳ is sent, still under the ack hold, the deadline is
+  pushed to `now + quiet` again, so items queued behind a slow ⏳ still join (T030). Otherwise the item starts a new batch. The rule is pure, and the store applies
   it inside one write transaction (see research R3).
 - **Lanes** (`capture.LaneOf`): `documents` = `files` captures at `extract`; `main` = everything
   else. Each lane's `NextDue` returns the lowest-ID **due** capture in that lane (no head-of-line
@@ -156,9 +157,13 @@ No violations. Complexity Tracking stays empty.
 - Two `Worker` instances share the store, each with a lane filter. The `main` lane has handlers
   for every step except document extraction. The `documents` lane has only the `extract` handler.
   Health reports unhealthy if either loop stops.
-- **download**: per file. Files are normally written at ingest. A file whose ingest download
-  failed is fetched here by file ID, one per attempt (`Progress`). A file too large or rejected by
-  Telegram is marked `failed`.
+- **download**: per file. Audio is normally written at ingest, and so is the item that created a
+  batch. Every file item's row commits on arrival with its file ID (T029), so batching follows
+  arrival order; joining items, and a first item whose arrival download failed, are fetched here
+  by file ID, one per attempt (`Progress`), as is audio whose ingest download failed. A file too
+  large or rejected by Telegram is marked `failed`. The batch's ⏳ is sent at arrival by the
+  handler for the item that created it, once that item is on disk; download sends one only when
+  that download or the ack failed.
 - **extract** (per file, one per attempt):
   - audio → speech-to-text (today's logic, incl. language recheck)
   - image/document → docling if configured, then vision if allowed by
@@ -194,9 +199,12 @@ No violations. Complexity Tracking stays empty.
   `Chat.Complete` is unchanged.
 - `internal/telegram`: `fromTele` maps `Photo` (largest size), `Document`, `Video`, `Caption` and
   `AlbumID`. Audio-MIME documents map to `Audio`. `Handler` gains `files()`.
-  1. Write the file durably (as audio today).
-  2. Call `Ingester.IngestFile`, which joins or creates the batch in one transaction.
-  3. Send ⏳ only when a new batch was created.
+  1. Call `Ingester.IngestFile`, which joins or creates the batch in one transaction.
+  2. Only when a new batch was created: download the item (bounded by
+     `pipeline.ArrivalDownloadLimit`), write and fsync it, and record its local path. A joining
+     item is left to the download step.
+  3. Send ⏳ only for a created batch whose item is now on disk; then restart the quiet period.
+     If step 2 failed, no ⏳ is sent here and the download step sends it later.
 - `internal/store/sqlite`: migration 002; `Insert`/`Update`/`queryOne` handle `Files`; new
   `AppendFile` (join-or-create in one `BEGIN IMMEDIATE` transaction); `NextDue(ctx, now, lane)`;
   `FilePaths` (renamed `AudioPaths`, now over `capture_files`).
@@ -263,7 +271,9 @@ to `internal/openai` and `internal/memos`. Pure logic extends the gated packages
 Re-checked against data-model.md and the contracts:
 
 - VI holds:
-  - Files are fsynced before the row commits.
+  - The item that creates a batch is fsynced, and its local path recorded, before its ⏳; a
+    joining item's row commits first and the pipeline downloads it. The ⏳ acknowledges the
+    batch as it exists then.
   - `ClassProgress` persists every per-file result before the next one.
   - Join-or-create happens in one write transaction.
   - Cleanup runs after `write_note`.

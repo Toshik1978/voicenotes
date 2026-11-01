@@ -5,12 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	stdpath "path"
 	"path/filepath"
 
 	"go.uber.org/zap"
 
-	"github.com/Toshik1978/voicenotes/internal/capture"
 	"github.com/Toshik1978/voicenotes/internal/pipeline"
 )
 
@@ -95,110 +93,46 @@ func removeAudio(dir, name string, log *zap.Logger) {
 	}
 }
 
-// filePattern is the os.CreateTemp pattern for a file item:
-// tg-<chat>-<msg>-<random><ext>, the same scheme as audioPattern. The
-// extension comes from the sanitised original name, so it is safe on disk.
-func filePattern(m Message) string {
-	ext := pipeline.SanitizeExt(stdpath.Ext(pipeline.SanitizeFileName(m.Files.Name)))
-
-	return fmt.Sprintf("tg-%d-%d-*%s", m.ChatID, m.ID, ext)
-}
-
 // files stores one photo, document or video as part of a files capture
-// (a batch). Like audio it downloads and fsyncs first, then commits the item
-// and sends ⏳, which the ingester runs only when the item started a new
-// batch. If the file cannot be fetched or written, the item is still
-// committed, with no local path and no reply, and the pipeline's download
-// step fetches it later. A file over the download limit is kept in its batch
-// as failed (see tooLargeFile).
+// (a batch) the moment it arrives. The item's row commits first, so its
+// batch position, caption order and quiet period are fixed in arrival
+// order (FR-106, FR-107): Run hands one chat's file messages over one at a
+// time, in delivery order, so a slow download can no longer reorder an
+// album or push a part out of its batch, and the item that creates a batch
+// really is its first. That item alone is then downloaded and fsynced here,
+// and only then gets the batch's one ⏳ (Constitution VI, FR-103; the
+// ingester holds the worker off it meanwhile and restarts the quiet period
+// afterwards), so the download step finds it on disk and the reply
+// recorded. If it cannot be downloaded or written it stays stored without
+// data and no ⏳ is sent here: the download step fetches it and sends the
+// ⏳ then. A joining item is not downloaded here; the pipeline's download
+// step fetches it by its Telegram file ID once the batch closes, and the
+// final reply confirms it.
+//
+// A file over the download limit (research R11) with an album ID, or one
+// that joins the chat's open batch, is stored in the batch as a failed
+// file, so the note keeps the rest and the reply names it (FR-126). A
+// standalone one is stored nowhere and gets TextTooLarge, as for audio.
 func (h *Handler) files(ctx context.Context, m Message) {
 	item := pipeline.FileItem{
 		Source: Source, ChatID: m.ChatID, MessageID: m.ID, ReceivedAt: m.Date,
 		Kind: m.Files.Kind, FileID: m.Files.FileID, MimeType: m.Files.MIME,
 		Name: m.Files.Name, Size: m.Files.Size, Caption: m.Files.Caption, AlbumID: m.Files.AlbumID,
+		TooLarge: m.Files.Size > MaxFileSize,
 	}
-	if m.Files.Size > MaxFileSize {
-		h.tooLargeFile(ctx, m, item)
-
-		return
-	}
-
-	data, err := h.dl.Download(ctx, m.Files.FileID)
-	if errors.Is(err, ErrTooLarge) {
-		h.tooLargeFile(ctx, m, item)
-
-		return
-	}
-	if err != nil {
-		h.log.Warn("file download failed, queueing for the download step",
-			zap.Int64("chat", m.ChatID), zap.Int64("message", m.ID), zap.Error(err))
-		h.ingestFile(ctx, m, item, nil)
-
-		return
-	}
-	name, err := writeAudio(h.filesDir, filePattern(m), data)
-	if err != nil {
-		h.log.Error("writing file failed, queueing for the download step",
-			zap.Int64("chat", m.ChatID), zap.Int64("message", m.ID), zap.Error(err))
-		h.ingestFile(ctx, m, item, nil)
-
-		return
-	}
-
-	item.LocalPath = name
-	if item.Size == 0 {
-		item.Size = int64(len(data))
-	}
-	if !h.ingestFile(ctx, m, item, h.ack(m)) {
-		// Duplicate or store failure: the file belongs to no row.
-		removeAudio(h.filesDir, name, h.log)
-	}
-}
-
-// tooLargeFile handles a file over the download limit (research R11). One
-// with an album ID, or one that joins the chat's open batch, is stored in
-// the batch as a failed file, so the note keeps the rest and the reply names
-// it (FR-126). A standalone one is stored nowhere and gets TextTooLarge, as
-// for audio.
-func (h *Handler) tooLargeFile(ctx context.Context, m Message, item pipeline.FileItem) {
-	item.TooLarge = true
 	stored, err := h.ingester.IngestFile(ctx, item, h.ack(m))
-	if errors.Is(err, pipeline.ErrFileTooLarge) {
-		h.tooLarge(ctx, m)
-
-		return
-	}
-	h.ingestFileResult(ctx, m, item, stored, err)
-}
-
-// ingestFile stores item and reports whether it was newly stored, with the
-// same duplicate and failure handling as ingest.
-func (h *Handler) ingestFile(ctx context.Context, m Message, item pipeline.FileItem, ack pipeline.Ack) bool {
-	stored, err := h.ingester.IngestFile(ctx, item, ack)
-
-	return h.ingestFileResult(ctx, m, item, stored, err)
-}
-
-// ingestFileResult logs IngestFile's outcome, asks the sender to resend on
-// a store failure and reports whether the item was newly stored.
-func (h *Handler) ingestFileResult(
-	ctx context.Context, m Message, item pipeline.FileItem, stored capture.Capture, err error,
-) bool {
 	switch {
+	case errors.Is(err, pipeline.ErrFileTooLarge):
+		h.tooLarge(ctx, m)
 	case errors.Is(err, pipeline.ErrDuplicate):
 		h.log.Info("duplicate delivery ignored", zap.Int64("chat", m.ChatID), zap.Int64("message", m.ID))
-
-		return false
 	case err != nil:
 		h.log.Error("storing file capture failed; asking the sender to resend",
 			zap.Int64("chat", m.ChatID), zap.Int64("message", m.ID), zap.Error(err))
 		h.reply(ctx, m, TextNotSaved)
-
-		return false
+	default:
+		h.log.Info("file stored",
+			zap.Int64("capture", stored.ID), zap.Int64("chat", m.ChatID), zap.Int64("message", m.ID),
+			zap.Stringer("kind", item.Kind))
 	}
-	h.log.Info("file stored",
-		zap.Int64("capture", stored.ID), zap.Int64("chat", m.ChatID), zap.Int64("message", m.ID),
-		zap.Stringer("kind", item.Kind))
-
-	return true
 }

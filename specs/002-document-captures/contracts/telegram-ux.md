@@ -25,7 +25,10 @@ owner's text.
   - the item has the same album ID.
 - Otherwise a new batch starts.
 - One batch = one capture = one note = one reply.
-- The ⏳ reply answers the batch's first item. Later items get no reply of their own.
+- The ⏳ reply answers the batch's first item, and is sent once that item is downloaded and on
+  disk (FR-103). If its download fails, the item stays stored and the ⏳ follows after the
+  pipeline downloads it. Later items get no reply of their own: they are stored on arrival,
+  downloaded by the pipeline, and confirmed by the final reply.
 - Captions are joined in send order.
 
 ## Capture replies (new or changed rows)
@@ -34,14 +37,16 @@ owner's text.
 |---|---|
 | Waiting on docling | `⏳ queued — document reader unavailable, will retry` |
 | Done (files) | `✓ saved · <a href="URL">open</a>`, plus the same `· N tasks` / `(no AI)` rules as 001 |
-| Done, some items not kept (too large, download rejected) | `⚠ saved, 1 of 4 not kept — <short reason> · <a href="URL">open</a>` |
-| Done, some items not attached (Memos refused) | `⚠ saved, 1 of 4 not attached — <short reason> · <a href="URL">open</a>` |
-| Done, no item could be kept | `⚠ files not kept — <short reason> · please send them again · <a href="URL">open</a>` |
+| Done, some items not kept (too large, download rejected) | `⚠ saved, 1 of 4 not kept — <item> (<short reason>) · <a href="URL">open</a>` |
+| Done, some items not attached (Memos refused) | `⚠ saved, 1 of 4 not attached — <item> (<short reason>) · <a href="URL">open</a>` |
+| Done, no item could be kept | `⚠ files not kept — <item> (<short reason>) · please send them again · <a href="URL">open</a>` |
 | Unsupported message type | `VoiceNotes takes voice, text, photos and files.` |
 | Single file over 20 MB, not part of a batch | `⚠ too large for Telegram bots (max 20 MB) — not saved.` (unchanged) |
 
-`<short reason>` names the first failure, for example `too large for Telegram bots`. When several
-kinds of failure occur, "not kept" wins over "not attached". Content extraction failures (no text,
+`<item>` is the file name as the note shows it (sanitised), or its place for a photo or file with
+no name (`photo 3`, `file 2`). Each named item carries its own `<short reason>`, for example
+`too large for Telegram bots`. At most three items are named, separated by commas; the rest are
+summarised as `and N more`. When several kinds of failure occur, "not kept" wins over "not attached". Content extraction failures (no text,
 couldn't read in time, unsupported by the reader) never change the reply: they show up as the
 placeholder hint in the note.
 

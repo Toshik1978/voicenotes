@@ -134,7 +134,7 @@ The owner photographs a handwritten note. The local document-conversion service 
 
 - **FR-101**: The system MUST accept photos, files sent as documents, and videos, including forwarded ones, from allowlisted senders as captures, within the bot download limit. This supersedes 001 FR-004 for those message types.
 - **FR-102**: The system MUST keep answering other message types (stickers, locations, contacts, polls and similar) with a one-line "unsupported" reply that names what is accepted, and MUST NOT create a note.
-- **FR-103**: The system MUST persist every received file durably and locally before acknowledging the capture, as for audio (001 FR-005).
+- **FR-103**: The system MUST persist every received file durably before acknowledging the capture, as for audio (001 FR-005). The ⏳ acknowledges a batch as it exists when it is sent: the item that creates the batch is downloaded and written durably and locally before its ⏳, and if that download fails the item is stored without its data, no ⏳ is sent on arrival, and the ⏳ follows once the pipeline has downloaded it. Items that join an open batch are stored on arrival and downloaded by the pipeline; they get no ⏳ of their own and are confirmed by the final reply after the note is saved.
 - **FR-104**: A caption sent with a photo, file or batch MUST be used as the note's own text and processed by the LLM step like a text capture.
 - **FR-105**: Audio sent as a file MUST keep being handled as audio (transcribed), as today.
 

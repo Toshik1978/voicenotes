@@ -362,6 +362,9 @@ func (s *stepRunner) extractFile(ctx context.Context, c *capture.Capture, i int)
 	if c.Files[i].Kind == capture.FileAudio {
 		return s.transcribeFile(ctx, c, i)
 	}
+	if c.Files[i].State == capture.FilePending && isPlainText(c.Files[i]) {
+		return s.readPlainText(c, i)
+	}
 	if c.Files[i].State == capture.FilePending && s.d.Extractor != nil {
 		if out := s.readDocument(ctx, c, i); out.Class != capture.ClassOK {
 			return out

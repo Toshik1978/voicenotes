@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -36,6 +38,12 @@ type e2eWorld struct {
 	// attached holds each attachment's bytes, which name its file ID.
 	attached []string
 	replies  []string
+	// downloadDelay slows every download; ackDelay slows every ⏳ send.
+	// Both are set before the pipeline starts.
+	downloadDelay, ackDelay time.Duration
+	// filesDir is the files directory; atAck lists its entries at each ⏳.
+	filesDir string
+	atAck    [][]string
 }
 
 func (w *e2eWorld) Create(_ context.Context, n pipeline.NoteInput) (string, string, capture.Outcome) {
@@ -56,9 +64,20 @@ func (w *e2eWorld) Attach(_ context.Context, _, filename, _ string, data []byte)
 }
 
 func (w *e2eWorld) Send(_ context.Context, _, _ int64, text string) (int64, error) {
+	var held []string
+	if text == "⏳" {
+		time.Sleep(w.ackDelay)
+		entries, _ := os.ReadDir(w.filesDir)
+		for _, e := range entries {
+			held = append(held, e.Name())
+		}
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.replies = append(w.replies, text)
+	if text == "⏳" {
+		w.atAck = append(w.atAck, held)
+	}
 
 	return 500, nil
 }
@@ -72,6 +91,8 @@ func (w *e2eWorld) Edit(_ context.Context, _, msgID int64, text string) (int64, 
 }
 
 func (w *e2eWorld) Download(_ context.Context, fileID string) ([]byte, error) {
+	time.Sleep(w.downloadDelay)
+
 	return []byte("jpeg " + fileID), nil
 }
 
@@ -112,6 +133,13 @@ func e2eConfig() config.Config {
 // test ends.
 func startE2E(t *testing.T, cfg config.Config, transcriber pipeline.Transcriber) *e2e {
 	t.Helper()
+
+	return startE2EWorld(t, cfg, transcriber, &e2eWorld{})
+}
+
+// startE2EWorld is startE2E against a prepared world.
+func startE2EWorld(t *testing.T, cfg config.Config, transcriber pipeline.Transcriber, world *e2eWorld) *e2e {
+	t.Helper()
 	dir := t.TempDir()
 	db, err := sqlite.Open(dir)
 	if err != nil {
@@ -119,8 +147,8 @@ func startE2E(t *testing.T, cfg config.Config, transcriber pipeline.Transcriber)
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	world := &e2eWorld{}
 	filesDir := dir + "/files"
+	world.filesDir = filesDir
 	deps := pipeline.Deps{
 		Transcriber: transcriber, Notes: world, Replier: world, Downloader: world,
 		Files: pipeline.NewDirFiles(filesDir), Log: zap.NewNop(),
@@ -186,6 +214,27 @@ func TestPhotoFlowsFromHandlerToSavedNote(t *testing.T) {
 	}
 }
 
+// Constitution VI, FR-103: the photo that creates a batch is on disk before
+// its ⏳ goes out, and the handler sends that ⏳ itself.
+func TestPhotoIsHeldLocallyBeforeItsHourglass(t *testing.T) {
+	e := startE2E(t, e2eConfig(), e2eTranscriber{})
+	world := e.world
+
+	e.handler.Handle(t.Context(), photo(42, "", ""))
+
+	world.mu.Lock()
+	atAck := slices.Clone(world.atAck)
+	world.mu.Unlock()
+	if len(atAck) != 1 || !slices.Contains(atAck[0], "1") {
+		t.Fatalf("files at each ⏳ = %q, want one ⏳ sent by the handler with file 1 on disk", atAck)
+	}
+	data, err := os.ReadFile(filepath.Join(world.filesDir, "1"))
+	if err != nil || string(data) != "jpeg photo-42" {
+		t.Fatalf("held file = %q, %v", data, err)
+	}
+	e.waitForIdle(t)
+}
+
 // photo is one compressed photo of album (empty for a standalone one).
 func photo(id int64, album, caption string) telegram.Message {
 	return telegram.Message{
@@ -238,6 +287,10 @@ func TestAlbumWithCaptionOnThirdItemYieldsOneNote(t *testing.T) {
 			caption = "Receipts from the trip"
 		}
 		e.handler.Handle(t.Context(), photo(id, "FAKE-ALBUM-1", caption))
+		if _, _, replies := e.world.snapshot(); count(replies, "⏳") != 1 {
+			// The quiet period is still running: only the handler can have sent it.
+			t.Fatalf("after item %d: replies = %q, want the ⏳ sent at arrival", id, replies)
+		}
 	}
 
 	notes, _, replies := e.waitForIdle(t)
@@ -306,7 +359,58 @@ func TestAlbumKeepsOtherItemsWhenOneIsTooLarge(t *testing.T) {
 	if len(notes) != 1 || len(attachments) != 3 {
 		t.Fatalf("%d notes, %d attachments; want 1 note with 3", len(notes), len(attachments))
 	}
-	if count(replies, "⏳") != 1 || count(replies, "⚠ saved, 1 of 4 not kept — too large for Telegram bots") != 1 {
+	if count(replies, "⏳") != 1 ||
+		count(replies, "⚠ saved, 1 of 4 not kept — photo 2 (too large for Telegram bots)") != 1 {
 		t.Errorf("replies = %q, want one ⏳ and a reply naming the item not kept", replies)
+	}
+}
+
+// sendAlbumSlowly hands n photos of one album to the handler one after the
+// other, as Run does for one chat, with a gap well inside the quiet period
+// between them, and waits until the queue is empty.
+func sendAlbumSlowly(t *testing.T, world *e2eWorld, n int64) (notes []pipeline.NoteInput, replies []string) {
+	t.Helper()
+	e := startE2EWorld(t, batchConfig(), e2eTranscriber{}, world)
+	for id := int64(1); id <= n; id++ {
+		if id > 1 {
+			time.Sleep(batchConfig().BatchQuietPeriod / 5)
+		}
+		e.handler.Handle(t.Context(), photo(id, "FAKE-ALBUM-1", ""))
+	}
+	notes, _, replies = e.waitForIdle(t)
+	var want []string
+	for id := int64(1); id <= n; id++ {
+		want = append(want, fmt.Sprintf("jpeg photo-%d", id))
+	}
+	if got := e.world.attachedData(); !slices.Equal(got, want) {
+		t.Errorf("attachments = %q, want %q", got, want)
+	}
+
+	return notes, replies
+}
+
+// T030 (FR-106, FR-107, SC-103): an album part's batch membership is
+// decided when it arrives, so downloads that each outlast the quiet period
+// still leave the album as one note.
+func TestAlbumWithDownloadsSlowerThanTheQuietPeriodYieldsOneNote(t *testing.T) {
+	world := &e2eWorld{downloadDelay: 2 * batchConfig().BatchQuietPeriod}
+
+	notes, replies := sendAlbumSlowly(t, world, 3)
+
+	if len(notes) != 1 || count(replies, "⏳") != 1 || count(replies, "✓ saved") != 1 {
+		t.Fatalf("notes = %d, replies = %q, want one note, one ⏳ and one saved reply", len(notes), replies)
+	}
+}
+
+// T030: a ⏳ send slower than the quiet period delays the album's next part,
+// which waits behind it in the chat's queue; the batch must still be open
+// for it, so the album stays one note.
+func TestAlbumWithAckSlowerThanTheQuietPeriodYieldsOneNote(t *testing.T) {
+	world := &e2eWorld{ackDelay: 3 * batchConfig().BatchQuietPeriod}
+
+	notes, replies := sendAlbumSlowly(t, world, 3)
+
+	if len(notes) != 1 || count(replies, "⏳") != 1 || count(replies, "✓ saved") != 1 {
+		t.Fatalf("notes = %d, replies = %q, want one note, one ⏳ and one saved reply", len(notes), replies)
 	}
 }

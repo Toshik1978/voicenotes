@@ -76,9 +76,10 @@ no NEEDS CLARIFICATION. The open points were integration details, resolved here.
     source_message_id)`.
   - The `collect` handler simply advances to `download`.
 - **Rationale**:
-  - Telegram delivers each album item as its own update, possibly concurrently (telebot runs
-    handlers in goroutines). The single SQLite connection plus `BEGIN IMMEDIATE` serialises
-    join-or-create, so two items can never both open a batch.
+  - Telegram delivers each album item as its own update. The handler takes one chat's file
+    messages one at a time, in delivery order (`chatQueues`), so items join in arrival order.
+    The single SQLite connection plus `BEGIN IMMEDIATE` still serialises join-or-create, so two
+    items can never both open a batch.
   - The worker only takes a capture whose deadline has passed. A join needs the deadline to still
     be in the future (or a matching album), so the two cannot interleave on an open batch.
   - The one exception is a late album item arriving after the worker has moved the batch past
@@ -223,7 +224,11 @@ no NEEDS CLARIFICATION. The open points were integration details, resolved here.
 
   Other behaviour:
   - Files over 20 MB, judged by reported size or by the download error:
-    - standalone (no album, no open batch): rejected with the existing "too large" reply
+    - standalone (no album, no open batch) and reported as over 20 MB: rejected with the existing
+      "too large" reply
+    - standalone, but found too large only when downloaded: it is already stored as a batch of
+      one, so it is marked `failed` and becomes a placeholder note with the reply
+      `⚠ files not kept — <item> (too large for Telegram bots) · please send them again`
     - otherwise: recorded in the batch as `failed` ("too large for Telegram bots"), and the reply
       names it (FR-126)
   - `TextUnsupported` changes to "VoiceNotes takes voice, text, photos and files."

@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/Toshik1978/voicenotes/internal/capture"
 )
@@ -37,12 +40,26 @@ type FileItem struct {
 	TooLarge bool
 }
 
+// ArrivalDownloadLimit bounds the download of a batch's first item on
+// arrival. A slower one is left to the download step, bounded only by the
+// source's download client, so the chat's next items and a shutdown never
+// wait on it for long.
+const ArrivalDownloadLimit = time.Minute
+
 // IngestFile durably stores item as part of a files capture: the store joins
 // it to the chat's open batch or starts one, and owns the batch deadline.
-// It runs ack only when a capture was created, and wakes the worker only
-// when a capture was created or its deadline moved. It mirrors Ingest: a
-// redelivered item returns ErrDuplicate with no ack and no wake. WithFiles
-// must have configured the Ingester.
+// Only a created capture is acknowledged, and only once its item is held
+// locally (Constitution VI, FR-103): the item is downloaded, written and
+// fsynced, and its local path recorded, before ack runs. When that fails
+// the item stays stored without data and ack does not run; the download
+// step fetches it and sends the ⏳ then. Either way the batch's quiet period
+// then restarts (the download and the ack may have outlasted it), and the
+// worker is woken only when a capture was created or its deadline moved.
+// A joining item is stored row-first and left to the download step: the
+// batch's one ⏳ has answered its first item already. It mirrors Ingest: a
+// redelivered item returns ErrDuplicate with no ack and no wake. With a nil
+// ack nothing is fetched on arrival. WithFiles must have configured the
+// Ingester.
 //
 // A TooLarge item is stored as a failed file. With an album ID it is
 // appended like any item, since the rest of its album will follow; without
@@ -70,7 +87,7 @@ func (i *Ingester) IngestFile(ctx context.Context, item FileItem, ack Ack) (capt
 	joinOnly := item.TooLarge && item.AlbumID == ""
 
 	var wake bool
-	stored, err := i.storeAndAck(ctx, c, ack, func() (capture.Capture, bool, error) {
+	stored, err := i.storeAndAck(ctx, c, i.ackWhenHeld(ack), func() (capture.Capture, bool, error) {
 		res, appendErr := i.appendFile(ctx, c, joinOnly)
 		if appendErr != nil {
 			return capture.Capture{}, false, appendErr
@@ -78,7 +95,7 @@ func (i *Ingester) IngestFile(ctx context.Context, item FileItem, ack Ack) (capt
 		wake = res.Created || res.DeadlineMoved
 
 		return res.Capture, res.Created, nil
-	})
+	}, i.restartQuiet)
 	if err != nil {
 		return capture.Capture{}, err
 	}
@@ -87,6 +104,71 @@ func (i *Ingester) IngestFile(ctx context.Context, item FileItem, ack Ack) (capt
 	}
 
 	return stored, nil
+}
+
+// ackWhenHeld wraps ack so that it runs only once the capture's file is held
+// locally (keepFirstFile). A nil ack stays nil.
+func (i *Ingester) ackWhenHeld(ack Ack) Ack {
+	if ack == nil {
+		return nil
+	}
+
+	return func(ctx context.Context, created capture.Capture) {
+		if held, ok := i.keepFirstFile(ctx, created); ok {
+			ack(ctx, held)
+		}
+	}
+}
+
+// keepFirstFile makes sure the one file of stored, a capture just created,
+// is held locally, and reports whether it is: a file already held, or one
+// that failed at arrival and so has nothing to hold, counts as held. A file
+// it cannot hold is left for the download step; nothing written for it is
+// kept.
+func (i *Ingester) keepFirstFile(ctx context.Context, stored capture.Capture) (capture.Capture, bool) {
+	f := stored.Files[0]
+	if f.State != capture.FilePending || f.LocalPath != "" {
+		return stored, true
+	}
+	log := i.log.With(zap.Int64("capture", stored.ID))
+	dctx, cancel := context.WithTimeout(ctx, ArrivalDownloadLimit)
+	data, err := i.fetch.Download(dctx, f.FileID)
+	cancel()
+	if err != nil {
+		log.Warn("downloading the first file failed, leaving it to the download step", zap.Error(err))
+
+		return stored, false
+	}
+	name := localName(stored.ID, f)
+	if err = i.held.Write(name, data); err != nil {
+		log.Error("writing the first file failed, leaving it to the download step", zap.Error(err))
+
+		return stored, false
+	}
+	if err = i.files.SetFileLocalPath(ctx, stored.ID, f.Position, name); err != nil {
+		log.Error("recording the first file failed, leaving it to the download step", zap.Error(err))
+		if rerr := i.held.Remove(name); rerr != nil {
+			log.Warn("removing the unrecorded first file failed", zap.Error(rerr))
+		}
+
+		return stored, false
+	}
+	stored.Files = slices.Clone(stored.Files)
+	stored.Files[0].LocalPath = name
+
+	return stored, true
+}
+
+// restartQuiet restarts the quiet period of a batch the ack just answered,
+// while the worker is still held off it. The ⏳ send can outlast the quiet
+// period, and the chat's next items wait behind it (the source hands one
+// chat's items over one at a time), so without this the worker could close
+// the batch before the next album part joins (T030). A failure only leaves
+// the deadline set at the append, so it is logged, not returned.
+func (i *Ingester) restartQuiet(ctx context.Context, stored capture.Capture) {
+	if err := i.files.RestartQuiet(ctx, stored.ID, i.quiet); err != nil {
+		i.log.Warn("restarting the batch quiet period failed", zap.Int64("capture", stored.ID), zap.Error(err))
+	}
 }
 
 // appendFile stores c through the FileAppender; with joinOnly it uses

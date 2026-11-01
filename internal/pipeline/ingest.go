@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/Toshik1978/voicenotes/internal/capture"
 )
 
@@ -41,6 +43,15 @@ type FileAppender interface {
 		item capture.Capture,
 		quiet time.Duration,
 	) (res capture.AppendResult, joined bool, err error)
+	// RestartQuiet pushes the collect deadline of batch id to now + quiet
+	// when it is earlier and the batch is still at collect, and does
+	// nothing otherwise. It must never pull a deadline in, and a deadline
+	// move must make a concurrent AdvanceCollect of the batch fail.
+	RestartQuiet(ctx context.Context, id int64, quiet time.Duration) error
+	// SetFileLocalPath records that file position of capture id is held
+	// locally under name (relative to the files directory). It changes
+	// nothing else.
+	SetFileLocalPath(ctx context.Context, id int64, position int, name string) error
 }
 
 // Waker is the worker as ingest sees it; *Worker implements it.
@@ -66,15 +77,30 @@ type Ingester struct {
 
 	files FileAppender
 	quiet time.Duration
+	// fetch and held keep a batch's first item locally before its ack.
+	fetch Downloader
+	held  FileStore
+	log   *zap.Logger
 }
 
 // IngesterOption configures optional ingest features.
 type IngesterOption func(*Ingester)
 
 // WithFiles enables IngestFile: items are appended through files, which
-// applies quiet as the batch quiet period.
-func WithFiles(files FileAppender, quiet time.Duration) IngesterOption {
-	return func(i *Ingester) { i.files, i.quiet = files, quiet }
+// applies quiet as the batch quiet period. The item that creates a batch is
+// fetched with fetch and written to held before its ack (Constitution VI).
+func WithFiles(files FileAppender, quiet time.Duration, fetch Downloader, held FileStore) IngesterOption {
+	return func(i *Ingester) { i.files, i.quiet, i.fetch, i.held = files, quiet, fetch, held }
+}
+
+// WithLog sets the logger for ingest problems that cannot fail an ingest
+// (default: none).
+func WithLog(log *zap.Logger) IngesterOption {
+	return func(i *Ingester) {
+		if log != nil {
+			i.log = log
+		}
+	}
 }
 
 // NewIngester returns an Ingester inserting into store and waking waker.
@@ -86,9 +112,12 @@ func NewIngester(store Inserter, waker Waker, opts ...IngesterOption) (*Ingester
 		return nil, errors.New("pipeline: nil waker")
 	}
 
-	i := &Ingester{store: store, waker: waker}
+	i := &Ingester{store: store, waker: waker, log: zap.NewNop()}
 	for _, opt := range opts {
 		opt(i)
+	}
+	if i.files != nil && (i.fetch == nil || i.held == nil) {
+		return nil, errors.New("pipeline: file ingest needs a downloader and a file store")
 	}
 
 	return i, nil
@@ -120,13 +149,15 @@ func (i *Ingester) insertAndAck(ctx context.Context, c capture.Capture, ack Ack)
 		}
 
 		return c, true, nil
-	})
+	}, nil)
 }
 
 // storeAndAck holds the worker off c while store runs and, when it created
-// a capture, acks it. A duplicate maps to ErrDuplicate.
+// a capture, acks it and then runs afterAck (when not nil), still under the
+// hold. A duplicate maps to ErrDuplicate.
 func (i *Ingester) storeAndAck(
 	ctx context.Context, c capture.Capture, ack Ack, store func() (capture.Capture, bool, error),
+	afterAck func(ctx context.Context, stored capture.Capture),
 ) (capture.Capture, error) {
 	if ack != nil {
 		release := i.waker.HoldAck(c)
@@ -142,6 +173,9 @@ func (i *Ingester) storeAndAck(
 	}
 	if created && ack != nil {
 		ack(ctx, stored)
+		if afterAck != nil {
+			afterAck(ctx, stored)
+		}
 	}
 
 	return stored, nil

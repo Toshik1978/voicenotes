@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,10 +26,19 @@ const (
 	defaultPollTimeout = 25 * time.Second
 	defaultRetryBase   = time.Second
 	maxRetry           = time.Minute
-	// httpTimeout bounds every Bot API call, including a long poll.
-	httpTimeout = time.Minute
-	// handlerTimeout bounds one message's handling: a download (at most
-	// httpTimeout), the file write, the insert and the ⏳ reply.
+	// defaultCallTimeout bounds every Bot API call, including a long poll.
+	defaultCallTimeout = time.Minute
+	// defaultDownloadTimeout bounds one file download. The Bot API serves
+	// at most 20 MB (MaxFileSize); 20 MB in 10 minutes needs about
+	// 270 kbit/s sustained, a tenth of the 2.8 Mbit/s a one-minute bound
+	// would demand, so a congested or throttled link still finishes, while
+	// a stalled transfer still fails and is retried. Only the pipeline's
+	// download step can use all of it: a download on arrival is bounded by
+	// pipeline.ArrivalDownloadLimit.
+	defaultDownloadTimeout = 10 * time.Minute
+	// handlerTimeout bounds one message's handling: a download on arrival
+	// (pipeline.ArrivalDownloadLimit), the file write, the insert and the ⏳
+	// reply (one call).
 	handlerTimeout = 3 * time.Minute
 )
 
@@ -43,7 +53,11 @@ type APIConfig struct {
 	// RetryBase is the first delay after a failed poll; it doubles up to a
 	// minute (default 1s).
 	RetryBase time.Duration
-	Log       *zap.Logger
+	// CallTimeout bounds each Bot API call (default 1m).
+	CallTimeout time.Duration
+	// DownloadTimeout bounds each file download (default 10m).
+	DownloadTimeout time.Duration
+	Log             *zap.Logger
 }
 
 // MessageHandler processes one incoming message; *Handler implements it.
@@ -56,7 +70,9 @@ type MessageHandler interface {
 type API struct {
 	bot    *tele.Bot
 	poller *poller
-	log    *zap.Logger
+	// files downloads file contents; it has its own, longer timeout.
+	files *http.Client
+	log   *zap.Logger
 }
 
 var (
@@ -86,7 +102,7 @@ func NewAPI(cfg APIConfig) (*API, error) {
 		Offline: true,
 		// Run spawns and tracks the handler goroutines itself.
 		Synchronous: true,
-		Client:      &http.Client{Timeout: httpTimeout},
+		Client:      &http.Client{Timeout: cmpOr(cfg.CallTimeout, defaultCallTimeout)},
 		OnError: func(err error, _ tele.Context) {
 			log.Error("telegram handler error", zap.Error(err))
 		},
@@ -95,11 +111,18 @@ func NewAPI(cfg APIConfig) (*API, error) {
 		return nil, fmt.Errorf("telegram: create bot: %w", err)
 	}
 
-	return &API{bot: bot, poller: p, log: log}, nil
+	files := &http.Client{Timeout: cmpOr(cfg.DownloadTimeout, defaultDownloadTimeout)}
+
+	return &API{bot: bot, poller: p, files: files, log: log}, nil
 }
 
 // Run long-polls for messages (allowed_updates=["message"]) and passes each
-// to h until ctx is cancelled. Each message is handled in its own goroutine.
+// to h until ctx is cancelled. Each message is handled in its own goroutine,
+// except that one chat's photos, files and videos are handled one at a time
+// in the order Telegram delivered them (the message ID order within the
+// chat), so a batch's positions, caption order and first item follow
+// arrival rather than goroutine scheduling (FR-106). Other messages never
+// wait for them, and different chats never wait for each other.
 // Handlers get a context that shutdown does not cancel, bounded by
 // handlerTimeout, and Run returns only after every handler has finished, so
 // an ingest in flight at shutdown can still commit its row (Constitution VI).
@@ -107,19 +130,26 @@ func NewAPI(cfg APIConfig) (*API, error) {
 func (a *API) Run(ctx context.Context, h MessageHandler) {
 	base := context.WithoutCancel(ctx)
 	var wg sync.WaitGroup
+	files := newChatQueues(&wg)
 	// telebot runs this synchronously in its update loop (Synchronous), so
-	// wg.Add happens before Start returns and the Wait below cannot miss it.
+	// messages are dispatched in delivery order, and wg.Add happens before
+	// Start returns and the Wait below cannot miss it.
 	handle := func(c tele.Context) error {
 		m := c.Message()
 		if m == nil {
 			return nil
 		}
 		msg := fromTele(m)
-		wg.Go(func() {
+		run := func() {
 			hctx, cancel := context.WithTimeout(base, handlerTimeout)
 			defer cancel()
 			h.Handle(hctx, msg)
-		})
+		}
+		if msg.Files != nil {
+			files.Go(msg.ChatID, run)
+		} else {
+			wg.Go(run)
+		}
 
 		return nil
 	}
@@ -141,6 +171,51 @@ func (a *API) Run(ctx context.Context, h MessageHandler) {
 	a.bot.Stop()
 	<-done
 	wg.Wait()
+}
+
+// chatQueues runs the functions queued for one chat one at a time, in the
+// order they were queued; different chats run concurrently. Each chat with
+// work has one goroutine, tracked by wg, that exits once its queue is empty.
+type chatQueues struct {
+	wg *sync.WaitGroup
+	mu sync.Mutex
+	// queued holds each busy chat's waiting functions; a chat is busy, with
+	// a goroutine draining it, exactly while it has an entry.
+	queued map[int64][]func()
+}
+
+func newChatQueues(wg *sync.WaitGroup) *chatQueues {
+	return &chatQueues{wg: wg, queued: map[int64][]func(){}}
+}
+
+// Go queues fn for chat and starts the chat's goroutine when it is idle.
+func (q *chatQueues) Go(chat int64, fn func()) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if waiting, busy := q.queued[chat]; busy {
+		q.queued[chat] = append(waiting, fn)
+
+		return
+	}
+	q.queued[chat] = []func(){}
+	q.wg.Go(func() { q.drain(chat, fn) })
+}
+
+// drain runs fn and then each function queued for chat, until none is left.
+func (q *chatQueues) drain(chat int64, fn func()) {
+	for {
+		fn()
+		q.mu.Lock()
+		waiting := q.queued[chat]
+		if len(waiting) == 0 {
+			delete(q.queued, chat)
+			q.mu.Unlock()
+
+			return
+		}
+		fn, q.queued[chat] = waiting[0], waiting[1:]
+		q.mu.Unlock()
+	}
 }
 
 // LastPoll is the time of the last successful getUpdates call; zero before
@@ -203,14 +278,16 @@ func (a *API) Edit(ctx context.Context, chatID, msgID int64, text string) (int64
 	return 0, wrapAPI("edit", err)
 }
 
-// Download fetches a file's bytes. A file over MaxFileSize, whether
-// Telegram refuses it or it turns out larger while reading, yields
-// ErrTooLarge.
+// Download fetches a file's bytes: getFile is a Bot API call, and the
+// contents come through the download client, bounded by its own longer
+// timeout and by ctx. A file over MaxFileSize, whether Telegram refuses it
+// or it turns out larger while reading, yields ErrTooLarge. Errors never
+// carry the file URL, which holds the token.
 func (a *API) Download(ctx context.Context, fileID string) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("telegram: download: %w", err)
 	}
-	rc, err := a.bot.File(&tele.File{FileID: fileID})
+	f, err := a.bot.FileByID(fileID)
 	if err != nil {
 		if errors.Is(err, tele.ErrTooLarge) || strings.Contains(err.Error(), "file is too big") {
 			return nil, ErrTooLarge
@@ -218,9 +295,32 @@ func (a *API) Download(ctx context.Context, fileID string) ([]byte, error) {
 
 		return nil, wrapAPI("download", err)
 	}
-	defer func() { _ = rc.Close() }()
 
-	data, err := io.ReadAll(io.LimitReader(rc, MaxFileSize+1))
+	return a.fetchFile(ctx, f.FilePath)
+}
+
+// fetchFile reads the contents of the file at filePath through the download
+// client. Errors leave out the URL, which holds the token.
+func (a *API) fetchFile(ctx context.Context, filePath string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		a.bot.URL+"/file/bot"+a.bot.Token+"/"+filePath, http.NoBody)
+	if err != nil {
+		return nil, errors.New("telegram: download: invalid file request")
+	}
+	resp, err := a.files.Do(req)
+	if err != nil {
+		if ue, ok := errors.AsType[*url.Error](err); ok {
+			err = ue.Err
+		}
+
+		return nil, fmt.Errorf("telegram: download: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("telegram: download: status %s", resp.Status)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, MaxFileSize+1))
 	if err != nil {
 		return nil, fmt.Errorf("telegram: download: %w", err)
 	}

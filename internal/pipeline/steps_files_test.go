@@ -521,6 +521,12 @@ func TestFilesReply(t *testing.T) {
 	tooLarge := capture.File{Kind: capture.FileImage, State: capture.FileFailed, Failure: "too large for Telegram bots"}
 	refused := kept()
 	refused.AttachFailure = "http 413 <big>"
+	namedLarge := func(name string) capture.File {
+		return capture.File{
+			Kind: capture.FileDocument, FileName: name, State: capture.FileFailed,
+			Failure: "too large for Telegram bots",
+		}
+	}
 	tests := []struct {
 		name    string
 		files   []capture.File
@@ -536,27 +542,46 @@ func TestFilesReply(t *testing.T) {
 		{
 			name:  "some not kept",
 			files: []capture.File{kept(), tooLarge, kept(), kept()},
-			want:  "⚠ saved, 1 of 4 not kept — too large for Telegram bots · " + link,
+			want:  "⚠ saved, 1 of 4 not kept — photo 2 (too large for Telegram bots) · " + link,
 		},
 		{
 			name:  "some not attached",
 			files: []capture.File{kept(), refused},
-			want:  "⚠ saved, 1 of 2 not attached — http 413 &lt;big&gt; · " + link,
+			want:  "⚠ saved, 1 of 2 not attached — photo 2 (http 413 &lt;big&gt;) · " + link,
 		},
 		{
 			name:  "not kept wins over not attached",
 			files: []capture.File{refused, tooLarge, kept()},
-			want:  "⚠ saved, 1 of 3 not kept — too large for Telegram bots · " + link,
+			want:  "⚠ saved, 1 of 3 not kept — photo 2 (too large for Telegram bots) · " + link,
 		},
 		{
 			name:  "a file missing at attach is not kept",
 			files: []capture.File{kept(), {Kind: capture.FileDocument, State: capture.FileSkipped}},
-			want:  "⚠ saved, 1 of 2 not kept — file missing · " + link,
+			want:  "⚠ saved, 1 of 2 not kept — file 2 (file missing) · " + link,
 		},
 		{
 			name:  "nothing kept",
 			files: []capture.File{tooLarge, tooLarge},
-			want:  "⚠ files not kept — too large for Telegram bots · please send them again · " + link,
+			want: "⚠ files not kept — photo 1 (too large for Telegram bots), photo 2 (too large for Telegram bots)" +
+				" · please send them again · " + link,
+		},
+		{
+			name:  "a named file is named, escaped",
+			files: []capture.File{kept(), namedLarge("scan<1>.pdf")},
+			want:  "⚠ saved, 1 of 2 not kept — scan&lt;1&gt;.pdf (too large for Telegram bots) · " + link,
+		},
+		{
+			name: "names are bounded, the rest summarised",
+			files: []capture.File{
+				namedLarge("a.pdf"),
+				namedLarge("b.pdf"),
+				namedLarge("c.pdf"),
+				namedLarge("d.pdf"),
+				namedLarge("e.pdf"),
+				kept(),
+			},
+			want: "⚠ saved, 5 of 6 not kept — a.pdf (too large for Telegram bots), b.pdf (too large for Telegram bots)," +
+				" c.pdf (too large for Telegram bots) and 2 more · " + link,
 		},
 	}
 	for _, tc := range tests {
@@ -604,7 +629,7 @@ func TestFilesCaptureEndToEnd(t *testing.T) {
 		r.notes.attached[0].mime != "image/jpeg" {
 		t.Errorf("attached %+v", r.notes.attached)
 	}
-	wantReply := `⚠ saved, 1 of 2 not kept — too large for Telegram bots · ` +
+	wantReply := `⚠ saved, 1 of 2 not kept — photo 2 (too large for Telegram bots) · ` +
 		`<a href="https://memos.example.org/memos/abc?a=1&amp;b=2">open</a>`
 	if len(r.rep.edits) != 1 || r.rep.edits[0].text != wantReply {
 		t.Errorf("sends %+v edits %+v", r.rep.sends, r.rep.edits)

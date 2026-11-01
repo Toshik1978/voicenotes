@@ -311,6 +311,36 @@ func (s *DB) PostponeOpenBatches(ctx context.Context, quiet time.Duration) (int6
 	return n, nil
 }
 
+// RestartQuiet pushes the deadline of files capture id to the wall-clock
+// now plus quiet, where it is earlier and the capture is still at collect;
+// see pipeline.FileAppender. Anything else is left alone.
+func (s *DB) RestartQuiet(ctx context.Context, id int64, quiet time.Duration) error {
+	deadline := ts(s.now().Add(quiet))
+	_, err := s.db.ExecContext(ctx, "UPDATE captures SET next_attempt_at = ?"+
+		" WHERE id = ? AND kind = 'files' AND step = 'collect' AND status != 'done' AND next_attempt_at < ?",
+		deadline, id, deadline)
+	if err != nil {
+		return fmt.Errorf("sqlite: restart quiet period of %d: %w", id, err)
+	}
+
+	return nil
+}
+
+// SetFileLocalPath records that file position of capture id is held
+// locally under name; see pipeline.FileAppender. Its state is left alone.
+func (s *DB) SetFileLocalPath(ctx context.Context, id int64, position int, name string) error {
+	res, err := s.db.ExecContext(ctx,
+		"UPDATE capture_files SET local_path = ? WHERE capture_id = ? AND position = ?", name, id, position)
+	if err != nil {
+		return fmt.Errorf("sqlite: set local path of capture %d file %d: %w", id, position, err)
+	}
+	if err := oneRow(res); err != nil {
+		return fmt.Errorf("sqlite: set local path of capture %d file %d: %w", id, position, err)
+	}
+
+	return nil
+}
+
 // appendFile is AppendFile's body inside the open transaction. It reports
 // whether item was stored: always, unless joinOnly and it would start a
 // batch.
@@ -326,6 +356,12 @@ func appendFile(
 	d := capture.JoinBatch(openBatch, capture.BatchItem{AlbumID: item.AlbumID, Caption: item.Text},
 		now, quiet)
 	if !d.Join && joinOnly {
+		// A redelivered item that joined a batch since closed is a
+		// duplicate, not one that would start a batch alone (vn-xht.8).
+		if dupErr := fileStored(ctx, conn, item.Files[0]); dupErr != nil {
+			return capture.AppendResult{}, false, dupErr
+		}
+
 		return capture.AppendResult{}, false, nil
 	}
 	if !d.Join {
@@ -357,6 +393,23 @@ func appendFile(
 	open.Files = append(open.Files, f)
 
 	return capture.AppendResult{Capture: open, DeadlineMoved: d.DeadlineMoved}, true, nil
+}
+
+// fileStored returns ErrDuplicate when f's source identity is already
+// stored, and nil when it is not.
+func fileStored(ctx context.Context, conn *sql.Conn, f capture.File) error {
+	var n int
+	err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM capture_files"+
+		" WHERE source = ? AND source_chat_id = ? AND source_message_id = ?",
+		f.Source, f.SourceChatID, f.SourceMessageID).Scan(&n)
+	if err != nil {
+		return fmt.Errorf("sqlite: check file identity: %w", err)
+	}
+	if n > 0 {
+		return ErrDuplicate
+	}
+
+	return nil
 }
 
 // queryOpenBatch reads the chat's newest files capture at collect with its

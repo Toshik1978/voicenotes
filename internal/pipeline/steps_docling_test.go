@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/Toshik1978/voicenotes/internal/capture"
+	"github.com/Toshik1978/voicenotes/internal/enrich"
 	"github.com/Toshik1978/voicenotes/internal/pipeline"
 )
 
@@ -80,7 +81,9 @@ func TestExtractReadsDocumentsOnePerAttempt(t *testing.T) {
 	if out.Class != capture.ClassProgress || len(e.calls) != 1 {
 		t.Fatalf("first attempt: out %+v calls %d", out, len(e.calls))
 	}
-	if want := (extractCall{"5.jpg", "image/jpeg", []byte("JPG")}); !reflect.DeepEqual(e.calls[0], want) {
+	// The nameless photo goes under its attachment name, extension included.
+	want := extractCall{"photo-2026-01-02-1.jpg", "image/jpeg", []byte("JPG")}
+	if !reflect.DeepEqual(e.calls[0], want) {
 		t.Errorf("call %+v, want %+v", e.calls[0], want)
 	}
 	f := got.Files[0]
@@ -235,5 +238,104 @@ func TestExtractDoclingKeepsAudioTranscribed(t *testing.T) {
 	got, out = r.run(capture.StepExtract, got)
 	if out.Class != capture.ClassOK || len(e.calls) != 1 || got.Files[1].State != capture.FileDone {
 		t.Errorf("out %+v convert %d pdf %+v", out, len(e.calls), got.Files[1])
+	}
+}
+
+// A standard docling-serve (v1.38.2) has no plain-text input format, so
+// .txt / text/plain files are read locally and never submitted (FR-110).
+func TestExtractReadsPlainTextLocally(t *testing.T) {
+	cases := []struct {
+		name string
+		file capture.File
+	}{
+		{"mime", capture.File{MimeType: "text/plain", FileName: "notes"}},
+		{"mime with parameters", capture.File{MimeType: "Text/Plain; charset=utf-8", FileName: "notes"}},
+		{"extension", capture.File{MimeType: "application/octet-stream", FileName: "dir/Notes.TXT"}},
+	}
+	for _, tc := range cases {
+		for _, withReader := range []bool{true, false} {
+			t.Run(tc.name, func(t *testing.T) {
+				e := &fakeExtractor{answers: []extractAnswer{readOK("from docling")}}
+				r := newRig(t)
+				if withReader {
+					r = doclingRig(t, e)
+				}
+				r.audio.files["5.txt"] = []byte("héllo\xff wörld")
+				f := tc.file
+				f.Kind, f.State, f.LocalPath = capture.FileDocument, capture.FilePending, "5.txt"
+
+				got, out := r.run(capture.StepExtract, filesCapture(f))
+				if out.Class != capture.ClassOK || len(e.calls) != 0 {
+					t.Fatalf("out %+v, docling calls %d", out, len(e.calls))
+				}
+				g := got.Files[0]
+				if g.State != capture.FileDone || g.Text != "héllo� wörld" || g.TextSource != capture.TextLocal {
+					t.Errorf("file %+v", g)
+				}
+			})
+		}
+	}
+}
+
+func TestExtractPlainTextIsBoundedByTheExcerptBudget(t *testing.T) {
+	r := newRigWith(t, pipeline.StepsConfig{
+		InboxTag: "inbox", TodoTag: "todo", NoteLimit: 1000, Enrich: enrich.Options{ExcerptRunes: 5},
+	})
+	r.audio.files["5.txt"] = []byte("абвгдежзи")
+	c := filesCapture(capture.File{
+		Kind: capture.FileDocument, State: capture.FilePending, MimeType: "text/plain", LocalPath: "5.txt",
+	})
+
+	got, _ := r.run(capture.StepExtract, c)
+	if got.Files[0].Text != "абвгд" {
+		t.Errorf("text %q", got.Files[0].Text)
+	}
+}
+
+func TestExtractEmptyPlainTextIsEmpty(t *testing.T) {
+	r := newRig(t)
+	r.audio.files["5.txt"] = []byte(" \n")
+	c := filesCapture(capture.File{
+		Kind: capture.FileDocument, State: capture.FilePending, MimeType: "text/plain", LocalPath: "5.txt",
+	})
+
+	got, out := r.run(capture.StepExtract, c)
+	if out.Class != capture.ClassOK || got.Files[0].State != capture.FileEmpty || got.Files[0].Text != "" {
+		t.Errorf("out %+v file %+v", out, got.Files[0])
+	}
+}
+
+func TestExtractPlainTextMissingFileFails(t *testing.T) {
+	r := newRig(t)
+	c := filesCapture(capture.File{
+		Kind: capture.FileDocument, State: capture.FilePending, MimeType: "text/plain", LocalPath: "gone.txt",
+	})
+
+	got, out := r.run(capture.StepExtract, c)
+	if out.Class != capture.ClassOK || got.Files[0].State != capture.FileFailed {
+		t.Errorf("out %+v file %+v", out, got.Files[0])
+	}
+}
+
+func TestExtractImageMarkersOnlyIsEmpty(t *testing.T) {
+	e := &fakeExtractor{answers: []extractAnswer{
+		readOK("<!-- image -->\n\n<!-- image -->\n"),
+		readOK("<!-- image -->\n# Receipt\nTotal 12"),
+	}}
+	r := doclingRig(t, e)
+	r.audio.files["5.jpg"] = []byte("JPG")
+	r.audio.files["5-1.jpg"] = []byte("JPG")
+	c := filesCapture(
+		capture.File{Kind: capture.FileImage, State: capture.FilePending, MimeType: "image/jpeg", LocalPath: "5.jpg"},
+		capture.File{Kind: capture.FileImage, State: capture.FilePending, MimeType: "image/jpeg", LocalPath: "5-1.jpg"},
+	)
+
+	got, _ := r.run(capture.StepExtract, c)
+	got, _ = r.run(capture.StepExtract, got)
+	if f := got.Files[0]; f.State != capture.FileEmpty || f.Text != "" {
+		t.Errorf("marker-only photo %+v", f)
+	}
+	if f := got.Files[1]; f.State != capture.FileDone || f.Text != "# Receipt\nTotal 12" {
+		t.Errorf("photo with text %+v", f)
 	}
 }

@@ -1143,6 +1143,49 @@ func TestPostponeOpenBatchesPushesOnlyEarlierCollectDeadlines(t *testing.T) {
 	}
 }
 
+// RestartQuiet (T030) pushes one batch's deadline to now plus quiet while
+// it is still at collect and the deadline is earlier; it never pulls a
+// deadline in and never touches another capture.
+func TestRestartQuietPushesOnlyAnEarlierCollectDeadline(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+	batch := appendItem(t, s, fileItemAt(1, "", "alb", ts0()), 3*time.Second)
+	otherItem := fileItemAt(2, "", "", ts0())
+	// Another chat's open batch, with the same early deadline.
+	otherItem.SourceChatID, otherItem.Files[0].SourceChatID = -1009876543210, -1009876543210
+	other := appendItem(t, s, otherItem, 3*time.Second)
+	text := textCapture(t, 3)
+	if err := s.Insert(ctx, &text); err != nil {
+		t.Fatal(err)
+	}
+
+	now := ts0().Add(10 * time.Second)
+	s.SetNow(func() time.Time { return now })
+	for _, id := range []int64{batch.c.ID, text.ID} {
+		if err := s.RestartQuiet(ctx, id, 3*time.Second); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A shorter quiet period must not pull the new deadline in.
+	if err := s.RestartQuiet(ctx, batch.c.ID, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		id   int64
+		want time.Time
+	}{
+		{batch.c.ID, now.Add(3 * time.Second)},
+		{other.c.ID, other.c.NextAttemptAt},
+		{text.ID, text.NextAttemptAt},
+	}
+	for _, tc := range cases {
+		got, _, gerr := s.Get(tc.id)
+		if gerr != nil || !got.NextAttemptAt.Equal(tc.want) {
+			t.Errorf("capture %d NextAttemptAt = %v err=%v, want %v", tc.id, got.NextAttemptAt, gerr, tc.want)
+		}
+	}
+}
+
 func textCapture(t *testing.T, msgID int64) capture.Capture {
 	t.Helper()
 
@@ -1153,4 +1196,54 @@ func textCapture(t *testing.T, msgID int64) capture.Capture {
 	c.Source, c.SourceChatID, c.SourceMessageID, c.Text = "telegram", -1001234567890, msgID, "hi"
 
 	return c
+}
+
+// vn-xht.8: a join-only item that joined a batch, redelivered once that
+// batch has left collect, is a duplicate, not an item that would start a
+// batch alone.
+func TestJoinOpenBatchRedeliveryAfterCollectIsDuplicate(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+
+	first := appendItem(t, s, fileItemAt(1, "", "", ts0()), 3*time.Second)
+	s.SetNow(func() time.Time { return ts0().Add(time.Second) })
+	failed := fileItemCapture(2, "")
+	failed.Files[0].State, failed.Files[0].Failure = capture.FileFailed, "too large for Telegram bots"
+	if _, joined, err := s.JoinOpenBatch(ctx, failed, 3*time.Second); err != nil || !joined {
+		t.Fatalf("join: joined=%v err=%v", joined, err)
+	}
+	read, _, err := s.Get(first.c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, aerr := s.AdvanceCollect(ctx, read, advanced(read)); aerr != nil || !ok {
+		t.Fatalf("advance ok=%v err=%v", ok, aerr)
+	}
+
+	res, joined, err := s.JoinOpenBatch(ctx, failed, 3*time.Second)
+	if !errors.Is(err, sqlite.ErrDuplicate) || joined || res.Created {
+		t.Fatalf("redelivery: res=%+v joined=%v err=%v, want ErrDuplicate", res, joined, err)
+	}
+	// An item never stored still finds no batch to join.
+	other := fileItemCapture(3, "")
+	if _, joined, err = s.JoinOpenBatch(ctx, other, 3*time.Second); err != nil || joined {
+		t.Fatalf("new item: joined=%v err=%v, want not joined", joined, err)
+	}
+}
+
+func TestSetFileLocalPath(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+	first := appendItem(t, s, fileItemAt(1, "", "", ts0()), 3*time.Second)
+
+	if err := s.SetFileLocalPath(ctx, first.c.ID, 0, "1.jpg"); err != nil {
+		t.Fatal(err)
+	}
+	read, _, err := s.Get(first.c.ID)
+	if err != nil || read.Files[0].LocalPath != "1.jpg" || read.Files[0].State != capture.FilePending {
+		t.Fatalf("file = %+v err=%v, want local path 1.jpg, still pending", read.Files[0], err)
+	}
+	if err := s.SetFileLocalPath(ctx, first.c.ID, 5, "x"); !errors.Is(err, sqlite.ErrNotFound) {
+		t.Fatalf("unknown position: err=%v, want ErrNotFound", err)
+	}
 }

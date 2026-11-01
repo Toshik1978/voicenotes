@@ -27,7 +27,23 @@ func TestFallbackHint(t *testing.T) {
 		{
 			"placeholder document",
 			[]FileSummary{{Kind: KindDocument, Name: "report.pdf", State: StateEmpty}},
-			"📎 report.pdf",
+			"📎 report.pdf — no text found",
+		},
+		{"empty photo", []FileSummary{{Kind: KindImage, State: StateEmpty}}, "📷 photo — no text found"},
+		{
+			"all empty batch",
+			[]FileSummary{{Kind: KindImage, State: StateEmpty}, {Kind: KindImage, State: StateEmpty}},
+			"📷 2 photos — no text found",
+		},
+		{
+			"skipped means no reader",
+			[]FileSummary{{Kind: KindImage, State: "skipped"}},
+			"📷 photo",
+		},
+		{
+			"some empty some failed",
+			[]FileSummary{{Kind: KindImage, State: StateEmpty}, failed(KindImage, "b", "too big")},
+			"📷 2 photos",
 		},
 		{"placeholder photo", []FileSummary{photo}, "📷 photo"},
 		{"placeholder photos", []FileSummary{photo, photo, photo}, "📷 3 photos"},
@@ -130,5 +146,19 @@ func TestRenderFileNoteTruncation(t *testing.T) {
 	got = Render(in, 100)
 	if len(got) > 100 || !strings.Contains(got, "(truncated)") || !strings.HasSuffix(got, "#inbox") {
 		t.Fatalf("hint truncation: %q", got)
+	}
+}
+
+func TestStripImageMarkers(t *testing.T) {
+	tests := map[string]string{
+		"":                                 "",
+		"<!-- image -->\n\n<!-- image -->": "",
+		"<!-- image -->\n# Title\nbody\n":  "# Title\nbody",
+		"plain":                            "plain",
+	}
+	for in, want := range tests {
+		if got := StripImageMarkers(in); got != want {
+			t.Errorf("StripImageMarkers(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

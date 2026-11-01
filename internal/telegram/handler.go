@@ -206,7 +206,8 @@ func (h *Handler) text(ctx context.Context, m Message) {
 }
 
 // audio follows research R2: download, write and fsync the file, commit the
-// row at transcribe, and only then send ⏳. If the file cannot be fetched or
+// row at transcribe, and only then send ⏳. The download is bounded by
+// pipeline.ArrivalDownloadLimit. If the file cannot be fetched in time or
 // written, the row is committed at download with no reply; the worker's
 // download step retries and sends ⏳ later.
 func (h *Handler) audio(ctx context.Context, m Message) {
@@ -217,7 +218,9 @@ func (h *Handler) audio(ctx context.Context, m Message) {
 		return
 	}
 
-	data, err := h.dl.Download(ctx, a.FileID)
+	dctx, cancel := context.WithTimeout(ctx, pipeline.ArrivalDownloadLimit)
+	data, err := h.dl.Download(dctx, a.FileID)
+	cancel()
 	if errors.Is(err, ErrTooLarge) {
 		h.tooLarge(ctx, m)
 

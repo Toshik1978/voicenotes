@@ -48,13 +48,18 @@ note. Voice and text captures behave as before and are never batched.
   item; otherwise it starts a new batch. The `⏳` reply answers the first item only. Captions are
   joined in send order.
 - **A restart while an album is arriving.** Items are stored before they are acknowledged, so
-  nothing is lost. On startup, the quiet period of every batch still collecting restarts, so items
-  that Telegram redelivers after the restart join their half-built batch instead of starting a
-  second note.
+  nothing is lost. The item that starts a batch is downloaded and written to disk before its `⏳`; if
+  that download fails, the `⏳` comes once the pipeline has downloaded it. Later items are downloaded
+  by the pipeline and confirmed by the final reply. On startup, the quiet period of every batch
+  still collecting restarts, so items that Telegram redelivers after the restart join their
+  half-built batch instead of starting a second note.
 - **A file over 20 MB.** Telegram bots cannot download more. Sent alone, it gets `⚠ too large for
-  Telegram bots (max 20 MB) — not saved.`. As part of a batch (an album, or sent inside the quiet
-  period) it does not stop the rest: the other files are saved and the reply reads `⚠ saved, 1 of
-  4 not kept — too large for Telegram bots · open`.
+  Telegram bots (max 20 MB) — not saved.`. If Telegram did not report it as too large and that shows
+  only at download, it is already stored, so it becomes a placeholder note instead, with the reply
+  `⚠ files not kept — <name> (too large for Telegram bots) · please send them again`. As part of a
+  batch (an album, or sent inside the quiet period) it does not stop the rest: the other files are
+  saved and the reply reads `⚠ saved, 1 of 4 not kept — photo 2 (too large for Telegram bots) ·
+  open`.
 - **Reading content (optional).** With `DOCLING_URL` set, each file is sent to a
   docling-serve instance that returns text,
   which the LLM uses to write the hint. Only the leading `DOCLING_MAX_PAGES` pages (default `20`)
@@ -100,8 +105,8 @@ Tags are `<version>` (for example `0.1.0`) and `latest`, both published only by 
 Give the container a 90 second stop grace period (`--stop-timeout 90`, or `stop_grace_period:
 90s` in Docker Compose); the Dockerfile cannot set it. Docker's default of 10 seconds is too short:
 on SIGTERM the service finishes what is in flight before it exits. A voice message still being
-downloaded from Telegram can take up to 60 seconds (the Bot API HTTP timeout) before its row is
-stored, and recording a delivered morning digest is retried for up to 30 seconds so the digest is
+downloaded from Telegram can take up to 60 seconds (the download bound on arrival) before its row
+is stored, and recording a delivered morning digest is retried for up to 30 seconds so the digest is
 not sent twice after the restart. A SIGKILL inside that window can lose a capture with no reply,
 which Telegram never redelivers, or repeat the digest. 90 seconds covers the longest of these with
 margin.
@@ -208,7 +213,7 @@ hints.
 | `HINT_EXCERPT_RUNES` | no | `4000` | no | `500`–`50000`; total extracted text sent to the LLM per batch |
 | `VISION_ENABLED` | no | `false` | no | Describe photos with a vision model when no text was read |
 | `VISION_BASE_URL` | if vision is on | `LLM_BASE_URL` | no | Base URL including `/v1`, for example `https://llm.example.org/v1` |
-| `VISION_API_KEY` | no | `LLM_API_KEY` | yes | Bearer key |
+| `VISION_API_KEY` | no | `LLM_API_KEY` | yes | Bearer key. **Set it whenever `VISION_BASE_URL` points to another host:** otherwise the LLM key is sent to that host |
 | `VISION_MODEL` | if vision is on | `LLM_MODEL` | no | Vision-capable model, for example `example-vision-model` |
 | `VISION_TIMEOUT` | no | `60s` | no | Per-request timeout |
 
@@ -300,7 +305,7 @@ Targets Memos v0.31.0 (`/api/v1`) and 26.10+ (`/api`). Requests send
 - The attachment upload limit must be at least 20 MB (the default is 30 to 32 MB).
 - After moving to 26.10, re-apply any custom content or upload limits; they are not migrated.
 - Calls: `GET {P}/auth/me` (resolve prefix and owner), `POST {P}/memos?memoId=...` (create; the
-  deterministic id makes retries idempotent), `POST {P}/attachments` (audio) and
+  deterministic id makes retries idempotent), `POST {P}/attachments` (audio, photos and files) and
   `GET {P}/memos?filter=...` (digest inbox listing). Tags are written inline in the note content.
 
 ### Error handling
@@ -314,7 +319,10 @@ Targets Memos v0.31.0 (`/api/v1`) and 26.10+ (`/api`). Requests send
 ### Telegram
 
 Long polling with `getUpdates` (`allowed_updates=["message"]`), `getFile` plus download (bots are
-limited to 20 MB files), `sendMessage` and `editMessageText`. No webhook.
+limited to 20 MB files), `sendMessage` and `editMessageText`. No webhook. Bot API calls time out
+after 1 minute; a file download has its own client with a 10 minute timeout, so a 20 MB file
+still arrives over a link of about 270 kbit/s. A download on arrival (a voice message, or the
+item that starts a batch) is cut off after 1 minute and left to the pipeline's download step.
 
 ## Telegram messages
 
@@ -332,9 +340,9 @@ sound. Messages from users not in `TELEGRAM_ALLOWED_USERS` get no reply.
 | Permanent failure, no audio kept | `⚠ audio not kept — <reason> · please send it again · open` |
 | Audio rejected by Memos | `⚠ saved, audio not attached — <reason> · open` |
 | Waiting on the document reader | `⏳ queued — document reader unavailable, will retry` |
-| Files saved, some not kept | `⚠ saved, 1 of 4 not kept — <reason> · open` |
-| Files saved, some not attached | `⚠ saved, 1 of 4 not attached — <reason> · open` |
-| No file could be kept | `⚠ files not kept — <reason> · please send them again · open` |
+| Files saved, some not kept | `⚠ saved, 1 of 4 not kept — scan.pdf (<reason>) · open` |
+| Files saved, some not attached | `⚠ saved, 1 of 4 not attached — photo 3 (<reason>) · open` |
+| No file could be kept | `⚠ files not kept — scan.pdf (<reason>), photo 2 (<reason>) · please send them again · open` |
 | Unsupported message type | `VoiceNotes takes voice, text, photos and files.` |
 | Single file over 20 MB | `⚠ too large for Telegram bots (max 20 MB) — not saved.` |
 | Storing failed | `⚠ not saved — please send it again.` |

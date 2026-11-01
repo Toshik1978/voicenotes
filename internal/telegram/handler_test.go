@@ -82,9 +82,14 @@ type fakeDownloader struct {
 	ev   *events
 	data []byte
 	err  error
+	// left is the time left on the ctx at the last call; 0 for no deadline.
+	left time.Duration
 }
 
-func (f *fakeDownloader) Download(_ context.Context, fileID string) ([]byte, error) {
+func (f *fakeDownloader) Download(ctx context.Context, fileID string) ([]byte, error) {
+	if d, ok := ctx.Deadline(); ok {
+		f.left = time.Until(d)
+	}
 	f.ev.addf("download %s", fileID)
 	if f.err != nil {
 		return nil, f.err
@@ -400,6 +405,19 @@ func TestVoiceDownloadsWritesCommitsThenAcks(t *testing.T) {
 	}
 }
 
+// The download before the row is bounded as in 001, although the client
+// allows file downloads far longer: a slower one is left to the download
+// step, so a shutdown never waits on it past the grace period.
+func TestVoiceDownloadIsBoundedOnArrival(t *testing.T) {
+	r := newRig(t)
+
+	r.handle(t, voiceMsg(1000))
+
+	if r.dl.left <= 0 || r.dl.left > pipeline.ArrivalDownloadLimit {
+		t.Fatalf("download ctx deadline in %v, want within %v", r.dl.left, pipeline.ArrivalDownloadLimit)
+	}
+}
+
 func TestAudioFileExtensionAndSize(t *testing.T) {
 	r := newRig(t)
 	m := voiceMsg(0)
@@ -525,39 +543,44 @@ func fileMsg(name string, size int64) telegram.Message {
 	}
 }
 
-func TestFileDownloadsWritesCommitsThenAcks(t *testing.T) {
-	r := newRig(t)
+// TestFileIsStoredOnArrival (FR-106, FR-107): a file item is committed the
+// moment it arrives, before anything is downloaded, so its batch position,
+// caption order and quiet period follow arrival, never a download's
+// duration. The item that creates a batch gets the batch's one ⏳ right
+// after the commit; an item joining a batch gets none. The pipeline's
+// download step fetches the files later.
+func TestFileIsStoredOnArrival(t *testing.T) {
+	for name, tc := range map[string]struct {
+		joined bool
+		want   []string
+	}{
+		"new batch":     {want: []string{`ingestfile`, `send "⏳"`, `reply 7=9001`, `wake`}},
+		"joins a batch": {joined: true, want: []string{`ingestfile`, `wake`}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newRig(t)
+			r.in.joined = tc.joined
 
-	r.handle(t, fileMsg("../lease.pdf", 1000))
+			r.handle(t, fileMsg("../lease.pdf", 1000))
 
-	wantEvents(t, r, `download FAKE-FILE-ID`, `ingestfile`, `send "⏳"`, `reply 7=9001`, `wake`)
-	it := r.in.items[0]
-	if it.Source != telegram.Source || it.ChatID != chat || it.MessageID != 44 || !it.ReceivedAt.Equal(date()) ||
-		it.Kind != capture.FileDocument || it.FileID != "FAKE-FILE-ID" || it.MimeType != "application/pdf" ||
-		it.Name != "../lease.pdf" || it.Size != 1000 || it.Caption != "the lease" || it.AlbumID != "FAKE-ALBUM" {
-		t.Fatalf("item = %+v", it)
-	}
-	if !strings.HasPrefix(it.LocalPath, fmt.Sprintf("tg-%d-44-", chat)) || !strings.HasSuffix(it.LocalPath, ".pdf") ||
-		filepath.Base(it.LocalPath) != it.LocalPath {
-		t.Fatalf("local path %q: want relative tg-<chat>-<msg>-*.pdf", it.LocalPath)
-	}
-	if !r.in.fileAtInsert[0] || !r.in.withAck[0] {
-		t.Fatalf("file on disk at insert = %v, ack = %v", r.in.fileAtInsert, r.in.withAck)
-	}
-	data, err := os.ReadFile(filepath.Join(r.dir, it.LocalPath))
-	if err != nil || !bytes.Equal(data, r.dl.data) {
-		t.Fatalf("file: %q, %v", data, err)
-	}
-}
-
-func TestFileSizeFallsBackToDownloaded(t *testing.T) {
-	r := newRig(t)
-
-	r.handle(t, fileMsg("", 0))
-
-	it := r.in.items[0]
-	if it.Size != int64(len(r.dl.data)) || strings.Contains(it.LocalPath, ".pdf") {
-		t.Fatalf("item = %+v", it)
+			wantEvents(t, r, tc.want...)
+			it := r.in.items[0]
+			if it.Source != telegram.Source || it.ChatID != chat || it.MessageID != 44 ||
+				!it.ReceivedAt.Equal(date()) || it.Kind != capture.FileDocument || it.FileID != "FAKE-FILE-ID" ||
+				it.MimeType != "application/pdf" || it.Name != "../lease.pdf" || it.Size != 1000 ||
+				it.Caption != "the lease" || it.AlbumID != "FAKE-ALBUM" || it.LocalPath != "" || it.TooLarge {
+				t.Fatalf("item = %+v", it)
+			}
+			if !r.in.withAck[0] {
+				t.Fatal("a file item must be stored with the ⏳ acknowledgement")
+			}
+			if s := r.rep.sent; !tc.joined && (len(s) != 1 || s[0].replyTo != 44) {
+				t.Fatalf("sent = %+v, want one ⏳ answering the item", s)
+			}
+			if got := r.audioFiles(t); len(got) != 0 {
+				t.Fatalf("files written at ingest: %v", got)
+			}
+		})
 	}
 }
 
@@ -568,139 +591,62 @@ func standaloneFileMsg(size int64) telegram.Message {
 	return m
 }
 
-func TestFileJoiningABatchGetsNoAck(t *testing.T) {
-	r := newRig(t)
-	r.in.joined = true
-
-	r.handle(t, fileMsg("a.pdf", 1000))
-
-	wantEvents(t, r, `download FAKE-FILE-ID`, `ingestfile`, `wake`)
-}
-
 func TestFileTooLargeStandaloneIsRejected(t *testing.T) {
-	for name, tc := range map[string]struct {
-		size  int64
-		dlErr error
-		want  []string
-	}{
-		"reported size": {
-			size: telegram.MaxFileSize + 1,
-			want: []string{`ingestfile`, `send "⚠ too large for Telegram bots (max 20 MB) — not saved."`},
-		},
-		"download error": {
-			dlErr: fmt.Errorf("wrapped: %w", telegram.ErrTooLarge),
-			want: []string{
-				`download FAKE-FILE-ID`, `ingestfile`,
-				`send "⚠ too large for Telegram bots (max 20 MB) — not saved."`,
-			},
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			r := newRig(t)
-			r.dl.err = tc.dlErr
-			// No open batch: the ingester stores nothing.
-			r.in.err = pipeline.ErrFileTooLarge
-
-			r.handle(t, standaloneFileMsg(tc.size))
-
-			wantEvents(t, r, tc.want...)
-			if it := r.in.items[0]; !it.TooLarge || it.LocalPath != "" || it.AlbumID != "" {
-				t.Fatalf("item = %+v, want a too-large item with no local file", it)
-			}
-		})
-	}
-}
-
-func TestFileTooLargeInAlbumIsKeptAsFailed(t *testing.T) {
-	for name, tc := range map[string]struct {
-		size  int64
-		dlErr error
-		want  []string
-	}{
-		"reported size": {
-			size: telegram.MaxFileSize + 1,
-			want: []string{`ingestfile`, `send "⏳"`, `reply 7=9001`, `wake`},
-		},
-		"download error": {
-			dlErr: fmt.Errorf("wrapped: %w", telegram.ErrTooLarge),
-			want:  []string{`download FAKE-FILE-ID`, `ingestfile`, `send "⏳"`, `reply 7=9001`, `wake`},
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			r := newRig(t)
-			r.dl.err = tc.dlErr
-
-			r.handle(t, fileMsg("a.pdf", tc.size))
-
-			wantEvents(t, r, tc.want...)
-			it := r.in.items[0]
-			if !it.TooLarge || it.LocalPath != "" || it.AlbumID != "FAKE-ALBUM" || it.FileID != "FAKE-FILE-ID" {
-				t.Fatalf("item = %+v, want a too-large album item", it)
-			}
-		})
-	}
-}
-
-func TestFileTooLargeJoiningOpenBatchIsKeptWithoutAck(t *testing.T) {
 	r := newRig(t)
-	r.in.joined = true
+	// No open batch: the ingester stores nothing.
+	r.in.err = pipeline.ErrFileTooLarge
 
 	r.handle(t, standaloneFileMsg(telegram.MaxFileSize+1))
 
-	wantEvents(t, r, `ingestfile`, `wake`)
-	if it := r.in.items[0]; !it.TooLarge {
-		t.Fatalf("item = %+v", it)
+	wantEvents(t, r, `ingestfile`, `send "⚠ too large for Telegram bots (max 20 MB) — not saved."`)
+	if it := r.in.items[0]; !it.TooLarge || it.LocalPath != "" || it.AlbumID != "" {
+		t.Fatalf("item = %+v, want a too-large item with no local file", it)
 	}
 }
 
-func TestFileDownloadFailureIngestsWithoutLocalPath(t *testing.T) {
-	r := newRig(t)
-	r.dl.err = errors.New("fake: file api down")
+// A too-large album item is kept as failed and, when it starts the batch,
+// gets the batch's ⏳; one joining the open batch gets none.
+func TestFileTooLargeInABatchIsKeptAsFailed(t *testing.T) {
+	for name, tc := range map[string]struct {
+		m    telegram.Message
+		want []string
+	}{
+		"album":      {fileMsg("a.pdf", telegram.MaxFileSize+1), []string{`ingestfile`, `send "⏳"`, `reply 7=9001`, `wake`}},
+		"open batch": {standaloneFileMsg(telegram.MaxFileSize + 1), []string{`ingestfile`, `wake`}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newRig(t)
+			r.in.joined = tc.m.Files.AlbumID == ""
 
-	r.handle(t, fileMsg("a.pdf", 1000))
+			r.handle(t, tc.m)
 
-	wantEvents(t, r, `download FAKE-FILE-ID`, `ingestfile`, `wake`)
-	if it := r.in.items[0]; it.LocalPath != "" || it.FileID != "FAKE-FILE-ID" {
-		t.Fatalf("item = %+v", it)
+			wantEvents(t, r, tc.want...)
+			it := r.in.items[0]
+			if !it.TooLarge || it.LocalPath != "" || it.AlbumID != tc.m.Files.AlbumID ||
+				it.FileID != "FAKE-FILE-ID" || !r.in.withAck[0] {
+				t.Fatalf("item = %+v, ack = %v, want a too-large item with the acknowledgement",
+					it, r.in.withAck[0])
+			}
+		})
 	}
 }
 
-func TestFileWriteFailureIngestsWithoutLocalPath(t *testing.T) {
-	r := newRig(t)
-	if err := os.RemoveAll(r.dir); err != nil {
-		t.Fatal(err)
-	}
-
-	r.handle(t, fileMsg("a.pdf", 1000))
-
-	wantEvents(t, r, `download FAKE-FILE-ID`, `ingestfile`, `wake`)
-	if it := r.in.items[0]; it.LocalPath != "" {
-		t.Fatalf("item = %+v", it)
-	}
-}
-
-func TestFileDuplicateRemovesFile(t *testing.T) {
+func TestFileDuplicateIsIgnored(t *testing.T) {
 	r := newRig(t)
 	r.in.err = pipeline.ErrDuplicate
 
 	r.handle(t, fileMsg("a.pdf", 1000))
 
-	wantEvents(t, r, `download FAKE-FILE-ID`, `ingestfile`)
-	if got := r.audioFiles(t); len(got) != 0 {
-		t.Fatalf("leftover files %v", got)
-	}
+	wantEvents(t, r, `ingestfile`)
 }
 
-func TestFileStoreErrorRemovesFileAndAsksToResend(t *testing.T) {
+func TestFileStoreErrorAsksToResend(t *testing.T) {
 	r := newRig(t)
 	r.in.err = errors.New("fake: disk full")
 
 	r.handle(t, fileMsg("a.pdf", 1000))
 
-	wantEvents(t, r, `download FAKE-FILE-ID`, `ingestfile`, notSaved)
-	if got := r.audioFiles(t); len(got) != 0 {
-		t.Fatalf("leftover files %v", got)
-	}
+	wantEvents(t, r, `ingestfile`, notSaved)
 }
 
 func TestTooLargeDiscoveredAtDownloadIsRejected(t *testing.T) {

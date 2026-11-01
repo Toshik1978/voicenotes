@@ -40,6 +40,8 @@ const (
 	TextSTT     TextSource = "stt"
 	TextDocling TextSource = "docling"
 	TextVision  TextSource = "vision"
+	// TextLocal is a plain-text file read as it is, with no reader.
+	TextLocal TextSource = "local"
 )
 
 // File is one file of a capture (data-model.md "Capture file"). Optional

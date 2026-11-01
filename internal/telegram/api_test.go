@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,6 +40,8 @@ type fakeAPI struct {
 	calls   []apiCall
 	respond map[string]func(params map[string]any) (int, string)
 	files   map[string][]byte
+	// fileDelay slows every file download response.
+	fileDelay time.Duration
 }
 
 func newFakeAPI(t *testing.T) *fakeAPI {
@@ -53,6 +56,7 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 
 func (f *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 	if path, ok := strings.CutPrefix(r.URL.Path, "/file/bot"+token+"/"); ok {
+		time.Sleep(f.fileDelay)
 		data, found := f.files[path]
 		if !found {
 			http.NotFound(w, r)
@@ -257,6 +261,58 @@ func TestEdit(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Minor 7: file downloads use their own client, whose bound is far longer
+// than a Bot API call's, so a 20 MB file on a slow link can finish.
+func TestDownloadHasItsOwnLongerTimeout(t *testing.T) {
+	for name, tc := range map[string]struct {
+		call, download time.Duration
+		wantErr        bool
+	}{
+		"slower than a call": {call: 100 * time.Millisecond, download: 5 * time.Second},
+		"slower than a download": {
+			call: 5 * time.Second, download: 100 * time.Millisecond, wantErr: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFakeAPI(t)
+			f.on("getFile", func(map[string]any) (int, string) {
+				return http.StatusOK, `{"ok":true,"result":{"file_id":"x","file_path":"documents/x.pdf"}}`
+			})
+			f.files["documents/x.pdf"] = []byte("%PDF-fake")
+			f.fileDelay = 300 * time.Millisecond
+			a, err := telegram.NewAPI(telegram.APIConfig{
+				Token: token, URL: f.srv.URL, CallTimeout: tc.call, DownloadTimeout: tc.download, Log: zap.NewNop(),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := a.Download(context.Background(), "x")
+			if tc.wantErr {
+				if err == nil || strings.Contains(err.Error(), "FAKE-TOKEN") {
+					t.Fatalf("err = %v, want a token-free timeout", err)
+				}
+
+				return
+			}
+			if err != nil || string(data) != "%PDF-fake" {
+				t.Fatalf("Download = %q, %v", data, err)
+			}
+		})
+	}
+}
+
+func TestTimeoutDefaults(t *testing.T) {
+	if telegram.DefaultDownloadTimeout != 10*time.Minute || telegram.DefaultCallTimeout != time.Minute {
+		t.Fatalf("download %v, call %v", telegram.DefaultDownloadTimeout, telegram.DefaultCallTimeout)
+	}
+	// The ack hold covers a whole handler run, which includes the bounded
+	// first-item download and the ⏳ call.
+	if telegram.HandlerTimeout >= pipeline.AckHoldLimit ||
+		telegram.HandlerTimeout < pipeline.ArrivalDownloadLimit+telegram.DefaultCallTimeout {
+		t.Fatalf("handler timeout %v, ack hold %v", telegram.HandlerTimeout, pipeline.AckHoldLimit)
 	}
 }
 
@@ -621,5 +677,100 @@ func TestSendWithSoundErrors(t *testing.T) {
 	cancel()
 	if err := a.SendWithSound(ctx, chat, "x"); err == nil {
 		t.Fatal("cancelled ctx: want error")
+	}
+}
+
+// orderHandler records the order handlers start and finish, and holds the
+// message hold until release is closed.
+type orderHandler struct {
+	hold    int64
+	release chan struct{}
+	mu      sync.Mutex
+	log     []string
+	done    chan struct{}
+}
+
+func (o *orderHandler) add(s string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.log = append(o.log, s)
+}
+
+func (o *orderHandler) Handle(_ context.Context, m telegram.Message) {
+	o.add(fmt.Sprintf("start %d", m.ID))
+	if m.ID == o.hold {
+		<-o.release
+	}
+	o.add(fmt.Sprintf("end %d", m.ID))
+
+	o.done <- struct{}{}
+}
+
+func (o *orderHandler) snapshot() []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	return slices.Clone(o.log)
+}
+
+// TestRunHandlesAChatsFilesInArrivalOrder (FR-106): one chat's photos and
+// files are handled one at a time in the order Telegram delivered them, so
+// an album's positions, caption order and ⏳ target cannot follow goroutine
+// scheduling. Other messages of the chat do not wait for them.
+func TestRunHandlesAChatsFilesInArrivalOrder(t *testing.T) {
+	f := newFakeAPI(t)
+	var once sync.Once
+	msg := func(id int, body string) string {
+		return fmt.Sprintf(`{"update_id":%[1]d,"message":{"message_id":%[1]d,"date":1,`+
+			`"chat":{"id":%[2]d,"type":"private"},"from":{"id":%[3]d,"is_bot":false,"first_name":"A"},%[4]s}}`,
+			id, chat, owner, body)
+	}
+	photo := func(id int) string {
+		return msg(id, fmt.Sprintf(`"media_group_id":"G1","photo":[`+
+			`{"file_id":"P%[1]d","file_unique_id":"p%[1]d","width":9,"height":9,"file_size":100}]`, id))
+	}
+	f.on("getUpdates", func(map[string]any) (int, string) {
+		out := `{"ok":true,"result":[]}`
+		once.Do(func() {
+			out = `{"ok":true,"result":[` + strings.Join([]string{
+				photo(61), photo(62), msg(63, `"text":"hi"`), photo(64),
+			}, ",") + `]}`
+		})
+		time.Sleep(10 * time.Millisecond)
+
+		return http.StatusOK, out
+	})
+	a := newAPI(t, f)
+	h := &orderHandler{hold: 61, release: make(chan struct{}), done: make(chan struct{}, 4)}
+	go a.Run(t.Context(), h)
+
+	select {
+	case <-h.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the text message waited for the held photo")
+	}
+	time.Sleep(100 * time.Millisecond)
+	for _, s := range h.snapshot() {
+		if s == "start 62" || s == "start 64" {
+			t.Fatalf("log %q: a later photo started while the first was still being handled", h.snapshot())
+		}
+	}
+	close(h.release)
+	for range 3 {
+		select {
+		case <-h.done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("handlers did not finish: %q", h.snapshot())
+		}
+	}
+	var photos []string
+	for _, s := range h.snapshot() {
+		if !strings.HasSuffix(s, " 63") {
+			photos = append(photos, s)
+		}
+	}
+	want := []string{"start 61", "end 61", "start 62", "end 62", "start 64", "end 64"}
+	if !slices.Equal(photos, want) {
+		t.Fatalf("photo handling %q, want %q", photos, want)
 	}
 }

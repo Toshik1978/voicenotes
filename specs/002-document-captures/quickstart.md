@@ -35,7 +35,7 @@ Run any docling-serve (e.g. a container on `docling.example.org:5001`) and set
 | Photo of a printed bill (LLM on) | Hint like "Electricity bill, €84, due Nov 10" in `TARGET_LANGUAGE`. |
 | Text PDF, scanned PDF, DOCX, XLSX (LLM on) | A hint derived from the content of each. |
 | Same with `LLM_BASE_URL` unset | The hint is the first lines of extracted text. |
-| Photo of a landscape | Placeholder `📷 photo`, photo attached. |
+| Photo of a landscape | Placeholder `📷 photo — no text found` (the reader found no text), photo attached. |
 | 300-page PDF | Only the first `DOCLING_MAX_PAGES` are converted. The note arrives within minutes, with the full PDF attached. |
 
 ## 3. Batches (US3, SC-103)
@@ -64,8 +64,8 @@ images).
 | Action | Expected |
 |---|---|
 | Photo of handwriting | A usable hint. The gateway logs show one image request. |
-| Gateway down during the photo | Up to 3 vision attempts back to back (no waiting state, no `⏳ queued`), within 2 minutes. Then the placeholder `📷 photo` and the normal `✓ saved` reply. |
-| Image-only PDF with no OCR text | Placeholder hint. No vision request. |
+| Gateway down during the photo | Up to 3 vision attempts back to back (no waiting state, no `⏳ queued`), within 2 minutes. Then the placeholder `📷 photo — no text found` and the normal `✓ saved` reply. |
+| Image-only PDF with no OCR text | Placeholder hint `📎 <name>.pdf — no text found`. No vision request. |
 | `VISION_ENABLED=false` | No image ever reaches the gateway. |
 
 ## 6. Upgrade from 001

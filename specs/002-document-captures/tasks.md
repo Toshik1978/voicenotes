@@ -327,3 +327,15 @@ Task: "T017 hint request/parse in internal/enrich/files.go"
 3. US3: one note per send.
 4. US4: vision fallback, off by default.
 5. Polish: docs and full quickstart.
+
+## Phase 8: Convergence
+
+- [x] T029 Assign each file item's batch position, caption order and the ⏳-answering first item in Telegram arrival order (message ID within the chat), not in download-completion order, in `internal/telegram/files.go`, `internal/telegram/api.go`, `internal/store/sqlite/store.go` and `internal/capture/batch.go`: handlers run concurrently and download before `AppendFile`, so concurrent album parts can land out of order; persist the item (or reserve its slot) before the download, or order by source message ID per FR-106, US3/AC1, US3/AC10 (partial)
+- [x] T030 Start an item's quiet period and album membership when it arrives, not when its download finishes, so an album part whose download outlasts `BATCH_QUIET_PERIOD` still joins its batch instead of starting a second note (shares T029's root cause), with a test using a slow fake download, per FR-106, FR-107, US3/AC1, SC-103 (partial)
+- [x] T031 Make the fallback hint state that no text was found (e.g. `📷 photo — no text found`) when a reader ran and every file came back empty, in `internal/render/hint.go` (tests in `internal/render/hint_test.go`), per US2/AC5, FR-117 (partial)
+- [x] T032 Verify against docling-serve's documented input formats whether `.txt`/`text/plain` is accepted; if not, read plain-text files locally (bounded by `HINT_EXCERPT_RUNES`) instead of submitting them, in `internal/pipeline/steps_files.go` (tests in `internal/pipeline/steps_docling_test.go`), per FR-110 (partial)
+- [x] T033 Name the item that was not kept or not attached in the batch reply (e.g. `scan.pdf not kept — <reason>`), in the reply/notice code under `internal/pipeline` and `internal/render`, per FR-126, US3/AC6 (partial)
+
+## Phase 9: Convergence
+
+- [x] T034 Treat docling markdown that is empty once image placeholders (`<!-- image -->`) and whitespace are stripped as `empty` in the files extract step (`internal/pipeline/steps_files.go`, tests in `internal/pipeline/steps_docling_test.go`), so a photo with no text gets the "no text found" placeholder with or without the LLM and the LLM never receives a marker-only excerpt, per US2/AC5, FR-117 (partial)
