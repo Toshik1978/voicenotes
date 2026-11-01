@@ -17,6 +17,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/Toshik1978/voicenotes/internal/capture"
 	"github.com/Toshik1978/voicenotes/internal/pipeline"
 	"github.com/Toshik1978/voicenotes/internal/telegram"
 )
@@ -412,6 +413,88 @@ func TestRunRecoversFromPollErrorsAndMapsAudio(t *testing.T) {
 	}
 	if p := f.call(t, "getUpdates"); p["allowed_updates"] == nil {
 		t.Fatal("allowed_updates missing")
+	}
+}
+
+func TestRunMapsFileMessages(t *testing.T) {
+	f := newFakeAPI(t)
+	var mu sync.Mutex
+	n := 0
+	msg := func(id int, body string) string {
+		return fmt.Sprintf(`{"update_id":%[1]d,"message":{"message_id":%[1]d,"date":1,`+
+			`"chat":{"id":%[2]d,"type":"private"},"from":{"id":%[3]d,"is_bot":false,"first_name":"A"},%[4]s}}`,
+			id, chat, owner, body)
+	}
+	f.on("getUpdates", func(map[string]any) (int, string) {
+		mu.Lock()
+		defer mu.Unlock()
+		n++
+		if n == 1 {
+			return http.StatusOK, `{"ok":true,"result":[` + strings.Join([]string{
+				msg(51, `"media_group_id":"G1","caption":"receipt","photo":[`+
+					`{"file_id":"S","file_unique_id":"s","width":90,"height":90,"file_size":100},`+
+					`{"file_id":"L","file_unique_id":"l","width":800,"height":800,"file_size":5000}]`),
+				msg(52, `"caption":"scan","document":{"file_id":"D","file_unique_id":"d",`+
+					`"file_name":"a.pdf","mime_type":"application/pdf","file_size":7000}`),
+				msg(53, `"document":{"file_id":"I","file_unique_id":"i","file_name":"p.png",`+
+					`"mime_type":"image/png","file_size":300}`),
+				msg(54, `"document":{"file_id":"A","file_unique_id":"a","file_name":"s.mp3",`+
+					`"mime_type":"audio/mpeg","file_size":400}`),
+				msg(55, `"video":{"file_id":"V","file_unique_id":"v","width":1,"height":1,"duration":2,`+
+					`"mime_type":"video/mp4","file_name":"c.mp4","file_size":900}`),
+				msg(56, `"document":{"file_id":"N","file_unique_id":"n","file_name":"g.mp4",`+
+					`"mime_type":"video/mp4","file_size":10},`+
+					`"animation":{"file_id":"N","file_unique_id":"n","width":1,"height":1,"duration":1,`+
+					`"mime_type":"video/mp4","file_name":"g.mp4","file_size":10}`),
+			}, ",") + `]}`
+		}
+		time.Sleep(10 * time.Millisecond)
+
+		return http.StatusOK, `{"ok":true,"result":[]}`
+	})
+	a, err := telegram.NewAPI(telegram.APIConfig{
+		Token: token, URL: f.srv.URL, PollTimeout: time.Millisecond, RetryBase: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &recordingHandler{got: make(chan telegram.Message, 6)}
+	go a.Run(t.Context(), h)
+
+	got := map[int64]telegram.Message{}
+	for range 6 {
+		select {
+		case m := <-h.got:
+			got[m.ID] = m
+		case <-time.After(5 * time.Second):
+			t.Fatalf("handler got only %d messages", len(got))
+		}
+	}
+	want := map[int64]telegram.FileItem{
+		51: {FileID: "L", MIME: "image/jpeg", Size: 5000, Kind: capture.FileImage, Caption: "receipt", AlbumID: "G1"},
+		52: {
+			FileID:  "D",
+			MIME:    "application/pdf",
+			Name:    "a.pdf",
+			Size:    7000,
+			Kind:    capture.FileDocument,
+			Caption: "scan",
+		},
+		53: {FileID: "I", MIME: "image/png", Name: "p.png", Size: 300, Kind: capture.FileImage},
+		55: {FileID: "V", MIME: "video/mp4", Name: "c.mp4", Size: 900, Kind: capture.FileVideo},
+		56: {FileID: "N", MIME: "video/mp4", Name: "g.mp4", Size: 10, Kind: capture.FileVideo},
+	}
+	for id, w := range want {
+		if g := got[id].Files; g == nil || *g != w {
+			t.Errorf("message %d: Files = %+v, want %+v", id, g, w)
+		}
+		if got[id].Audio != nil {
+			t.Errorf("message %d: Audio must be nil", id)
+		}
+	}
+	if m := got[54]; m.Files != nil || m.Audio == nil ||
+		*m.Audio != (telegram.Audio{FileID: "A", MimeType: "audio/mpeg", Size: 400}) {
+		t.Errorf("audio document = %+v, want existing Audio and no Files", m)
 	}
 }
 

@@ -733,3 +733,66 @@ func TestPurgeDoneCascadesFiles(t *testing.T) {
 		t.Fatalf("purged item identity must be insertable: %v", err)
 	}
 }
+
+func fileItemCapture(msgID int64, caption string) capture.Capture {
+	c, _ := capture.New(capture.KindFiles, capture.StepCollect, ts0())
+	c.Source, c.SourceChatID, c.SourceMessageID = "telegram", -1001234567890, msgID
+	c.Text = caption
+	c.NextAttemptAt = ts0().Add(3 * time.Second)
+	c.Files = []capture.File{{
+		Source: c.Source, SourceChatID: c.SourceChatID, SourceMessageID: msgID,
+		Kind: capture.FileImage, State: capture.FilePending, FileID: "FAKE-FILE",
+	}}
+
+	return c
+}
+
+func TestAppendFileCreatesCollectCapture(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+
+	got, created, err := s.AppendFile(ctx, fileItemCapture(5, "cap"), 3*time.Second)
+	if err != nil || !created {
+		t.Fatalf("created=%v err=%v", created, err)
+	}
+	if got.ID == 0 || got.Files[0].ID == 0 || got.Files[0].CaptureID != got.ID || got.Files[0].Position != 0 {
+		t.Fatalf("IDs not assigned: %+v", got)
+	}
+	read, ok, err := s.OldestUnfinished(ctx)
+	if err != nil || !ok {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	if !reflect.DeepEqual(read, got) {
+		t.Fatalf("stored differs\n got %+v\nwant %+v", read, got)
+	}
+	if read.Step != capture.StepCollect || read.Text != "cap" || !read.NextAttemptAt.Equal(ts0().Add(3*time.Second)) {
+		t.Fatalf("capture = %+v", read)
+	}
+}
+
+func TestAppendFileRedeliveryIsDuplicate(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+
+	if _, _, err := s.AppendFile(ctx, fileItemCapture(5, ""), time.Second); err != nil {
+		t.Fatal(err)
+	}
+	// Same identity: both the capture and the file UNIQUE constraints apply.
+	_, created, err := s.AppendFile(ctx, fileItemCapture(5, ""), time.Second)
+	if !errors.Is(err, sqlite.ErrDuplicate) || created {
+		t.Fatalf("created=%v err=%v, want ErrDuplicate", created, err)
+	}
+	// A new capture identity whose file identity was already stored.
+	other := fileItemCapture(6, "")
+	other.Files[0].SourceMessageID = 5
+	if _, _, err := s.AppendFile(ctx, other, time.Second); !errors.Is(err, sqlite.ErrDuplicate) {
+		t.Fatalf("want ErrDuplicate via the file constraint, got %v", err)
+	}
+	if n, err := s.CountUnfinished(ctx); err != nil || n != 1 {
+		t.Fatalf("unfinished = %d err=%v", n, err)
+	}
+	// The connection is usable after the rolled-back transaction.
+	if _, _, err := s.AppendFile(ctx, fileItemCapture(7, ""), time.Second); err != nil {
+		t.Fatal(err)
+	}
+}

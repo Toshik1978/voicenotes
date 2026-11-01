@@ -141,6 +141,7 @@ func NewHandlers(d Deps, cfg StepsConfig) (map[capture.Step]Handler, error) {
 	s := &stepRunner{d: d, cfg: cfg}
 
 	return map[capture.Step]Handler{
+		capture.StepCollect:       s.collect,
 		capture.StepDownload:      s.download,
 		capture.StepExtract:       s.extract,
 		capture.StepEnrich:        s.enrich,
@@ -275,10 +276,12 @@ func (s *stepRunner) downloadFile(ctx context.Context, c *capture.Capture, i int
 
 // extract turns the pending audio files into text, one per attempt, and
 // returns Progress while any remain. A file already done is not sent again.
+// Photos, documents and videos are skipped: no reader is wired for them.
 // Once none remain, an audio capture takes its file's text and language, so
 // enrich and render see a voice note as before.
 func (s *stepRunner) extract(ctx context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
 	c.Files = slices.Clone(c.Files)
+	skipUnreadFiles(c.Files)
 	if i := slices.IndexFunc(c.Files, pendingAudio); i >= 0 {
 		if out := s.transcribeFile(ctx, &c, i); out.Class != capture.ClassOK {
 			return c, out
@@ -441,9 +444,12 @@ func (s *stepRunner) noteInput(c capture.Capture) render.Input {
 // kept even when an attach fails, so a retry resumes there without creating
 // the note again; each attached file is recorded, so a re-run never sends it
 // twice. MinimalNote keeps the raw text (truncated to the limit) and drops the
-// attachments and the LLM output.
+// attachments and the LLM output. A files capture has its own flow.
 func (s *stepRunner) writeNote(ctx context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
 	c.Files = slices.Clone(c.Files)
+	if c.Kind == capture.KindFiles {
+		return s.writeFilesNote(ctx, c)
+	}
 	if c.NoteName == "" || c.MinimalNote {
 		var out capture.Outcome
 		if c, out = s.createNote(ctx, c); out.Class != capture.ClassOK {
@@ -484,6 +490,16 @@ func (s *stepRunner) createNote(ctx context.Context, c capture.Capture) (capture
 	if strings.HasPrefix(c.Failure, attachFailedMark) {
 		in.Failure = ""
 	}
+
+	return s.create(ctx, c, in)
+}
+
+// create renders in, creates the note and records its name and link.
+func (s *stepRunner) create(
+	ctx context.Context,
+	c capture.Capture,
+	in render.Input,
+) (capture.Capture, capture.Outcome) {
 	s.logRendered(c, in)
 	name, link, out := s.d.Notes.Create(ctx, NoteInput{
 		CaptureID:  c.ID,
@@ -506,7 +522,11 @@ func attachable(f capture.File) bool { return f.LocalPath != "" && !f.Attached }
 // logRendered records at debug whether the note carries the LLM result, so a
 // live deploy can tell a dropped result from an answer that kept the text.
 func (s *stepRunner) logRendered(c capture.Capture, in render.Input) {
-	llm := in.Text != c.Text || len(in.Actions) > 0 || len(in.SuggestedTags) > 0
+	main := in.Text
+	if len(in.Files) > 0 {
+		main = in.Caption
+	}
+	llm := main != c.Text || len(in.Actions) > 0 || len(in.SuggestedTags) > 0
 	s.d.Log.Debug("note rendered",
 		zap.Int64("capture", c.ID), zap.Bool("stored_result", c.EnrichedJSON != ""),
 		zap.Bool("llm", llm), zap.Bool("minimal", c.MinimalNote), zap.Bool("failure", in.Failure != ""),
@@ -514,7 +534,9 @@ func (s *stepRunner) logRendered(c capture.Capture, in render.Input) {
 }
 
 // attach uploads c.Files[i] to the note and records it as attached. A missing
-// file is not an error: the note exists and the file cannot be recovered.
+// file is not an error: the note exists and the file cannot be recovered. In
+// a files capture a file the notes store refuses for good is recorded as
+// attached with its reason, and the note stands (FR-126).
 func (s *stepRunner) attach(ctx context.Context, c *capture.Capture, i int) capture.Outcome {
 	f := &c.Files[i]
 	data, err := s.d.Files.Read(f.LocalPath)
@@ -529,7 +551,13 @@ func (s *stepRunner) attach(ctx context.Context, c *capture.Capture, i int) capt
 
 		return capture.Temporary("file store: " + err.Error())
 	}
-	out := s.d.Notes.Attach(ctx, c.NoteName, s.attachmentName(c.ReceivedAt, *f), audioMime(f.LocalPath), data)
+	out := s.d.Notes.Attach(ctx, c.NoteName, s.attachmentName(*c, *f), attachMime(*f), data)
+	if out.Class == capture.ClassPermanent && c.Kind == capture.KindFiles {
+		s.log(*c, "file not attached, note saved without it", errors.New(out.Reason))
+		f.Attached, f.AttachFailure = true, out.Reason
+
+		return capture.OK()
+	}
 	if out.Class != capture.ClassOK {
 		// Policy.Next drops the reason of a permanent outcome; the minimal
 		// rerun reads it back from LastError.
@@ -669,6 +697,9 @@ func holdsAudio(c capture.Capture) bool {
 // replyText builds the final reply (contracts/telegram-ux.md), HTML-escaped.
 func replyText(c capture.Capture) string {
 	link := `<a href="` + html.EscapeString(c.NoteURL) + `">open</a>`
+	if c.Kind == capture.KindFiles {
+		return filesReplyText(c, link)
+	}
 	if reason, ok := strings.CutPrefix(c.Failure, attachFailedMark); ok {
 		return fmt.Sprintf("⚠ saved, audio not attached — %s · %s", html.EscapeString(reason), link)
 	}
@@ -680,6 +711,13 @@ func replyText(c capture.Capture) string {
 	if c.Failure != "" {
 		return fmt.Sprintf("⚠ saved audio only — %s · %s", html.EscapeString(c.Failure), link)
 	}
+
+	return savedText(c, link)
+}
+
+// savedText is the reply for a note saved in full, with the "(no AI)" and
+// task-count marks.
+func savedText(c capture.Capture, link string) string {
 	head := "✓ saved"
 	if c.LLMSkipped == capture.SkippedUnavailable || c.LLMSkipped == capture.SkippedInvalidOutput {
 		head += " (no AI)"
@@ -712,7 +750,7 @@ func localName(captureID int64, f capture.File) string {
 		name += "-" + strconv.Itoa(f.Position)
 	}
 	if f.Kind != capture.FileAudio {
-		return name + path.Ext(f.FileName)
+		return name + SanitizeExt(path.Ext(f.FileName))
 	}
 
 	return name + audioExt(f.MimeType)
@@ -735,21 +773,17 @@ func audioExt(mime string) string {
 	return extOgg
 }
 
-// attachmentName is the deterministic Memos attachment filename
-// voice-<received_at local date>.<ext>. It never carries the local file name,
-// which holds the Telegram chat ID. Attach dedupes within the capture's own
-// memo, so same-day captures cannot collide.
-func (s *stepRunner) attachmentName(receivedAt time.Time, f capture.File) string {
-	loc := s.cfg.Location
-	if loc == nil {
-		loc = time.UTC
-	}
-	ext := path.Ext(f.LocalPath)
-	if ext == "" {
-		ext = extOgg
+// attachmentName is the capture's Memos attachment filename for f, from
+// AttachmentNames over the whole capture so that names stay unique and stable.
+func (s *stepRunner) attachmentName(c capture.Capture, f capture.File) string {
+	names := AttachmentNames(c.ReceivedAt, s.cfg.Location, c.Files)
+	for i := range c.Files {
+		if c.Files[i].Position == f.Position {
+			return names[i]
+		}
 	}
 
-	return "voice-" + receivedAt.In(loc).Format(time.DateOnly) + ext
+	return AttachmentNames(c.ReceivedAt, s.cfg.Location, []capture.File{f})[0]
 }
 
 // audioMime is the attachment MIME type for a stored file name.

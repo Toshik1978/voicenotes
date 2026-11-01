@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/Toshik1978/voicenotes/internal/capture"
 )
@@ -18,6 +19,18 @@ var ErrDuplicate = errors.New("pipeline: duplicate capture")
 // pipeline recognises it without importing the store.
 type Inserter interface {
 	Insert(ctx context.Context, c *capture.Capture) error
+}
+
+// FileAppender is the slice of the capture queue file ingest needs.
+// AppendFile stores item, a files capture at collect holding one file, and
+// reports whether a capture was created. Duplicates are signalled like
+// Inserter's.
+type FileAppender interface {
+	AppendFile(
+		ctx context.Context,
+		item capture.Capture,
+		quiet time.Duration,
+	) (stored capture.Capture, created bool, err error)
 }
 
 // Waker is the worker as ingest sees it; *Worker implements it.
@@ -40,10 +53,22 @@ type Ack func(ctx context.Context, stored capture.Capture)
 type Ingester struct {
 	store Inserter
 	waker Waker
+
+	files FileAppender
+	quiet time.Duration
+}
+
+// IngesterOption configures optional ingest features.
+type IngesterOption func(*Ingester)
+
+// WithFiles enables IngestFile: items are appended through files and a new
+// batch is due quiet after its first item arrived.
+func WithFiles(files FileAppender, quiet time.Duration) IngesterOption {
+	return func(i *Ingester) { i.files, i.quiet = files, quiet }
 }
 
 // NewIngester returns an Ingester inserting into store and waking waker.
-func NewIngester(store Inserter, waker Waker) (*Ingester, error) {
+func NewIngester(store Inserter, waker Waker, opts ...IngesterOption) (*Ingester, error) {
 	if store == nil {
 		return nil, errors.New("pipeline: nil store")
 	}
@@ -51,7 +76,12 @@ func NewIngester(store Inserter, waker Waker) (*Ingester, error) {
 		return nil, errors.New("pipeline: nil waker")
 	}
 
-	return &Ingester{store: store, waker: waker}, nil
+	i := &Ingester{store: store, waker: waker}
+	for _, opt := range opts {
+		opt(i)
+	}
+
+	return i, nil
 }
 
 // Ingest durably inserts c, runs ack (when not nil) and then wakes the
@@ -74,22 +104,37 @@ func (i *Ingester) Ingest(ctx context.Context, c capture.Capture, ack Ack) (capt
 }
 
 func (i *Ingester) insertAndAck(ctx context.Context, c capture.Capture, ack Ack) (capture.Capture, error) {
+	return i.storeAndAck(ctx, c, ack, func() (capture.Capture, bool, error) {
+		if err := i.store.Insert(ctx, &c); err != nil {
+			return capture.Capture{}, false, fmt.Errorf("insert: %w", err)
+		}
+
+		return c, true, nil
+	})
+}
+
+// storeAndAck holds the worker off c while store runs and, when it created
+// a capture, acks it. A duplicate maps to ErrDuplicate.
+func (i *Ingester) storeAndAck(
+	ctx context.Context, c capture.Capture, ack Ack, store func() (capture.Capture, bool, error),
+) (capture.Capture, error) {
 	if ack != nil {
 		release := i.waker.HoldAck(c)
 		defer release()
 	}
-	if err := i.store.Insert(ctx, &c); err != nil {
+	stored, created, err := store()
+	if err != nil {
 		if isDuplicate(err) {
 			return capture.Capture{}, ErrDuplicate
 		}
 
 		return capture.Capture{}, fmt.Errorf("pipeline: ingest: %w", err)
 	}
-	if ack != nil {
-		ack(ctx, c)
+	if created && ack != nil {
+		ack(ctx, stored)
 	}
 
-	return c, nil
+	return stored, nil
 }
 
 // duplicate is the behaviour a store error exposes for a duplicate insert.

@@ -7,6 +7,10 @@
 //	checklist ("- [ ] item" lines, when there are action items)
 //	original quote ("*Original (xx):*" then "> " lines, when translated)
 //	tags line (inbox tag, todo tag with action items, suggested tags)
+//
+// File notes (Input.Files set) use the layout: caption (when present), hint,
+// checklist, original quote, tags. The first non-empty line is therefore the
+// caption, otherwise the hint (FR-125).
 package render
 
 import (
@@ -46,6 +50,14 @@ type Input struct {
 	// SuggestedTags are extra tags without "#"; duplicates of the inbox and
 	// to-do tags are dropped.
 	SuggestedTags []string
+
+	// Files marks a photo or file note; the fields below apply only then,
+	// and Text, Failure and NoAudio are ignored.
+	Files []FileSummary
+	// Caption is the user's caption (processed text when the LLM step is on).
+	Caption string
+	// Hint describes the item; when empty, FallbackHint(Files) is used.
+	Hint string
 }
 
 // Render returns the note content, at most limit bytes where possible. The
@@ -53,12 +65,37 @@ type Input struct {
 // "(truncated)" and never split inside a UTF-8 rune. The checklist and tags
 // are never cut, so they may exceed limit on their own.
 func Render(in Input, limit int) string {
+	if len(in.Files) > 0 {
+		return renderFiles(in, limit)
+	}
 	main := mainText(in)
+
+	return fit(in, main, limit, func(m string) []string { return []string{m} })
+}
+
+// renderFiles lays out a file note. The caption is shortened first; without a
+// caption the hint is. The attachments live outside the text and are untouched.
+func renderFiles(in Input, limit int) string {
+	hint := strings.TrimSpace(in.Hint)
+	if hint == "" {
+		hint = FallbackHint(in.Files)
+	}
+	caption := strings.TrimSpace(in.Caption)
+	if caption == "" {
+		return fit(in, hint, limit, func(m string) []string { return []string{m} })
+	}
+
+	return fit(in, caption, limit, func(m string) []string { return []string{m, hint} })
+}
+
+// fit assembles the note from head(main) and the shared tail, shortening the
+// quote, then main, until it fits limit.
+func fit(in Input, main string, limit int, head func(string) []string) string {
 	quote := in.Original
 	tags := tagsLine(in)
 
 	build := func(m, q string) string {
-		parts := []string{m}
+		parts := head(m)
 		if len(in.Actions) > 0 {
 			parts = append(parts, checklist(in.Actions))
 		}

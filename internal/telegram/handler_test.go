@@ -98,6 +98,7 @@ type fakeIngester struct {
 	err      error
 	audioDir string
 	got      []capture.Capture
+	items    []pipeline.FileItem
 	// withAck records whether each ingest carried an acknowledgement.
 	withAck []bool
 	// fileAtInsert records whether the audio file was on disk at insert.
@@ -118,6 +119,31 @@ func (f *fakeIngester) Ingest(ctx context.Context, c capture.Capture, ack pipeli
 		return capture.Capture{}, f.err
 	}
 	c.ID = 7
+	if ack != nil {
+		ack(ctx, c)
+	}
+	f.ev.addf("wake")
+
+	return c, nil
+}
+
+// IngestFile mirrors Ingest for file items.
+func (f *fakeIngester) IngestFile(
+	ctx context.Context,
+	item pipeline.FileItem,
+	ack pipeline.Ack,
+) (capture.Capture, error) {
+	f.ev.addf("ingestfile")
+	f.items = append(f.items, item)
+	f.withAck = append(f.withAck, ack != nil)
+	if item.LocalPath != "" {
+		_, err := os.Stat(filepath.Join(f.audioDir, item.LocalPath))
+		f.fileAtInsert = append(f.fileAtInsert, err == nil)
+	}
+	if f.err != nil {
+		return capture.Capture{}, f.err
+	}
+	c := capture.Capture{ID: 7}
 	if ack != nil {
 		ack(ctx, c)
 	}
@@ -461,8 +487,8 @@ func TestTooLargeIsRejected(t *testing.T) {
 }
 
 func TestCommandsAndUnsupported(t *testing.T) {
-	const help = "VoiceNotes: send a voice or text message to save it as a note."
-	const unsupported = "VoiceNotes takes voice or text only."
+	const help = "VoiceNotes: send a voice message, text, photo or file to save it as a note."
+	const unsupported = "VoiceNotes takes voice, text, photos and files."
 
 	for _, tc := range []struct {
 		text string
@@ -483,6 +509,119 @@ func TestCommandsAndUnsupported(t *testing.T) {
 		if s := r.rep.sent[0]; s.replyTo != 42 {
 			t.Fatalf("%q: reply = %+v", tc.text, s)
 		}
+	}
+}
+
+func fileMsg(name string, size int64) telegram.Message {
+	return telegram.Message{
+		ChatID: chat, ID: 44, SenderID: owner, Date: date(),
+		Files: &telegram.FileItem{
+			FileID: "FAKE-FILE-ID", MIME: "application/pdf", Name: name, Size: size,
+			Kind: capture.FileDocument, Caption: "the lease", AlbumID: "FAKE-ALBUM",
+		},
+	}
+}
+
+func TestFileDownloadsWritesCommitsThenAcks(t *testing.T) {
+	r := newRig(t)
+
+	r.handle(t, fileMsg("../lease.pdf", 1000))
+
+	wantEvents(t, r, `download FAKE-FILE-ID`, `ingestfile`, `send "⏳"`, `reply 7=9001`, `wake`)
+	it := r.in.items[0]
+	if it.Source != telegram.Source || it.ChatID != chat || it.MessageID != 44 || !it.ReceivedAt.Equal(date()) ||
+		it.Kind != capture.FileDocument || it.FileID != "FAKE-FILE-ID" || it.MimeType != "application/pdf" ||
+		it.Name != "../lease.pdf" || it.Size != 1000 || it.Caption != "the lease" || it.AlbumID != "FAKE-ALBUM" {
+		t.Fatalf("item = %+v", it)
+	}
+	if !strings.HasPrefix(it.LocalPath, fmt.Sprintf("tg-%d-44-", chat)) || !strings.HasSuffix(it.LocalPath, ".pdf") ||
+		filepath.Base(it.LocalPath) != it.LocalPath {
+		t.Fatalf("local path %q: want relative tg-<chat>-<msg>-*.pdf", it.LocalPath)
+	}
+	if !r.in.fileAtInsert[0] || !r.in.withAck[0] {
+		t.Fatalf("file on disk at insert = %v, ack = %v", r.in.fileAtInsert, r.in.withAck)
+	}
+	data, err := os.ReadFile(filepath.Join(r.dir, it.LocalPath))
+	if err != nil || !bytes.Equal(data, r.dl.data) {
+		t.Fatalf("file: %q, %v", data, err)
+	}
+}
+
+func TestFileSizeFallsBackToDownloaded(t *testing.T) {
+	r := newRig(t)
+
+	r.handle(t, fileMsg("", 0))
+
+	it := r.in.items[0]
+	if it.Size != int64(len(r.dl.data)) || strings.Contains(it.LocalPath, ".pdf") {
+		t.Fatalf("item = %+v", it)
+	}
+}
+
+func TestFileTooLargeIsRejected(t *testing.T) {
+	r := newRig(t)
+
+	r.handle(t, fileMsg("a.pdf", telegram.MaxFileSize+1))
+
+	wantEvents(t, r, `send "⚠ too large for Telegram bots (max 20 MB) — not saved."`)
+}
+
+func TestFileTooLargeDiscoveredAtDownloadIsRejected(t *testing.T) {
+	r := newRig(t)
+	r.dl.err = fmt.Errorf("wrapped: %w", telegram.ErrTooLarge)
+
+	r.handle(t, fileMsg("a.pdf", 0))
+
+	wantEvents(t, r, `download FAKE-FILE-ID`, `send "⚠ too large for Telegram bots (max 20 MB) — not saved."`)
+}
+
+func TestFileDownloadFailureIngestsWithoutLocalPath(t *testing.T) {
+	r := newRig(t)
+	r.dl.err = errors.New("fake: file api down")
+
+	r.handle(t, fileMsg("a.pdf", 1000))
+
+	wantEvents(t, r, `download FAKE-FILE-ID`, `ingestfile`, `wake`)
+	if it := r.in.items[0]; it.LocalPath != "" || it.FileID != "FAKE-FILE-ID" {
+		t.Fatalf("item = %+v", it)
+	}
+}
+
+func TestFileWriteFailureIngestsWithoutLocalPath(t *testing.T) {
+	r := newRig(t)
+	if err := os.RemoveAll(r.dir); err != nil {
+		t.Fatal(err)
+	}
+
+	r.handle(t, fileMsg("a.pdf", 1000))
+
+	wantEvents(t, r, `download FAKE-FILE-ID`, `ingestfile`, `wake`)
+	if it := r.in.items[0]; it.LocalPath != "" {
+		t.Fatalf("item = %+v", it)
+	}
+}
+
+func TestFileDuplicateRemovesFile(t *testing.T) {
+	r := newRig(t)
+	r.in.err = pipeline.ErrDuplicate
+
+	r.handle(t, fileMsg("a.pdf", 1000))
+
+	wantEvents(t, r, `download FAKE-FILE-ID`, `ingestfile`)
+	if got := r.audioFiles(t); len(got) != 0 {
+		t.Fatalf("leftover files %v", got)
+	}
+}
+
+func TestFileStoreErrorRemovesFileAndAsksToResend(t *testing.T) {
+	r := newRig(t)
+	r.in.err = errors.New("fake: disk full")
+
+	r.handle(t, fileMsg("a.pdf", 1000))
+
+	wantEvents(t, r, `download FAKE-FILE-ID`, `ingestfile`, notSaved)
+	if got := r.audioFiles(t); len(got) != 0 {
+		t.Fatalf("leftover files %v", got)
 	}
 }
 

@@ -29,8 +29,8 @@ const MaxFileSize = 20 << 20
 // Reply texts (contracts/telegram-ux.md).
 const (
 	TextPending     = "⏳"
-	TextHelp        = "VoiceNotes: send a voice or text message to save it as a note."
-	TextUnsupported = "VoiceNotes takes voice or text only."
+	TextHelp        = "VoiceNotes: send a voice message, text, photo or file to save it as a note."
+	TextUnsupported = "VoiceNotes takes voice, text, photos and files."
 	TextTooLarge    = "⚠ too large for Telegram bots (max 20 MB) — not saved."
 	TextNotSaved    = "⚠ not saved — please send it again."
 )
@@ -50,6 +50,25 @@ type Message struct {
 	Text string
 	// Audio is set for voice and audio messages, forwarded or not.
 	Audio *Audio
+	// Files is set for photo, document, video and animation messages; audio
+	// documents map to Audio instead.
+	Files *FileItem
+}
+
+// FileItem describes a photo, document or video file held by Telegram.
+type FileItem struct {
+	FileID string
+	// MIME is the reported media type; image/jpeg for photos.
+	MIME string
+	// Name is the original file name, if Telegram reports one.
+	Name string
+	// Size is the size Telegram reported; 0 if unknown.
+	Size int64
+	Kind capture.FileKind
+	// Caption is the message caption, if any.
+	Caption string
+	// AlbumID is the media group ID; empty for a standalone message.
+	AlbumID string
 }
 
 // Audio describes a voice or audio file held by Telegram.
@@ -81,6 +100,9 @@ type Downloader interface {
 // redelivered message. *pipeline.Ingester implements it.
 type Ingester interface {
 	Ingest(ctx context.Context, c capture.Capture, ack pipeline.Ack) (capture.Capture, error)
+	// IngestFile stores one photo, document or video as part of a files
+	// capture; it needs an Ingester built with pipeline.WithFiles.
+	IngestFile(ctx context.Context, item pipeline.FileItem, ack pipeline.Ack) (capture.Capture, error)
 }
 
 // ReplyRecorder records the ⏳ reply of a stored capture without touching
@@ -106,7 +128,7 @@ type HandlerConfig struct {
 // concurrent use: telebot runs handlers concurrently.
 type Handler struct {
 	allowed  []int64
-	audioDir string
+	filesDir string
 	replier  Replier
 	dl       Downloader
 	ingester Ingester
@@ -114,12 +136,12 @@ type Handler struct {
 	log      *zap.Logger
 }
 
-// NewHandler validates cfg, creates the audio directory and returns a
+// NewHandler validates cfg, creates the files directory and returns a
 // Handler.
 func NewHandler(cfg HandlerConfig) (*Handler, error) {
 	switch {
 	case cfg.FilesDir == "":
-		return nil, errors.New("telegram: empty audio dir")
+		return nil, errors.New("telegram: empty files dir")
 	case cfg.Replier == nil:
 		return nil, errors.New("telegram: nil replier")
 	case cfg.Downloader == nil:
@@ -130,7 +152,7 @@ func NewHandler(cfg HandlerConfig) (*Handler, error) {
 		return nil, errors.New("telegram: nil reply recorder")
 	}
 	if err := os.MkdirAll(cfg.FilesDir, 0o700); err != nil {
-		return nil, fmt.Errorf("telegram: create audio dir: %w", err)
+		return nil, fmt.Errorf("telegram: create files dir: %w", err)
 	}
 	log := cfg.Log
 	if log == nil {
@@ -139,7 +161,7 @@ func NewHandler(cfg HandlerConfig) (*Handler, error) {
 
 	return &Handler{
 		allowed:  slices.Clone(cfg.AllowedUsers),
-		audioDir: cfg.FilesDir,
+		filesDir: cfg.FilesDir,
 		replier:  cfg.Replier,
 		dl:       cfg.Downloader,
 		ingester: cfg.Ingester,
@@ -161,8 +183,13 @@ func (h *Handler) Handle(ctx context.Context, m Message) {
 	}
 
 	switch {
+	// Audio and voice go first: an audio capture holds exactly one file
+	// (extract relies on it). A caption on them is dropped on purpose; the
+	// transcript is the note body.
 	case m.Audio != nil:
 		h.audio(ctx, m)
+	case m.Files != nil:
+		h.files(ctx, m)
 	case isHelp(m.Text):
 		h.reply(ctx, m, TextHelp)
 	case strings.TrimSpace(m.Text) != "":
@@ -203,7 +230,7 @@ func (h *Handler) audio(ctx context.Context, m Message) {
 
 		return
 	}
-	name, err := writeAudio(h.audioDir, audioPattern(m), data)
+	name, err := writeAudio(h.filesDir, audioPattern(m), data)
 	if err != nil {
 		h.log.Error("writing audio failed, queueing for the download step",
 			zap.Int64("chat", m.ChatID), zap.Int64("message", m.ID), zap.Error(err))
@@ -220,7 +247,7 @@ func (h *Handler) audio(ctx context.Context, m Message) {
 	}
 	if !h.ingest(ctx, m, c, h.ack(m)) {
 		// Duplicate or store failure: the file belongs to no row.
-		removeAudio(h.audioDir, name, h.log)
+		removeAudio(h.filesDir, name, h.log)
 	}
 }
 
@@ -300,7 +327,7 @@ func (h *Handler) ack(m Message) pipeline.Ack {
 }
 
 func (h *Handler) tooLarge(ctx context.Context, m Message) {
-	h.log.Info("rejecting audio over the Telegram download limit",
+	h.log.Info("rejecting file over the Telegram download limit",
 		zap.Int64("chat", m.ChatID), zap.Int64("message", m.ID))
 	h.reply(ctx, m, TextTooLarge)
 }

@@ -87,6 +87,11 @@ func handlers(l *stepLog, crashAt capture.Step, crash context.CancelFunc) map[ca
 			return c, capture.OK()
 		}
 	}
+	// collect never runs for the audio captures these tests queue; the
+	// main lane just needs a handler for it.
+	hs[capture.StepCollect] = func(_ context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
+		return c, capture.OK()
+	}
 
 	return hs
 }

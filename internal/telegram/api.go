@@ -16,6 +16,7 @@ import (
 	"go.uber.org/zap"
 	tele "gopkg.in/telebot.v4"
 
+	"github.com/Toshik1978/voicenotes/internal/capture"
 	"github.com/Toshik1978/voicenotes/internal/pipeline"
 )
 
@@ -264,6 +265,12 @@ func fromTele(m *tele.Message) Message {
 		out.Audio = &Audio{FileID: m.Voice.FileID, MimeType: m.Voice.MIME, Size: m.Voice.FileSize, Voice: true}
 	case m.Audio != nil:
 		out.Audio = &Audio{FileID: m.Audio.FileID, MimeType: m.Audio.MIME, Size: m.Audio.FileSize}
+	default:
+		out.Audio, out.Files = mapMedia(m)
+	}
+	if out.Files != nil {
+		out.Files.Caption = m.Caption
+		out.Files.AlbumID = m.AlbumID
 	}
 
 	return out
@@ -363,4 +370,65 @@ func wrapAPI(op string, err error) error {
 	}
 
 	return fmt.Errorf("telegram: %s: %w", op, err)
+}
+
+// mapMedia maps a photo, document, animation or video message. An audio
+// document becomes an Audio, like a voice or audio message; everything else
+// becomes a FileItem. Both results are nil for other messages.
+func mapMedia(m *tele.Message) (*Audio, *FileItem) {
+	switch {
+	case m.Photo != nil:
+		// The Bot API delivers the largest size, as JPEG.
+		return nil, &FileItem{
+			FileID: m.Photo.FileID,
+			MIME:   "image/jpeg",
+			Size:   m.Photo.FileSize,
+			Kind:   capture.FileImage,
+		}
+	case m.Animation != nil:
+		// Telegram also sets Document for an animation; the animation wins.
+		a := m.Animation
+
+		return nil, &FileItem{
+			FileID: a.FileID,
+			MIME:   a.MIME,
+			Name:   a.FileName,
+			Size:   a.FileSize,
+			Kind:   capture.FileVideo,
+		}
+	case m.Document != nil:
+		d := m.Document
+		switch {
+		case strings.HasPrefix(d.MIME, "audio/"):
+			return &Audio{FileID: d.FileID, MimeType: d.MIME, Size: d.FileSize}, nil
+		case strings.HasPrefix(d.MIME, "image/"):
+			return nil, &FileItem{
+				FileID: d.FileID,
+				MIME:   d.MIME,
+				Name:   d.FileName,
+				Size:   d.FileSize,
+				Kind:   capture.FileImage,
+			}
+		}
+
+		return nil, &FileItem{
+			FileID: d.FileID,
+			MIME:   d.MIME,
+			Name:   d.FileName,
+			Size:   d.FileSize,
+			Kind:   capture.FileDocument,
+		}
+	case m.Video != nil:
+		v := m.Video
+
+		return nil, &FileItem{
+			FileID: v.FileID,
+			MIME:   v.MIME,
+			Name:   v.FileName,
+			Size:   v.FileSize,
+			Kind:   capture.FileVideo,
+		}
+	}
+
+	return nil, nil
 }

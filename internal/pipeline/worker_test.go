@@ -72,6 +72,7 @@ func (r *recorder) Calls() []call {
 
 func allSteps(h pipeline.Handler) map[capture.Step]pipeline.Handler {
 	return map[capture.Step]pipeline.Handler{
+		capture.StepCollect:       h,
 		capture.StepDownload:      h,
 		capture.StepExtract:       h,
 		capture.StepEnrich:        h,
@@ -122,7 +123,7 @@ func TestNewValidates(t *testing.T) {
 	clock := newFakeClock(t0())
 
 	for _, step := range []capture.Step{
-		capture.StepDownload, capture.StepExtract, capture.StepEnrich,
+		capture.StepCollect, capture.StepDownload, capture.StepExtract, capture.StepEnrich,
 		capture.StepWriteNote, capture.StepFinalizeReply, capture.StepCleanup,
 	} {
 		h := allSteps(ok[step])
@@ -587,5 +588,29 @@ func TestLanesRunOnlyTheirOwnCaptures(t *testing.T) {
 	}
 	if got := mainRec.Calls(); len(got) != 1 || got[0].id != 2 {
 		t.Errorf("main lane calls = %v, want only capture 2", got)
+	}
+}
+
+type wakeSpy struct{ wakes chan struct{} }
+
+func (s wakeSpy) Wake() { s.wakes <- struct{}{} }
+
+func (wakeSpy) HoldAck(capture.Capture) func() { return func() {} }
+
+func TestWorkerWakesPeersWhenACaptureChangesLane(t *testing.T) {
+	files := textCapture(t, 1)
+	files.Kind, files.Step = capture.KindFiles, capture.StepDownload
+	store := newFakeStore(files)
+	rec := &recorder{}
+	w := newWorker(t, store, newFakeClock(t0()), rec.handlers())
+	spy := wakeSpy{wakes: make(chan struct{}, 10)}
+	w.SetPeers(spy)
+	start(t, w)
+
+	// download -> extract moves a files capture into the documents lane.
+	select {
+	case <-spy.wakes:
+	case <-time.After(5 * time.Second):
+		t.Fatal("peer lane was not woken after the capture moved to it")
 	}
 }

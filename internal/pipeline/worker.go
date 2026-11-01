@@ -72,7 +72,7 @@ func steps(lane capture.Lane) ([]capture.Step, bool) {
 
 func mainSteps() []capture.Step {
 	return []capture.Step{
-		capture.StepDownload, capture.StepExtract, capture.StepEnrich,
+		capture.StepCollect, capture.StepDownload, capture.StepExtract, capture.StepEnrich,
 		capture.StepWriteNote, capture.StepFinalizeReply, capture.StepCleanup,
 	}
 }
@@ -87,6 +87,7 @@ type Worker struct {
 	handlers map[capture.Step]Handler
 	log      *zap.Logger
 	notify   QueueNotifier
+	peers    []Waker
 
 	wake  chan struct{}
 	alive atomic.Bool
@@ -158,6 +159,11 @@ func New(
 // SetQueueNotifier installs the hook that edits the reply of a capture that
 // just went into waiting. Call it before Run; without one no edit happens.
 func (w *Worker) SetQueueNotifier(n QueueNotifier) { w.notify = n }
+
+// SetPeers installs the other lane workers. When a step moves a capture into
+// another lane, the worker wakes them so they do not sleep through it. Call it
+// before Run.
+func (w *Worker) SetPeers(peers ...Waker) { w.peers = peers }
 
 // Wake asks the worker to re-check the queue now, typically after ingest
 // inserted a capture. It never blocks, and wakes that arrive while one is
@@ -277,7 +283,7 @@ func (w *Worker) iterate(ctx context.Context) time.Duration {
 // result, then sends the queued notice if the capture just went into waiting.
 func (w *Worker) step(ctx context.Context, c capture.Capture) time.Duration {
 	next, out := w.run(ctx, c)
-	next.ID, next.Step = c.ID, c.Step
+	next.ID, next.Step, next.Kind = c.ID, c.Step, c.Kind
 	if ctx.Err() != nil {
 		// Cancelled mid-step: the result may be half-applied. Drop it; the
 		// capture is still at its persisted step and is retried after restart.
@@ -330,6 +336,11 @@ func (w *Worker) run(ctx context.Context, c capture.Capture) (capture.Capture, c
 func (w *Worker) persist(ctx context.Context) time.Duration {
 	if err := w.store.Update(ctx, *w.pending); err != nil {
 		return w.storeFailed(ctx, "update", err)
+	}
+	if capture.LaneOf(*w.pending) != w.lane {
+		for _, p := range w.peers {
+			p.Wake()
+		}
 	}
 	w.pending = nil
 	w.failures = 0

@@ -52,6 +52,17 @@ type Store interface {
 	// file's ID and CaptureID, and returns ErrDuplicate if the capture's or
 	// any file's identity already exists (nothing is stored then).
 	Insert(ctx context.Context, c *capture.Capture) error
+	// AppendFile adds one incoming file item to the chat's open batch, or
+	// starts a new one, in a single BEGIN IMMEDIATE transaction (research
+	// R3). item is a new files capture at collect holding that one file.
+	// It returns the stored capture and whether it was created. In this
+	// phase it always creates; batch joining arrives with T022. It returns
+	// ErrDuplicate if the item's identity was already stored.
+	AppendFile(
+		ctx context.Context,
+		item capture.Capture,
+		quiet time.Duration,
+	) (stored capture.Capture, created bool, err error)
 	// NextDue is due-first within a lane (FR-114a): it returns, with OK
 	// true, the lowest-ID unfinished capture of the lane whose NextAttemptAt
 	// is not after now; a capture that is not due never blocks later ones.
@@ -206,7 +217,60 @@ func (s *DB) Insert(ctx context.Context, c *capture.Capture) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	res, err := tx.ExecContext(ctx, `INSERT INTO captures (
+	if err := insertCapture(ctx, tx, c); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sqlite: insert capture: %w", err)
+	}
+
+	return nil
+}
+
+// AppendFile stores item inside BEGIN IMMEDIATE, so the write lock is taken
+// up front and the join-or-create of T022 can read the open batch in the
+// same transaction. For now it always creates a capture: the file keeps
+// position 0 and the capture is due at its NextAttemptAt, which the caller
+// set to received + quiet. quiet is for the join and is unused until then.
+func (s *DB) AppendFile(ctx context.Context, item capture.Capture, _ time.Duration) (capture.Capture, bool, error) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return capture.Capture{}, false, fmt.Errorf("sqlite: append file: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if _, err = conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return capture.Capture{}, false, fmt.Errorf("sqlite: append file: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			// Not the request context: a cancelled one must still roll back.
+			_, _ = conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
+		}
+	}()
+
+	stored := item
+	if insErr := insertCapture(ctx, conn, &stored); insErr != nil {
+		return capture.Capture{}, false, insErr
+	}
+	if _, err = conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return capture.Capture{}, false, fmt.Errorf("sqlite: append file: %w", err)
+	}
+	committed = true
+
+	return stored, true, nil
+}
+
+// execer is the part of *sql.Tx and *sql.Conn that inserts need.
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// insertCapture writes c and its files with q, setting c.ID and each file's
+// ID and CaptureID; c is left unchanged on error.
+func insertCapture(ctx context.Context, q execer, c *capture.Capture) error {
+	res, err := q.ExecContext(ctx, `INSERT INTO captures (
 source, source_chat_id, source_message_id, kind, received_at,
 album_id, text, language, enriched_json,
 llm_skipped, failure, note_name, note_url, task_count, reply_message_id,
@@ -238,19 +302,16 @@ VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?, ?)`,
 	files := slices.Clone(c.Files)
 	for i := range files {
 		files[i].CaptureID = id
-		if err := insertFile(ctx, tx, &files[i]); err != nil {
+		if err := insertFile(ctx, q, &files[i]); err != nil {
 			return err
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("sqlite: insert capture: %w", err)
 	}
 	c.ID, c.Files = id, files
 
 	return nil
 }
 
-func insertFile(ctx context.Context, tx *sql.Tx, f *capture.File) error {
+func insertFile(ctx context.Context, tx execer, f *capture.File) error {
 	res, err := tx.ExecContext(ctx, `INSERT INTO capture_files (
 capture_id, position, source, source_chat_id, source_message_id,
 kind, file_id, mime_type, file_name, file_size, local_path, state, text,

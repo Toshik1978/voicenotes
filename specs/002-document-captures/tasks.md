@@ -107,22 +107,22 @@ packages are in `internal/` (see plan.md Structure). `COVERPKG` stays unchanged.
 
 **Independent Test**: with no `DOCLING_*`/`VISION_*` and the LLM off, send a PDF and a photo with a caption. Each becomes a note (`📎 name.pdf` / caption + `📷 photo`) with the file attached. A sticker gets the new unsupported text. Voice still works (quickstart §1).
 
-- [ ] T008 [P] [US1] Map Telegram file messages in `internal/telegram/api.go` `fromTele` (tests in `internal/telegram/api_test.go`), per research R11:
+- [x] T008 [P] [US1] Map Telegram file messages in `internal/telegram/api.go` `fromTele` (tests in `internal/telegram/api_test.go`), per research R11:
   - Add `Message.Files *FileItem` with `FileID`, `MIME`, `Name`, `Size`, `Kind`, `Caption`, `AlbumID`.
   - Map Photo (largest, `image/jpeg`), Document (`image/*` → image, `audio/*` → existing `Audio`, else document), Video and Animation (video).
   - Keep the `OnMedia`/`OnDocument`/`OnPhoto`/`OnVideo` endpoints routed to `Handle`.
-- [ ] T009 [P] [US1] Render file notes in `internal/render/render.go` and new `internal/render/hint.go` (tests alongside), per contracts/telegram-ux.md "Note layout":
+- [x] T009 [P] [US1] Render file notes in `internal/render/render.go` and new `internal/render/hint.go` (tests alongside), per contracts/telegram-ux.md "Note layout":
   - `Input` gains `Caption`, `Hint`, `Files []FileSummary` (kind, name, state, failure, text).
   - Layout: caption text, hint, checklist, original quote, tags.
   - `FallbackHint(files)`: first two cleaned lines of the first extracted text, "≤ 160 runes", markdown noise stripped (headings, table pipes, `<!-- image -->`). Without text, use placeholders `📎 <name>`, `📷 photo`, `📷 N photos`, `📎 N files`, plus ` — <reason>` when every file failed.
   - Truncation keeps attachments untouched and shortens the caption with "(truncated)".
   - FR-125 test: the note's first non-empty line is the caption when there is one, otherwise the hint, so the digest's first-line summary (001 FR-029) shows it unchanged.
-- [ ] T010 [P] [US1] Add attachment naming in new `internal/pipeline/names.go` (tests in `internal/pipeline/names_test.go`), per research R8:
+- [x] T010 [P] [US1] Add attachment naming in new `internal/pipeline/names.go` (tests in `internal/pipeline/names_test.go`), per research R8:
   - Audio keeps `voice-<local date>.<ext>`.
   - Other files use the sanitised original base name ("at most 100 bytes", control characters removed, extension kept), else `photo-<date>-<n>.jpg` / `video-<date>-<n><ext>` / `file-<date>-<n><ext>`.
   - Duplicates within a capture get ` (2)`, ` (3)` before the extension.
   - Deterministic for a given capture.
-- [ ] T011 [US1] Add file-item ingest across `internal/pipeline/ingest.go` and `internal/store/sqlite/store.go` (tests in `internal/pipeline/ingest_test.go`, `internal/store/sqlite/store_test.go`):
+- [x] T011 [US1] Add file-item ingest across `internal/pipeline/ingest.go` and `internal/store/sqlite/store.go` (tests in `internal/pipeline/ingest_test.go`, `internal/store/sqlite/store_test.go`):
   - `Ingester.IngestFile(ctx, item, ack)` calls the new `Store.AppendFile`, which in this phase always creates a new `files` capture at `collect`:
     - `NextAttemptAt = received + quiet`
     - the file at position 0
@@ -130,7 +130,7 @@ packages are in `internal/` (see plan.md Structure). `COVERPKG` stays unchanged.
     - capture identity = the item's identity
   - A redelivery returns `ErrDuplicate` via either UNIQUE constraint.
   - Ack runs only when a capture was created.
-- [ ] T012 [US1] Accept file items in the Telegram handler, in `internal/telegram/handler.go` and `internal/telegram/audio.go` → `internal/telegram/files.go` (tests in `internal/telegram/handler_test.go`):
+- [x] T012 [US1] Accept file items in the Telegram handler, in `internal/telegram/handler.go` and `internal/telegram/audio.go` → `internal/telegram/files.go` (tests in `internal/telegram/handler_test.go`):
   - `Handle` routes `m.Files` to `files()`.
   - `files()`:
     - size check against `MaxFileSize` (a standalone item over the limit gets `TextTooLarge`)
@@ -139,13 +139,13 @@ packages are in `internal/` (see plan.md Structure). `COVERPKG` stays unchanged.
     - `IngestFile` with the ⏳ ack
     - on a download or write failure, ingest the item without a local path so the download step fetches it later
   - New texts: `TextUnsupported` = `VoiceNotes takes voice, text, photos and files.`, `TextHelp` = `VoiceNotes: send a voice message, text, photo or file to save it as a note.`
-- [ ] T013 [US1] Run `files` captures through the pipeline in `internal/pipeline/steps.go` (tests in `internal/pipeline/steps_test.go`):
+- [x] T013 [US1] Run `files` captures through the pipeline in `internal/pipeline/steps.go` (tests in `internal/pipeline/steps_test.go`):
   - a `collect` handler that returns OK
   - `extract` marks image and document files `skipped` when no reader is wired, and video always `skipped`
   - `enrich` for `files` captures with only a caption runs the existing `BuildRequest` on the caption, and with no caption records no call
   - `writeNote` renders with `Caption`/`Hint=FallbackHint`, creates the note, then attaches every kept file in order using T010 names. A per-file permanent attach failure is recorded in `File.AttachFailure` and does not fail the note (FR-126).
   - `replyText` for `files` per contracts/telegram-ux.md: `✓ saved`, `⚠ saved, X of N not kept — …`, `⚠ saved, X of N not attached — …`, `⚠ files not kept — … · please send them again`
-- [ ] T014 [US1] Wire file ingest and the `collect` handler in `cmd/voicenotes/service.go` and `cmd/voicenotes/adapters.go` (tests in `cmd/voicenotes/service_test.go`): pass `BatchQuietPeriod` to the ingester and register the `collect` handler. An end-to-end test with fakes: a photo item yields one note with an attachment and the `📷 photo` hint.
+- [x] T014 [US1] Wire file ingest and the `collect` handler in `cmd/voicenotes/service.go` and `cmd/voicenotes/adapters.go` (tests in `cmd/voicenotes/service_test.go`): pass `BatchQuietPeriod` to the ingester and register the `collect` handler. An end-to-end test with fakes: a photo item yields one note with an attachment and the `📷 photo` hint.
 
 **Checkpoint**: US1 is fully functional with nothing new configured.
 

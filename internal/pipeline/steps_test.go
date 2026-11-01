@@ -204,7 +204,7 @@ func TestNewHandlersValidates(t *testing.T) {
 	}
 	r := newRig(t)
 	for _, s := range []capture.Step{
-		capture.StepDownload, capture.StepExtract, capture.StepEnrich,
+		capture.StepCollect, capture.StepDownload, capture.StepExtract, capture.StepEnrich,
 		capture.StepWriteNote, capture.StepFinalizeReply, capture.StepCleanup,
 	} {
 		if r.h[s] == nil {

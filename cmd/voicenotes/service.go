@@ -145,18 +145,18 @@ func wire(
 		return nil, fmt.Errorf("telegram: %w", err)
 	}
 
-	handlers, err := newHandlers(cfg, log, tg, transcriber, notes, filesDir)
+	p, err := newPipeline(cfg, log, db, pipeline.Deps{
+		Transcriber: sttShim{t: transcriber},
+		Notes:       notesShim{c: notes},
+		Replier:     tg,
+		Downloader:  tg,
+		Files:       pipeline.NewDirFiles(filesDir),
+		Log:         log,
+	})
 	if err != nil {
 		return nil, err
 	}
-	mainWorker, docsWorker, err := newWorkers(cfg, log, db, tg, handlers)
-	if err != nil {
-		return nil, err
-	}
-	ingester, err := pipeline.NewIngester(db, wakeAll{mainWorker, docsWorker})
-	if err != nil {
-		return nil, fmt.Errorf("ingester: %w", err)
-	}
+	mainWorker, docsWorker, ingester := p.mainWorker, p.docsWorker, p.ingester
 	handler, err := telegram.NewHandler(telegram.HandlerConfig{
 		AllowedUsers: cfg.AllowedUsers,
 		FilesDir:     filesDir,
@@ -196,25 +196,44 @@ func wire(
 	return &service{goroutines: goroutines}, nil
 }
 
-// newWorkers builds the main and documents lane workers. Until docling lands
-// the documents lane runs the same handlers; it needs only extract.
-func newWorkers(
-	cfg config.Config, log *zap.Logger, db *sqlite.DB, tg *telegram.API, handlers map[capture.Step]pipeline.Handler,
-) (mainWorker, docsWorker *pipeline.Worker, err error) {
+// pipelineParts is the queue side of the service: the two lane workers and
+// the ingester that feeds them.
+type pipelineParts struct {
+	mainWorker, docsWorker *pipeline.Worker
+	ingester               *pipeline.Ingester
+}
+
+// newPipeline builds the step handlers, the main and documents lane workers
+// and the ingester, with file ingest enabled. The LLM is wired only when
+// configured. Until docling lands the documents lane runs the same handlers;
+// it needs only extract.
+func newPipeline(cfg config.Config, log *zap.Logger, db *sqlite.DB, deps pipeline.Deps) (*pipelineParts, error) {
+	handlers, err := newHandlers(cfg, deps)
+	if err != nil {
+		return nil, err
+	}
 	policy := capture.Policy{MaxInterval: cfg.RetryMaxInterval, Rand: rand.Float64}
-	notifier := pipeline.NewQueueNotifier(tg, log)
-	mainWorker, err = pipeline.New(capture.LaneMain, db, pipeline.SystemClock{}, policy, handlers, log)
+	notifier := pipeline.NewQueueNotifier(deps.Replier, log)
+	mainWorker, err := pipeline.New(capture.LaneMain, db, pipeline.SystemClock{}, policy, handlers, log)
 	if err != nil {
-		return nil, nil, fmt.Errorf("main worker: %w", err)
+		return nil, fmt.Errorf("main worker: %w", err)
 	}
-	docsWorker, err = pipeline.New(capture.LaneDocuments, db, pipeline.SystemClock{}, policy, handlers, log)
+	docsWorker, err := pipeline.New(capture.LaneDocuments, db, pipeline.SystemClock{}, policy, handlers, log)
 	if err != nil {
-		return nil, nil, fmt.Errorf("documents worker: %w", err)
+		return nil, fmt.Errorf("documents worker: %w", err)
 	}
+	mainWorker.SetPeers(docsWorker)
+	docsWorker.SetPeers(mainWorker)
 	mainWorker.SetQueueNotifier(notifier)
 	docsWorker.SetQueueNotifier(notifier)
 
-	return mainWorker, docsWorker, nil
+	ingester, err := pipeline.NewIngester(db, wakeAll{mainWorker, docsWorker},
+		pipeline.WithFiles(db, cfg.BatchQuietPeriod))
+	if err != nil {
+		return nil, fmt.Errorf("ingester: %w", err)
+	}
+
+	return &pipelineParts{mainWorker: mainWorker, docsWorker: docsWorker, ingester: ingester}, nil
 }
 
 // digestGoroutines returns the morning digest runner, or nothing when the
@@ -279,18 +298,7 @@ func newChat(cfg config.Config) *openai.Chat {
 }
 
 // newHandlers builds the step handlers; the LLM is wired only when configured.
-func newHandlers(
-	cfg config.Config, log *zap.Logger, tg *telegram.API,
-	transcriber *openai.Transcriber, notes *memos.Client, filesDir string,
-) (map[capture.Step]pipeline.Handler, error) {
-	deps := pipeline.Deps{
-		Transcriber: sttShim{t: transcriber},
-		Notes:       notesShim{c: notes},
-		Replier:     tg,
-		Downloader:  tg,
-		Files:       pipeline.NewDirFiles(filesDir),
-		Log:         log,
-	}
+func newHandlers(cfg config.Config, deps pipeline.Deps) (map[capture.Step]pipeline.Handler, error) {
 	if cfg.LLMEnabled {
 		deps.Enricher = llmShim{c: newChat(cfg)}
 	}
