@@ -9,6 +9,34 @@ Versions follow [semver](https://semver.org). Commits follow
 
 ---
 
+## v0.2.0 — 2026-11-01
+
+Highlights:
+
+- Photos and files sent to the bot become `#inbox` notes with the originals attached and a one- or two-line hint of what they are, so a late-night "deal with it tomorrow" capture is recognisable in the morning digest. A caption is kept as the note's text.
+- An album, or several photos and files sent within `BATCH_QUIET_PERIOD` (3 s), becomes one note with every item attached in the order sent, one ⏳ reply and one combined hint. A restart while an album is arriving still yields one note.
+- Hints come from an optional, self-hosted docling-serve (`DOCLING_URL`) via the existing LLM step, which sees only a bounded excerpt (`HINT_EXCERPT_RUNES`). Large documents are capped at `DOCLING_MAX_PAGES`, a reader that is down is retried in the background, and a document that cannot be read still becomes a note with a placeholder hint. Plain-text files are read locally.
+- Optional vision fallback (`VISION_ENABLED`, off by default) for photos docling reads little or no text from; documents are never sent.
+- With nothing new configured, voice and text behave exactly as before, and photos and files are saved with a placeholder hint.
+- Reading a document never holds back voice and text notes: documents are processed in their own lane.
+- Upgrade: migrations 002 and 003 run on start, and `$DATA_DIR/audio` is renamed to `$DATA_DIR/files`.
+
+### Features
+
+- feat(config): document, photo and vision settings ([f6c7976](https://github.com/Toshik1978/voicenotes/commit/f6c7976642039258c526356f5fa83b59f2cbc7c0))
+- feat(pipeline): one capture holds many files, with due-first worker lanes ([cfe601e](https://github.com/Toshik1978/voicenotes/commit/cfe601ebd736030d9610e9b3526decf5b3616c12))
+- feat: save photos and files as notes with their originals attached ([9414f7e](https://github.com/Toshik1978/voicenotes/commit/9414f7e3e80fd24d8e976c3956cd12bbe2def6c7))
+- feat: hint each photo and document from its content via docling ([bfefb73](https://github.com/Toshik1978/voicenotes/commit/bfefb73f9020de6b329a8cd2324f259afe313365))
+- feat: one send, one note — batch photos and files into a single capture ([d77f2a7](https://github.com/Toshik1978/voicenotes/commit/d77f2a7056b73d9d72ff7861e0d0693e576cfca2))
+- feat: describe barely read photos with an optional vision model ([e293ac0](https://github.com/Toshik1978/voicenotes/commit/e293ac0eb797b729c89b3edc053551e19f870eb4))
+- feat: keep albums in send order and save the first file before ⏳ ([49f3cc8](https://github.com/Toshik1978/voicenotes/commit/49f3cc88fe8579aba72c0d12af1af45ba88e1ee8))
+
+### Others
+
+- docs: document photo, file and album captures; final gate and quickstart ([23c1492](https://github.com/Toshik1978/voicenotes/commit/23c1492688f9d730123b3a3458a12d35be936346))
+
+---
+
 ## v0.1.3 — 2026-10-31
 
 Highlights:
