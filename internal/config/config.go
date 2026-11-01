@@ -54,6 +54,25 @@ type Config struct {
 	// their own default.
 	LLMTemperature *float64 `env:"LLM_TEMPERATURE"`
 
+	// Documents and photos. All optional. DoclingURL, when set, enables
+	// content extraction. BatchQuietPeriod closes a batch of captures and
+	// HintExcerptRunes caps the extracted text sent to the LLM per batch.
+	DoclingURL       string        `env:"DOCLING_URL"`
+	DoclingAPIKey    string        `env:"DOCLING_API_KEY"`
+	DoclingTimeout   time.Duration `env:"DOCLING_TIMEOUT"    envDefault:"10m"`
+	DoclingMaxPages  int           `env:"DOCLING_MAX_PAGES"  envDefault:"20"`
+	BatchQuietPeriod time.Duration `env:"BATCH_QUIET_PERIOD" envDefault:"3s"`
+	HintExcerptRunes int           `env:"HINT_EXCERPT_RUNES" envDefault:"4000"`
+
+	// Vision fallback for photo-only batches. VisionBaseURL, VisionAPIKey and
+	// VisionModel are resolved: each takes the LLM_* value when its own
+	// variable is unset, so readers use them directly.
+	VisionEnabled bool          `env:"VISION_ENABLED"`
+	VisionBaseURL string        `env:"VISION_BASE_URL"`
+	VisionAPIKey  string        `env:"VISION_API_KEY"`
+	VisionModel   string        `env:"VISION_MODEL"`
+	VisionTimeout time.Duration `env:"VISION_TIMEOUT"  envDefault:"60s"`
+
 	// Memos. MemosPublicURL defaults to MemosURL.
 	MemosURL          string `env:"MEMOS_URL"`
 	MemosToken        string `env:"MEMOS_TOKEN"`
@@ -165,11 +184,18 @@ func (v *validator) positive(name string, ok bool) {
 	}
 }
 
+func (v *validator) inRange(name string, ok bool, bounds string) {
+	if !ok {
+		v.fail(name, "must be between "+bounds)
+	}
+}
+
 func (v *validator) validate(environ map[string]string) {
 	v.validateTelegram(environ)
 	v.validateSTT()
 	v.validateLanguages(environ)
 	v.validateLLM()
+	v.validateDocuments()
 	v.validateMemos()
 	v.validateDigest()
 	v.validateRuntime()
@@ -234,6 +260,36 @@ func (v *validator) validateLLM() {
 	// Written this way round so NaN fails too.
 	if t := c.LLMTemperature; t != nil && !(*t >= 0 && *t <= 2) {
 		v.fail("LLM_TEMPERATURE", "must be between 0 and 2")
+	}
+}
+
+func (v *validator) validateDocuments() {
+	c := v.c
+	if c.DoclingURL != "" {
+		v.url("DOCLING_URL", c.DoclingURL)
+	}
+	v.positive("DOCLING_TIMEOUT", c.DoclingTimeout > 0)
+	v.inRange("DOCLING_MAX_PAGES", c.DoclingMaxPages >= 1 && c.DoclingMaxPages <= 1000, "1 and 1000")
+	v.inRange("BATCH_QUIET_PERIOD",
+		c.BatchQuietPeriod >= 500*time.Millisecond && c.BatchQuietPeriod <= time.Minute, "500ms and 1m")
+	v.inRange("HINT_EXCERPT_RUNES", c.HintExcerptRunes >= 500 && c.HintExcerptRunes <= 50000, "500 and 50000")
+	v.positive("VISION_TIMEOUT", c.VisionTimeout > 0)
+
+	if c.VisionBaseURL == "" {
+		c.VisionBaseURL = c.LLMBaseURL
+	}
+	if c.VisionAPIKey == "" {
+		c.VisionAPIKey = c.LLMAPIKey
+	}
+	if c.VisionModel == "" {
+		c.VisionModel = c.LLMModel
+	}
+	if c.VisionEnabled {
+		v.required("VISION_BASE_URL", c.VisionBaseURL)
+		if c.VisionBaseURL != "" {
+			v.url("VISION_BASE_URL", c.VisionBaseURL)
+		}
+		v.required("VISION_MODEL", c.VisionModel)
 	}
 }
 

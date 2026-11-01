@@ -300,3 +300,156 @@ func TestParseTZ(t *testing.T) {
 		})
 	}
 }
+
+func TestParseDocumentDefaults(t *testing.T) {
+	c, err := Parse(baseEnv())
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	checks := []struct {
+		name      string
+		got, want any
+	}{
+		{"DoclingURL", c.DoclingURL, ""},
+		{"DoclingAPIKey", c.DoclingAPIKey, ""},
+		{"DoclingTimeout", c.DoclingTimeout, 10 * time.Minute},
+		{"DoclingMaxPages", c.DoclingMaxPages, 20},
+		{"BatchQuietPeriod", c.BatchQuietPeriod, 3 * time.Second},
+		{"HintExcerptRunes", c.HintExcerptRunes, 4000},
+		{"VisionEnabled", c.VisionEnabled, false},
+		{"VisionBaseURL", c.VisionBaseURL, ""},
+		{"VisionAPIKey", c.VisionAPIKey, ""},
+		{"VisionModel", c.VisionModel, ""},
+		{"VisionTimeout", c.VisionTimeout, 60 * time.Second},
+	}
+	for _, ch := range checks {
+		if ch.got != ch.want {
+			t.Errorf("%s = %v, want %v", ch.name, ch.got, ch.want)
+		}
+	}
+}
+
+func TestParseVisionFallback(t *testing.T) {
+	llm := []string{
+		"LLM_BASE_URL", "http://llm.example.org/v1",
+		"LLM_API_KEY", "llm-key",
+		"LLM_MODEL", "llm-model",
+	}
+	t.Run("falls back to LLM", func(t *testing.T) {
+		c, err := Parse(with(append(llm, "VISION_ENABLED", "true")...))
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		if c.VisionBaseURL != "http://llm.example.org/v1" || c.VisionAPIKey != "llm-key" ||
+			c.VisionModel != "llm-model" {
+			t.Errorf("fallback = %q %q %q", c.VisionBaseURL, c.VisionAPIKey, c.VisionModel)
+		}
+	})
+	t.Run("own values win", func(t *testing.T) {
+		c, err := Parse(with(append(llm,
+			"VISION_ENABLED", "true",
+			"VISION_BASE_URL", "http://vision.example.org/v1",
+			"VISION_API_KEY", "vision-key",
+			"VISION_MODEL", "vision-model",
+		)...))
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		if c.VisionBaseURL != "http://vision.example.org/v1" || c.VisionAPIKey != "vision-key" ||
+			c.VisionModel != "vision-model" {
+			t.Errorf("own = %q %q %q", c.VisionBaseURL, c.VisionAPIKey, c.VisionModel)
+		}
+	})
+	t.Run("standalone vision without LLM", func(t *testing.T) {
+		_, err := Parse(with("VISION_ENABLED", "true",
+			"VISION_BASE_URL", "http://vision.example.org/v1", "VISION_MODEL", "m"))
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+	})
+}
+
+func TestParseDocumentErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{"docling relative url", with("DOCLING_URL", "docling.example.org"), "config: DOCLING_URL: "},
+		{"docling ftp url", with("DOCLING_URL", "ftp://docling.example.org"), "config: DOCLING_URL: "},
+		{"bad docling timeout", with("DOCLING_TIMEOUT", "soon"), "config: DOCLING_TIMEOUT: "},
+		{"zero docling timeout", with("DOCLING_TIMEOUT", "0s"), "config: DOCLING_TIMEOUT: "},
+		{"pages zero", with("DOCLING_MAX_PAGES", "0"), "config: DOCLING_MAX_PAGES: "},
+		{"pages too many", with("DOCLING_MAX_PAGES", "1001"), "config: DOCLING_MAX_PAGES: "},
+		{"quiet too short", with("BATCH_QUIET_PERIOD", "499ms"), "config: BATCH_QUIET_PERIOD: "},
+		{"quiet too long", with("BATCH_QUIET_PERIOD", "61s"), "config: BATCH_QUIET_PERIOD: "},
+		{"excerpt too small", with("HINT_EXCERPT_RUNES", "499"), "config: HINT_EXCERPT_RUNES: "},
+		{"excerpt too large", with("HINT_EXCERPT_RUNES", "50001"), "config: HINT_EXCERPT_RUNES: "},
+		{"bad vision bool", with("VISION_ENABLED", "maybe"), "config: VISION_ENABLED: "},
+		{"vision no url", with("VISION_ENABLED", "true", "VISION_MODEL", "m"), "config: VISION_BASE_URL: "},
+		{
+			"vision no model",
+			with("VISION_ENABLED", "true", "VISION_BASE_URL", "http://v.example.org"),
+			"config: VISION_MODEL: ",
+		},
+		{
+			"vision bad url",
+			with("VISION_ENABLED", "true", "VISION_BASE_URL", "nope", "VISION_MODEL", "m"),
+			"config: VISION_BASE_URL: ",
+		},
+		{"zero vision timeout", with("VISION_TIMEOUT", "0s"), "config: VISION_TIMEOUT: "},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse(tt.env)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error %q lacks %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseDocumentBoundsAccepted(t *testing.T) {
+	_, err := Parse(with(
+		"DOCLING_MAX_PAGES", "1", "BATCH_QUIET_PERIOD", "500ms", "HINT_EXCERPT_RUNES", "500",
+	))
+	if err != nil {
+		t.Fatalf("lower bounds: %v", err)
+	}
+	_, err = Parse(with(
+		"DOCLING_MAX_PAGES", "1000", "BATCH_QUIET_PERIOD", "1m", "HINT_EXCERPT_RUNES", "50000",
+		"DOCLING_URL", "https://docling.example.org:5001",
+	))
+	if err != nil {
+		t.Fatalf("upper bounds: %v", err)
+	}
+}
+
+func TestDocumentErrorsNeverContainValues(t *testing.T) {
+	_, err := Parse(with(
+		"DOCLING_URL", secretValue,
+		"DOCLING_API_KEY", secretValue,
+		"DOCLING_TIMEOUT", secretValue,
+		"DOCLING_MAX_PAGES", secretValue,
+		"BATCH_QUIET_PERIOD", secretValue,
+		"HINT_EXCERPT_RUNES", secretValue,
+		"VISION_ENABLED", "true",
+		"VISION_BASE_URL", secretValue,
+		"VISION_API_KEY", secretValue,
+		"VISION_TIMEOUT", secretValue,
+	))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if strings.Contains(err.Error(), secretValue) {
+		t.Errorf("error leaks a value: %v", err)
+	}
+	for _, v := range []string{"DOCLING_URL", "VISION_BASE_URL", "VISION_MODEL"} {
+		if !strings.Contains(err.Error(), "config: "+v+": ") {
+			t.Errorf("error lacks %s: %v", v, err)
+		}
+	}
+}
