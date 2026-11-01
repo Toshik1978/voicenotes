@@ -44,9 +44,9 @@ Run any docling-serve (e.g. a container on `docling.example.org:5001`) and set
 |---|---|
 | Album of 4 photos with a caption on the 3rd | One `⏳`, one note, 4 attachments in order, caption as text, one hint. |
 | 15 photos at once (Telegram splits into 2 albums) | One note, 15 attachments. |
-| Two photos sent separately 1 s apart | One note. |
+| Two photos sent separately 1 s apart (within `BATCH_QUIET_PERIOD`, default `3s`) | One note. |
 | Photo, then a voice message 1 s later | Two notes. |
-| Restart VoiceNotes while an album is arriving | Still one note, nothing missing. |
+| Restart VoiceNotes while an album is arriving | Still one note, nothing missing. On startup the quiet period of every batch still collecting restarts, so Telegram's redelivered parts join the half-built batch. |
 
 ## 4. Non-blocking and resilience (FR-114a, FR-113, SC-104)
 
@@ -54,7 +54,7 @@ Run any docling-serve (e.g. a container on `docling.example.org:5001`) and set
 |---|---|
 | Send a 20-page scan, then immediately a voice message | The voice note is confirmed first. Both notes are ordered by receive time in Memos. |
 | Stop docling, send a PDF | `⏳ queued — document reader unavailable, will retry`. Health degraded after the threshold. Start docling → note created, reply edited. |
-| Set `DOCLING_TIMEOUT=5s`, send a large scan | After 3 timeouts: the note has `📎 scan.pdf — couldn't read in time`, file attached. |
+| Set `DOCLING_TIMEOUT=5s`, send a large scan | The first two timeouts are retried: the reply shows `⏳ queued — document reader unavailable, will retry`. After the 3rd timeout the note has `📎 scan.pdf — couldn't read in time`, file attached, and the reply is edited to the saved text. |
 
 ## 5. Vision fallback (US4, SC-105)
 
@@ -64,6 +64,7 @@ images).
 | Action | Expected |
 |---|---|
 | Photo of handwriting | A usable hint. The gateway logs show one image request. |
+| Gateway down during the photo | Up to 3 vision attempts back to back (no waiting state, no `⏳ queued`), within 2 minutes. Then the placeholder `📷 photo` and the normal `✓ saved` reply. |
 | Image-only PDF with no OCR text | Placeholder hint. No vision request. |
 | `VISION_ENABLED=false` | No image ever reaches the gateway. |
 
@@ -71,6 +72,16 @@ images).
 
 With captures queued in a 001 instance (some audio mid-pipeline), deploy this version:
 
-- Migration 002 runs.
+- Migrations 002 and 003 run.
 - `$DATA_DIR/audio` becomes `$DATA_DIR/files`.
 - The queued captures finish normally.
+
+## Measured times (SC-106)
+
+Not yet measured — to be filled after the first deployment. The timing needs real docling, LLM and
+Telegram services, which are not reachable from the development environment.
+
+| Scenario | Target | Measured | Hardware |
+|---|---|---|---|
+| Single photo, from sending to the confirmed reply | <= 60 s | not yet measured | |
+| 10-page document, from sending to the confirmed reply | <= 3 min | not yet measured | |

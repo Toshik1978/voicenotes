@@ -228,6 +228,32 @@ func TestConvertSubmitsPinnedForm(t *testing.T) {
 	}
 }
 
+// TestConvertSendsNoOCROptions pins that no OCR option is sent, so the
+// server's own OCR preset decides (contracts/external-apis.md section 1).
+func TestConvertSendsNoOCROptions(t *testing.T) {
+	var fields map[string][]string
+	srv := &fakeServer{polls: []string{"success"}, result: resultOK}
+	srv.submit = func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Errorf("parse multipart: %v", err)
+			return
+		}
+		fields = r.MultipartForm.Value
+		_, _ = io.WriteString(w, submitBody)
+	}
+	c, _ := newTestClient(t, srv, nil)
+
+	_, out := c.Convert(context.Background(), "scan.pdf", "application/pdf", []byte("x"))
+	if out.Class != capture.ClassOK {
+		t.Fatalf("outcome = %+v, want OK", out)
+	}
+	for _, k := range []string{"ocr_engine", "ocr_preset", "ocr_lang", "force_ocr"} {
+		if v, ok := fields[k]; ok {
+			t.Errorf("field %s = %q was sent, want absent", k, v)
+		}
+	}
+}
+
 func TestConvertFilePartDefaults(t *testing.T) {
 	var name, ctype, key string
 	var keySet bool

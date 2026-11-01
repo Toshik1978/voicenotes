@@ -262,11 +262,11 @@ packages are in `internal/` (see plan.md Structure). `COVERPKG` stays unchanged.
 
 ## Phase 7: Polish & Cross-Cutting Concerns
 
-- [ ] T027 [P] Document the feature in `README.md` and `.env.example`:
+- [x] T027 [P] Document the feature in `README.md` and `.env.example`:
   - photo, file and album behaviour, and the new reply texts
   - the new optional variables, with anonymised examples only (`http://docling.example.org:5001`, `https://llm.example.org/v1`, `example-vision-model`)
   - a docling-serve container and a vision-capable model as a suggested setup, not a requirement (FR-131, Constitution VII)
-- [ ] T028 Run the full gate and the quickstart scenarios against `specs/002-document-captures/quickstart.md`:
+- [x] T028 Run the full gate and the quickstart scenarios against `specs/002-document-captures/quickstart.md`:
   - `task lint`, `golangci-lint fmt --diff`, `task test:coverage` (≥ 80%, `-race`), `task build`
   - time the SC-106 scenarios against real services: a single photo from sending to the confirmed reply (target ≤ 60 s) and a 10-page document (target ≤ 3 min), and record the measured times and hardware in `specs/002-document-captures/quickstart.md`
   - scan the diff for real hostnames, IPs, tokens or IDs

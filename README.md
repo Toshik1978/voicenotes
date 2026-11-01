@@ -10,10 +10,14 @@ transcribes the audio, optionally cleans it up with an LLM, saves a note with th
 and replies with a link. Each morning it sends a digest of the notes that are still tagged
 `#inbox`.
 
+It also saves photos and files. A document or photo becomes a note with the original attached, and
+a short hint describing it ([Photos, files and albums](#photos-files-and-albums)).
+
 ## How it works
 
 1. The bot receives a voice or text message from an allowlisted Telegram user (long polling, no
-   public ingress).
+   public ingress). Photos and files are accepted too (see
+   [Photos, files and albums](#photos-files-and-albums)).
 2. The capture is stored durably in a local SQLite file, with the audio on disk, before anything
    else happens.
 3. Speech-to-text: the audio goes to an OpenAI-compatible `/audio/transcriptions` endpoint.
@@ -29,6 +33,47 @@ capture waits and is retried with backoff, and health reports the degradation. A
 dropped: a permanent failure produces a placeholder note with the audio only. If even the audio
 could not be kept (for example Telegram refused the download), the reply says so and asks you to
 send it again.
+
+## Photos, files and albums
+
+Send a photo, a document, a video or an animation to the bot, with or without a caption. The
+original is attached to the note; a caption is your own text and goes through the LLM step like a
+voice note. The note gets one hint line (from the LLM when it is on, otherwise a placeholder such as
+`📎 report.pdf`, `📷 photo`, `📷 3 photos` or `📎 4 files`). Extracted text is never pasted into the
+note. Voice and text captures behave as before and are never batched.
+
+- **One send, one note.** Files from the same chat are collected into one batch, and one batch is
+  one note and one reply. An item joins the open batch when it has the same album ID, or arrives
+  before the quiet period (`BATCH_QUIET_PERIOD`, default `3s`) has passed since the previous
+  item; otherwise it starts a new batch. The `⏳` reply answers the first item only. Captions are
+  joined in send order.
+- **A restart while an album is arriving.** Items are stored before they are acknowledged, so
+  nothing is lost. On startup, the quiet period of every batch still collecting restarts, so items
+  that Telegram redelivers after the restart join their half-built batch instead of starting a
+  second note.
+- **A file over 20 MB.** Telegram bots cannot download more. Sent alone, it gets `⚠ too large for
+  Telegram bots (max 20 MB) — not saved.`. As part of a batch (an album, or sent inside the quiet
+  period) it does not stop the rest: the other files are saved and the reply reads `⚠ saved, 1 of
+  4 not kept — too large for Telegram bots · open`.
+- **Reading content (optional).** With `DOCLING_URL` set, each file is sent to a
+  docling-serve instance that returns text,
+  which the LLM uses to write the hint. Only the leading `DOCLING_MAX_PAGES` pages (default `20`)
+  of a document are converted. `DOCLING_TIMEOUT` (default `10m`) is the wait per file, from submit
+  to result; a file that times out is retried and, on its third timeout, gets the placeholder hint
+  with `couldn't read in time`. A file the reader cannot read or does not support also keeps the
+  placeholder hint. Without `DOCLING_URL`, files are still saved, with placeholder hints.
+- **No OCR options are sent.** VoiceNotes deliberately sends none of `ocr_engine`, `ocr_preset`,
+  `ocr_lang` or `force_ocr`, so the server's own OCR preset decides (for example a Cyrillic preset
+  configured on the docling-serve side).
+- **Vision (optional, photos only).** With `VISION_ENABLED=true`, a photo that the document reader
+  gave fewer than 20 non-space characters of text for, or that was not read because there is no `DOCLING_URL`, is
+  described by a vision-capable model, one photo per request. It is a best-effort fallback: when it
+  fails or is out of budget the placeholder hint is used, and it is never part of health, so a down
+  vision model does not make the service `degraded`. Documents and videos are never sent to it.
+  The model must accept images in an OpenAI-compatible `/chat/completions` request.
+
+A docling-serve container and a vision-capable model are a suggested setup, not a requirement: any
+server speaking the same API will do, and no image, version, OCR engine or model is mandated.
 
 ## Quick start
 
@@ -73,6 +118,11 @@ services:
 volumes:
   voicenotes-data:
 ```
+
+On upgrade, a `$DATA_DIR/audio` directory left by an earlier version is renamed to
+`$DATA_DIR/files` at startup, before anything uses it; queued captures keep working. If both exist,
+the entries are moved across without overwriting, and `audio/` is removed once empty. Nothing needs
+to be done by hand.
 
 Port 8080 serves health only and does not need to be published; omit `-p` unless a monitor outside
 the container reads it.
@@ -143,6 +193,25 @@ The LLM step is enabled only when `LLM_BASE_URL` is set.
 | `LLM_TIMEOUT` | no | `60s` | no | Per-request timeout |
 | `LLM_TEMPERATURE` | no | unset | no | Sampling temperature `0`–`2`; unset sends none, so the model uses its default (some models accept only that) |
 
+### Documents and photos (optional)
+
+All optional. With none set, voice and text behave as before and files are saved with placeholder
+hints.
+
+| Variable | Required | Default | Secret | Meaning |
+|---|---|---|---|---|
+| `DOCLING_URL` | no | unset | no | Base URL of a docling-serve instance, for example `http://docling.example.org:5001`; enables content extraction |
+| `DOCLING_API_KEY` | no | unset | yes | Sent as `X-Api-Key`; ignored without `DOCLING_URL` |
+| `DOCLING_TIMEOUT` | no | `10m` | no | Wait per file, from submit to result; the third timeout of a file gives up on it |
+| `DOCLING_MAX_PAGES` | no | `20` | no | `1`–`1000`; leading pages converted per document |
+| `BATCH_QUIET_PERIOD` | no | `3s` | no | `500ms`–`1m`; quiet time that closes a batch |
+| `HINT_EXCERPT_RUNES` | no | `4000` | no | `500`–`50000`; total extracted text sent to the LLM per batch |
+| `VISION_ENABLED` | no | `false` | no | Describe photos with a vision model when no text was read |
+| `VISION_BASE_URL` | if vision is on | `LLM_BASE_URL` | no | Base URL including `/v1`, for example `https://llm.example.org/v1` |
+| `VISION_API_KEY` | no | `LLM_API_KEY` | yes | Bearer key |
+| `VISION_MODEL` | if vision is on | `LLM_MODEL` | no | Vision-capable model, for example `example-vision-model` |
+| `VISION_TIMEOUT` | no | `60s` | no | Per-request timeout |
+
 ### Memos
 
 | Variable | Required | Default | Secret | Meaning |
@@ -168,7 +237,7 @@ The LLM step is enabled only when `LLM_BASE_URL` is set.
 
 | Variable | Required | Default | Secret | Meaning |
 |---|---|---|---|---|
-| `DATA_DIR` | no | `/data` | no | SQLite file and queued audio; mount a persistent volume here |
+| `DATA_DIR` | no | `/data` | no | SQLite file and queued audio and files (`files/`); mount a persistent volume here |
 | `HTTP_ADDR` | no | `:8080` | no | Health listener; must listen on loopback (`:port` or `0.0.0.0:port`) for `voicenotes health` |
 | `HEALTH_PENDING_THRESHOLD` | no | `30m` | no | Oldest unfinished capture older than this makes health `degraded` |
 | `RETRY_MAX_INTERVAL` | no | `5m` | no | Backoff cap for dependency retries |
@@ -203,6 +272,23 @@ enough: about one call per capture plus one per day, a few hundred tokens each. 
 is sent unless `LLM_TEMPERATURE` is set, because some models (Claude Haiku, for one) accept only
 their default. If the output fails validation, the note is saved without LLM output (`✓ saved (no
 AI)`).
+
+### Document reader (optional)
+
+`POST {DOCLING_URL}/v1/convert/file/async`, then polling `GET /v1/status/poll/{task_id}` and
+`GET /v1/result/{task_id}`; one file per conversion, Markdown output, the first
+`DOCLING_MAX_PAGES` pages. No OCR options are sent (`ocr_engine`, `ocr_preset`, `ocr_lang`,
+`force_ocr`): the server's OCR preset decides, so configure it on the docling-serve side. A
+docling-serve container is a suggestion, not a requirement. `DOCLING_API_KEY`, when set, is sent as
+`X-Api-Key`. A down reader (connection errors, 5xx, 408, 429, 401, 403, 404) queues the capture
+with `⏳ queued — document reader unavailable, will retry`; a file it rejects (400, 413, 415, 422)
+keeps the placeholder hint.
+
+### Vision model (optional)
+
+When `VISION_ENABLED=true`: `POST {VISION_BASE_URL}/chat/completions` with the photo as a base64
+`image_url` part, one photo per request, at most 3 attempts or 2 minutes per photo. Failure falls
+back to the placeholder hint and never queues the capture or affects health.
 
 ### Memos
 
@@ -245,11 +331,15 @@ sound. Messages from users not in `TELEGRAM_ALLOWED_USERS` get no reply.
 | Permanent failure | `⚠ saved audio only — <reason> · open` |
 | Permanent failure, no audio kept | `⚠ audio not kept — <reason> · please send it again · open` |
 | Audio rejected by Memos | `⚠ saved, audio not attached — <reason> · open` |
-| Unsupported message type | `VoiceNotes takes voice or text only.` |
-| File over 20 MB | `⚠ too large for Telegram bots (max 20 MB) — not saved.` |
+| Waiting on the document reader | `⏳ queued — document reader unavailable, will retry` |
+| Files saved, some not kept | `⚠ saved, 1 of 4 not kept — <reason> · open` |
+| Files saved, some not attached | `⚠ saved, 1 of 4 not attached — <reason> · open` |
+| No file could be kept | `⚠ files not kept — <reason> · please send them again · open` |
+| Unsupported message type | `VoiceNotes takes voice, text, photos and files.` |
+| Single file over 20 MB | `⚠ too large for Telegram bots (max 20 MB) — not saved.` |
 | Storing failed | `⚠ not saved — please send it again.` |
 
-`/start` and `/help` reply with `VoiceNotes: send a voice or text message to save it as a note.`
+`/start` and `/help` reply with `VoiceNotes: send a voice message, text, photo or file to save it as a note.`
 
 The morning digest lists new `#inbox` notes and earlier ones, oldest first, capped at
 `DIGEST_MAX_NOTES` lines, each with a one-line summary and a link to
@@ -281,7 +371,7 @@ single non-loopback IP, or the `HEALTHCHECK` fails and the container shows as un
 
 | Item | Value |
 |---|---|
-| Volume | `/data`: a small SQLite file, plus audio only while captures are queued. Must be writable by `65532:65532` |
+| Volume | `/data`: a small SQLite file, plus audio and files (in `files/`) only while captures are queued. Must be writable by `65532:65532` |
 | Port | `8080/tcp`: health only |
 
 ## Development

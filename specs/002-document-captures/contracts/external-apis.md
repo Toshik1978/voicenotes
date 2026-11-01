@@ -26,6 +26,10 @@ Base: `DOCLING_URL` (e.g. `http://docling.example.org:5001`). Header: `X-Api-Key
 
 Response 200: JSON with `task_id` (string) and `task_status`.
 
+VoiceNotes deliberately sends no OCR options (`ocr_engine`, `ocr_preset`, `ocr_lang`, `force_ocr`),
+so the server's OCR preset decides (for example a Cyrillic preset configured on the server). A
+client test pins that these fields are absent.
+
 ### Poll
 
 `GET {base}/v1/status/poll/{task_id}`, repeated at 2 s intervals.
