@@ -325,8 +325,8 @@ func TestMigrationsIdempotentAndVersioned(t *testing.T) {
 	if _, ok, _ := s2.OldestUnfinished(context.Background()); !ok {
 		t.Fatal("row lost after reopen")
 	}
-	if v := s2.UserVersion(); v != 2 {
-		t.Fatalf("user_version=%d, want 2", v)
+	if v := s2.UserVersion(); v != 3 {
+		t.Fatalf("user_version=%d, want 3", v)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "voicenotes.db")); err != nil {
 		t.Fatal(err)
@@ -595,6 +595,7 @@ func TestInsertRoundTripsFiles(t *testing.T) {
 	c.Files[2].LocalPath, c.Files[2].State, c.Files[2].Failure = "f.pdf", capture.FileFailed, "too large"
 	c.Files[2].Text, c.Files[2].TextSource, c.Files[2].Language = "body", capture.TextDocling, "en"
 	c.Files[2].Timeouts, c.Files[2].Attached, c.Files[2].AttachFailure = 2, true, "rejected"
+	c.Files[1].VisionAttempts, c.Files[1].VisionStartedAt = 2, time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)
 	if err := s.Insert(ctx, &c); err != nil {
 		t.Fatal(err)
 	}
@@ -660,6 +661,7 @@ func TestUpdatePersistsMutableFileColumns(t *testing.T) {
 	f.FileID, f.MimeType, f.FileName, f.FileSize = "", "application/x-pdf", "", 4096
 	f.LocalPath, f.State, f.Text, f.TextSource = "tg-10-11.pdf", capture.FileDone, "text", capture.TextVision
 	f.Language, f.Failure, f.Timeouts = "de", "slow", 3
+	f.VisionAttempts, f.VisionStartedAt = 3, time.Date(2026, 2, 3, 4, 5, 6, 7, time.UTC)
 	f.Attached, f.AttachFailure = true, "refused"
 	c.Step, c.AlbumID = capture.StepExtract, "album-2"
 	if err := s.Update(ctx, c); err != nil {

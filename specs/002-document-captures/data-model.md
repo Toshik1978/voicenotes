@@ -42,6 +42,8 @@ Validation (`capture.New`):
 | `language` | TEXT | audio only: detected language |
 | `failure` | TEXT | secret-free reason for `failed`, shown in the hint/reply |
 | `timeouts` | INTEGER NOT NULL DEFAULT 0 | docling timeouts on this file |
+| `vision_attempts` | INTEGER NOT NULL DEFAULT 0 | failed vision-model attempts on this file (budget 3 or 2 minutes) |
+| `vision_started_at` | INTEGER | Unix ns of the first failed vision attempt; NULL until then |
 | `attached` | INTEGER NOT NULL DEFAULT 0 | 1 once attached to the note (or attach failed permanently, see `attach_failure`) |
 | `attach_failure` | TEXT | reason the notes store refused this attachment |
 

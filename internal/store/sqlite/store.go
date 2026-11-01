@@ -218,7 +218,8 @@ enrich_started_at`
 
 const fileColumns = `id, capture_id, position, source, source_chat_id, source_message_id,
 kind, file_id, mime_type, file_name, file_size, local_path, state, text,
-text_source, language, failure, timeouts, attached, attach_failure`
+text_source, language, failure, timeouts, attached, attach_failure,
+vision_attempts, vision_started_at`
 
 // Lane predicates over captures; they must agree with capture.LaneOf.
 const (
@@ -442,13 +443,15 @@ func insertFile(ctx context.Context, tx execer, f *capture.File) error {
 	res, err := tx.ExecContext(ctx, `INSERT INTO capture_files (
 capture_id, position, source, source_chat_id, source_message_id,
 kind, file_id, mime_type, file_name, file_size, local_path, state, text,
-text_source, language, failure, timeouts, attached, attach_failure)
-VALUES (?,?,?,?,?, ?,?,?,?,?,?,?,?, ?,?,?,?,?,?)`,
+text_source, language, failure, timeouts, attached, attach_failure,
+vision_attempts, vision_started_at)
+VALUES (?,?,?,?,?, ?,?,?,?,?,?,?,?, ?,?,?,?,?,?, ?,?)`,
 		f.CaptureID, f.Position, f.Source, f.SourceChatID, f.SourceMessageID,
 		string(f.Kind), nullStr(f.FileID), nullStr(f.MimeType), nullStr(f.FileName),
 		nullInt(f.FileSize), nullStr(f.LocalPath), string(f.State), nullStr(f.Text),
 		nullStr(string(f.TextSource)), nullStr(f.Language), nullStr(f.Failure),
-		f.Timeouts, f.Attached, nullStr(f.AttachFailure))
+		f.Timeouts, f.Attached, nullStr(f.AttachFailure),
+		f.VisionAttempts, nullTS(f.VisionStartedAt))
 	if err != nil {
 		if isUnique(err) {
 			return ErrDuplicate
@@ -490,12 +493,14 @@ func updateFile(ctx context.Context, tx *sql.Tx, captureID int64, f *capture.Fil
 	}
 	res, err := tx.ExecContext(ctx, `UPDATE capture_files SET
 file_id=?, mime_type=?, file_name=?, file_size=?, local_path=?, state=?, text=?,
-text_source=?, language=?, failure=?, timeouts=?, attached=?, attach_failure=?
+text_source=?, language=?, failure=?, timeouts=?, attached=?, attach_failure=?,
+vision_attempts=?, vision_started_at=?
 WHERE id=? AND capture_id=?`,
 		nullStr(f.FileID), nullStr(f.MimeType), nullStr(f.FileName), nullInt(f.FileSize),
 		nullStr(f.LocalPath), string(f.State), nullStr(f.Text),
 		nullStr(string(f.TextSource)), nullStr(f.Language), nullStr(f.Failure),
 		f.Timeouts, f.Attached, nullStr(f.AttachFailure),
+		f.VisionAttempts, nullTS(f.VisionStartedAt),
 		f.ID, captureID)
 	if err != nil {
 		return fmt.Errorf("sqlite: update file %d of capture %d: %w", f.ID, captureID, err)
@@ -793,12 +798,13 @@ func queryFiles(ctx context.Context, tx querier, captureID int64) ([]capture.Fil
 			kind, state                         string
 			fileID, mime, name, local, text     sql.NullString
 			source, lang, failure, attachFailed sql.NullString
-			size                                sql.NullInt64
+			size, visionStarted                 sql.NullInt64
 		)
 		err := rows.Scan(
 			&f.ID, &f.CaptureID, &f.Position, &f.Source, &f.SourceChatID, &f.SourceMessageID,
 			&kind, &fileID, &mime, &name, &size, &local, &state, &text,
 			&source, &lang, &failure, &f.Timeouts, &f.Attached, &attachFailed,
+			&f.VisionAttempts, &visionStarted,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("sqlite: query files of capture %d: %w", captureID, err)
@@ -807,6 +813,9 @@ func queryFiles(ctx context.Context, tx querier, captureID int64) ([]capture.Fil
 		f.FileID, f.MimeType, f.FileName, f.FileSize = fileID.String, mime.String, name.String, size.Int64
 		f.LocalPath, f.Text, f.TextSource = local.String, text.String, capture.TextSource(source.String)
 		f.Language, f.Failure, f.AttachFailure = lang.String, failure.String, attachFailed.String
+		if visionStarted.Valid {
+			f.VisionStartedAt = fromTS(visionStarted.Int64)
+		}
 		files = append(files, f)
 	}
 	if err := rows.Err(); err != nil {

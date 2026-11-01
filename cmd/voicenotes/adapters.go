@@ -43,6 +43,9 @@ func (d doclingShim) Convert(
 	return pipeline.ExtractResult{Markdown: res.Markdown, TimedOut: res.TimedOut}, out
 }
 
+// The vision client already speaks pipeline.Describer: it needs no shim.
+var _ pipeline.Describer = (*openai.Vision)(nil)
+
 // notesShim adapts the Memos client to pipeline.NotesWriter.
 type notesShim struct{ c *memos.Client }
 

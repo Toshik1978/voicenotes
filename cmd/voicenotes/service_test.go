@@ -476,3 +476,100 @@ func TestHintExcerptRunesBoundsTheLLMRequest(t *testing.T) {
 		t.Errorf("excerpt runes in the request = %d, want 500 (HINT_EXCERPT_RUNES)", n)
 	}
 }
+
+// fakeVision is an httptest vision model answering every request with status
+// and body; hits counts the requests.
+type fakeVision struct {
+	srv  *httptest.Server
+	mu   sync.Mutex
+	hits int
+}
+
+func newFakeVision(t *testing.T, status int, body string) *fakeVision {
+	t.Helper()
+	v := &fakeVision{}
+	v.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		v.mu.Lock()
+		v.hits++
+		v.mu.Unlock()
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(v.srv.Close)
+
+	return v
+}
+
+func (v *fakeVision) count() int {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	return v.hits
+}
+
+// visionConfig points the vision fallback at v, on or off.
+func visionConfig(v *fakeVision, enabled bool) config.Config {
+	cfg := e2eConfig()
+	cfg.VisionEnabled, cfg.VisionBaseURL, cfg.VisionModel = enabled, v.srv.URL, "fake-vision"
+	cfg.VisionTimeout = 5 * time.Second
+
+	return cfg
+}
+
+// VISION_ENABLED wires the vision model: without docling a photo goes to it
+// and its answer becomes the hint.
+func TestVisionEnabledDescribesAPhoto(t *testing.T) {
+	v := newFakeVision(t, http.StatusOK, `{"choices":[{"message":{"content":"A handwritten list"}}]}`)
+	e := startE2E(t, visionConfig(v, true), e2eTranscriber{})
+
+	e.handler.Handle(t.Context(), photo(42, "", ""))
+	notes, _, _ := e.waitForIdle(t)
+
+	if v.count() != 1 {
+		t.Errorf("vision requests = %d, want 1", v.count())
+	}
+	if len(notes) != 1 || !strings.Contains(notes[0].Content, "A handwritten list") {
+		t.Errorf("notes = %+v, want the vision answer as the hint", notes)
+	}
+}
+
+// Vision off (the default): nothing is sent, the photo gets the placeholder.
+func TestVisionOffSendsNothing(t *testing.T) {
+	v := newFakeVision(t, http.StatusOK, `{"choices":[{"message":{"content":"A handwritten list"}}]}`)
+	e := startE2E(t, visionConfig(v, false), e2eTranscriber{})
+
+	e.handler.Handle(t.Context(), photo(42, "", ""))
+	notes, _, _ := e.waitForIdle(t)
+
+	if v.count() != 0 {
+		t.Errorf("vision requests = %d, want none with VISION_ENABLED off", v.count())
+	}
+	if len(notes) != 1 || !strings.Contains(notes[0].Content, "📷 photo") {
+		t.Errorf("notes = %+v, want the 📷 photo placeholder", notes)
+	}
+}
+
+// FR-123: a failing vision model degrades to the placeholder hint, the
+// capture never waits (no queued notice) and the reply is the normal one.
+func TestVisionFailureKeepsTheNormalReply(t *testing.T) {
+	v := newFakeVision(t, http.StatusServiceUnavailable, `{"error":"down"}`)
+	e := startE2E(t, visionConfig(v, true), e2eTranscriber{})
+
+	e.handler.Handle(t.Context(), photo(42, "", ""))
+	notes, attachments, replies := e.waitForIdle(t)
+
+	if v.count() == 0 {
+		t.Error("the photo never reached the vision model")
+	}
+	if len(notes) != 1 || !strings.Contains(notes[0].Content, "📷 photo") || len(attachments) != 1 {
+		t.Errorf("notes = %+v attachments %q, want one note with the placeholder and the photo", notes, attachments)
+	}
+	for _, r := range replies {
+		if strings.Contains(r, "queued") || strings.Contains(r, "⚠") || strings.Contains(r, "(no AI)") {
+			t.Errorf("reply %q, want no queued notice, warning or (no AI)", r)
+		}
+	}
+	if len(replies) == 0 || !strings.HasPrefix(replies[len(replies)-1], "✓ saved · ") {
+		t.Errorf("replies = %q, want the normal confirmation last", replies)
+	}
+}

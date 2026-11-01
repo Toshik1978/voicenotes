@@ -241,14 +241,14 @@ packages are in `internal/` (see plan.md Structure). `COVERPKG` stays unchanged.
 
 **Independent Test**: with vision on, a photo of handwriting gets a usable hint through exactly one image request. An image-only PDF triggers no vision request. With vision off, no image reaches the gateway (quickstart §5).
 
-- [ ] T024 [P] [US4] Add the vision client in new `internal/openai/vision.go` (tests in `internal/openai/vision_test.go` with `httptest`), per contracts/external-apis.md §2:
+- [x] T024 [P] [US4] Add the vision client in new `internal/openai/vision.go` (tests in `internal/openai/vision_test.go` with `httptest`), per contracts/external-apis.md §2:
   - `Vision.Describe(ctx, image, mime)` posts to `/chat/completions` with a system instruction and a user content array (`text` + `image_url` data URL), with bearer auth when a key is set.
   - Return `choices[0].message.content` trimmed and capped at "2000 runes".
   - Classify via `capture.ClassifyHTTP`/`NetworkError`.
-- [ ] T025 [P] [US4] Add the vision decision and budget in `internal/capture/file.go` (tests in `internal/capture/file_test.go`):
+- [x] T025 [P] [US4] Add the vision decision and budget in `internal/capture/file.go` (tests in `internal/capture/file_test.go`):
   - `NeedsVision(f, enabled, doclingConfigured)` is true only for `image` files when enabled and (docling not configured or the file's docling text has fewer than 20 non-space runes).
   - A per-file vision budget of 3 attempts or 2 minutes, after which the file is `empty` with no `waiting_on` (FR-121, FR-123).
-- [ ] T026 [US4] Use vision in `extract` and wire it, in `internal/pipeline/steps.go`, `cmd/voicenotes/service.go`, `cmd/voicenotes/adapters.go` (tests in `internal/pipeline/steps_test.go`, `cmd/voicenotes/service_test.go`):
+- [x] T026 [US4] Use vision in `extract` and wire it, in `internal/pipeline/steps.go`, `cmd/voicenotes/service.go`, `cmd/voicenotes/adapters.go` (tests in `internal/pipeline/steps_test.go`, `cmd/voicenotes/service_test.go`):
   - Add a `Describer` to `Deps`, nil unless `VISION_ENABLED`.
   - After docling, or instead of it when docling is unconfigured, call it for an image file when `NeedsVision` holds, and store the answer as `Text` with `text_source=vision`.
   - Tests:

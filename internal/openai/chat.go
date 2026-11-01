@@ -65,18 +65,41 @@ func (c *Chat) Complete(ctx context.Context, messages []Message) (string, captur
 	if err != nil {
 		return "", capture.Permanent("build request")
 	}
-	endpoint := strings.TrimRight(c.cfg.BaseURL, "/") + "/chat/completions"
+
+	return postChatCompletion(
+		ctx,
+		c.client,
+		endpointSpec{c.cfg.BaseURL, c.cfg.APIKey, c.cfg.Version, "LLM_BASE_URL"},
+		payload,
+	)
+}
+
+// endpointSpec identifies an OpenAI-compatible chat endpoint; setting names
+// the base URL variable for misconfiguration outcomes.
+type endpointSpec struct {
+	baseURL, apiKey, version, setting string
+}
+
+// postChatCompletion posts payload to {baseURL}/chat/completions and returns
+// choices[0].message.content, classifying failures (shared by Chat and Vision).
+func postChatCompletion(
+	ctx context.Context,
+	client *http.Client,
+	ep endpointSpec,
+	payload []byte,
+) (string, capture.Outcome) {
+	endpoint := strings.TrimRight(ep.baseURL, "/") + "/chat/completions"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
-		return "", capture.Misconfig("invalid LLM_BASE_URL")
+		return "", capture.Misconfig("invalid " + ep.setting)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "VoiceNotes/"+c.cfg.Version)
-	if c.cfg.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+	req.Header.Set("User-Agent", "VoiceNotes/"+ep.version)
+	if ep.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+ep.apiKey)
 	}
 
-	resp, err := c.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", capture.NetworkError(err)
 	}

@@ -237,8 +237,8 @@ VALUES (?, 'telegram', -1001234567890, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	}
 
 	s := open(t, dir)
-	if v := s.UserVersion(); v != 2 {
-		t.Fatalf("user_version = %d, want 2", v)
+	if v := s.UserVersion(); v != 3 {
+		t.Fatalf("user_version = %d, want 3", v)
 	}
 	file := func(id int64, fileID, mime, local string, size int64, state capture.FileState) []capture.File {
 		return []capture.File{{

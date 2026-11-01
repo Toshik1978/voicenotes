@@ -113,8 +113,15 @@ type Extractor interface {
 	Convert(ctx context.Context, name, mime string, data []byte) (ExtractResult, capture.Outcome)
 }
 
+// Describer describes one photo through a vision model. It is nil unless
+// VISION_ENABLED; the wiring passes the vision client. An OK outcome may come
+// with an empty description.
+type Describer interface {
+	Describe(ctx context.Context, image []byte, mime string) (string, capture.Outcome)
+}
+
 // Deps are the collaborators of the step handlers. All but Enricher,
-// Extractor and Log are required.
+// Extractor, Describer and Log are required.
 type Deps struct {
 	Transcriber Transcriber
 	Notes       NotesWriter
@@ -123,6 +130,7 @@ type Deps struct {
 	Files       FileStore
 	Enricher    Enricher
 	Extractor   Extractor
+	Describer   Describer
 	Log         *zap.Logger
 }
 
@@ -296,17 +304,18 @@ func (s *stepRunner) downloadFile(ctx context.Context, c *capture.Capture, i int
 // extract turns the pending files into text, one per attempt, and returns
 // Progress while any remain. A file already settled is not sent again. Audio
 // goes to speech-to-text; photos and documents go to the document reader when
-// one is wired and are skipped otherwise; videos are always skipped. Once none
-// remain, an audio capture takes its file's text and language, so enrich and
-// render see a voice note as before.
+// one is wired, and a photo it barely read (or every photo, without a reader)
+// then goes to the vision model when one is wired. Files no reader can take
+// are skipped; videos always are. Once none remain, an audio capture takes its
+// file's text and language, so enrich and render see a voice note as before.
 func (s *stepRunner) extract(ctx context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
 	c.Files = slices.Clone(c.Files)
-	skipUnreadFiles(c.Files, s.d.Extractor != nil)
-	if i := slices.IndexFunc(c.Files, pendingRead); i >= 0 {
+	skipUnreadFiles(c.Files, s.d.Extractor != nil, s.d.Describer != nil)
+	if i := slices.IndexFunc(c.Files, s.pendingRead); i >= 0 {
 		if out := s.extractFile(ctx, &c, i); out.Class != capture.ClassOK {
 			return c, out
 		}
-		if slices.ContainsFunc(c.Files[i+1:], pendingRead) {
+		if slices.ContainsFunc(c.Files[i+1:], s.pendingRead) {
 			return c, capture.Progress()
 		}
 	}
@@ -319,17 +328,50 @@ func (s *stepRunner) extract(ctx context.Context, c capture.Capture) (capture.Ca
 	return c, capture.OK()
 }
 
-// pendingRead reports whether extract still has to read f. Files it cannot
-// read were skipped before this is asked.
-func pendingRead(f capture.File) bool { return f.State == capture.FilePending }
+// pendingRead reports whether extract still has to read f: it is pending, or
+// it is a photo still owed to the vision model. Files it cannot read were
+// skipped before this is asked.
+func (s *stepRunner) pendingRead(f capture.File) bool {
+	return f.State == capture.FilePending || s.needsVision(f)
+}
 
-// extractFile reads c.Files[i] with the reader for its kind.
+// needsVision reports whether f goes to the vision model now. Only a file
+// whose extraction is live qualifies (pending without a document reader, or
+// read by it); a failed or skipped file never does.
+func (s *stepRunner) needsVision(f capture.File) bool {
+	if s.d.Describer == nil {
+		return false
+	}
+	switch f.State {
+	case capture.FilePending:
+		if s.d.Extractor != nil {
+			return false
+		}
+	case capture.FileDone, capture.FileEmpty:
+	case capture.FileFailed, capture.FileSkipped:
+		return false
+	}
+
+	return capture.NeedsVision(f, true, s.d.Extractor != nil)
+}
+
+// extractFile reads c.Files[i] with the reader for its kind: speech-to-text
+// for audio, else the document reader for a pending file and then the vision
+// model when the photo still needs it.
 func (s *stepRunner) extractFile(ctx context.Context, c *capture.Capture, i int) capture.Outcome {
 	if c.Files[i].Kind == capture.FileAudio {
 		return s.transcribeFile(ctx, c, i)
 	}
+	if c.Files[i].State == capture.FilePending && s.d.Extractor != nil {
+		if out := s.readDocument(ctx, c, i); out.Class != capture.ClassOK {
+			return out
+		}
+	}
+	if s.needsVision(c.Files[i]) {
+		return s.describePhoto(ctx, c, i)
+	}
 
-	return s.readDocument(ctx, c, i)
+	return capture.OK()
 }
 
 // transcribeFile sends c.Files[i] to speech-to-text. The language is forced

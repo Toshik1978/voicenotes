@@ -319,15 +319,31 @@ func newDocling(cfg config.Config) *docling.Client {
 	}, nil)
 }
 
+// newVision builds the vision model client; its http.Client carries
+// VISION_TIMEOUT.
+func newVision(cfg config.Config) *openai.Vision {
+	return openai.NewVision(openai.VisionConfig{
+		BaseURL: cfg.VisionBaseURL,
+		APIKey:  cfg.VisionAPIKey,
+		Model:   cfg.VisionModel,
+		Version: Version,
+	}, &http.Client{Timeout: cfg.VisionTimeout})
+}
+
 // newHandlers builds the step handlers. The LLM is wired only when
-// configured, and the document reader only when DOCLING_URL is set; without
-// it extract marks images and documents skipped, so nothing waits on docling.
+// configured, the document reader only when DOCLING_URL is set and the vision
+// model only when VISION_ENABLED; without a reader extract marks the files it
+// cannot read skipped, so nothing waits on docling. The vision model never
+// makes a capture wait and is not part of health (FR-128).
 func newHandlers(cfg config.Config, deps pipeline.Deps) (map[capture.Step]pipeline.Handler, error) {
 	if cfg.LLMEnabled {
 		deps.Enricher = llmShim{c: newChat(cfg)}
 	}
 	if cfg.DoclingURL != "" {
 		deps.Extractor = doclingShim{c: newDocling(cfg)}
+	}
+	if cfg.VisionEnabled {
+		deps.Describer = newVision(cfg)
 	}
 
 	handlers, err := pipeline.NewHandlers(deps, pipeline.StepsConfig{

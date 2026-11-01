@@ -1,5 +1,10 @@
 package capture
 
+import (
+	"time"
+	"unicode"
+)
+
 // FileKind is the type of one file in a capture.
 type FileKind string
 
@@ -71,6 +76,11 @@ type File struct {
 	Failure string
 	// Timeouts counts docling timeouts on this file.
 	Timeouts int
+	// VisionAttempts counts failed vision-model attempts on this file;
+	// VisionStartedAt is when the first one happened (the 2-minute budget
+	// counts from it).
+	VisionAttempts  int
+	VisionStartedAt time.Time
 	// Attached is true once attached to the note (or the attach failed for good).
 	Attached      bool
 	AttachFailure string
@@ -97,4 +107,66 @@ func DoclingTimeout(f *File) Outcome {
 	}
 
 	return Temporary("docling timeout").On(WaitingDocling)
+}
+
+// Vision budget (contracts/external-apis.md section 2): a file gets 3
+// attempts or 2 minutes at the vision model, then it is left empty.
+const (
+	visionMaxAttempts = 3
+	visionMaxDuration = 2 * time.Minute
+	// visionMinRunes is how many non-space runes docling must have read for a
+	// photo to skip the vision model (FR-121).
+	visionMinRunes = 20
+)
+
+// NeedsVision reports whether f goes to the vision model: only photos, only
+// when vision is enabled, and only when docling is not configured or its text
+// has fewer than 20 non-space runes (FR-121). A file the vision model already
+// read, or whose vision budget is spent, is not sent again.
+func NeedsVision(f File, enabled, doclingConfigured bool) bool {
+	if !enabled || f.Kind != FileImage || f.TextSource == TextVision {
+		return false
+	}
+	if f.State == FileEmpty && f.VisionAttempts > 0 {
+		return false
+	}
+	if !doclingConfigured {
+		return true
+	}
+
+	return nonSpaceRunes(f.Text) < visionMinRunes
+}
+
+func nonSpaceRunes(s string) int {
+	n := 0
+	for _, r := range s {
+		if !unicode.IsSpace(r) {
+			n++
+		}
+	}
+
+	return n
+}
+
+// VisionFailed records one failed vision attempt on f at now and returns the
+// outcome for the step. A temporary or misconfig failure within the budget is
+// returned as is, without a dependency to wait on, so it is retried. A
+// permanent failure, or the third attempt, or two minutes since the first
+// attempt, leaves f empty and returns OK: the hint falls back and extraction
+// carries on (FR-123).
+func VisionFailed(f *File, o Outcome, now time.Time) Outcome {
+	f.VisionAttempts++
+	if f.VisionStartedAt.IsZero() {
+		f.VisionStartedAt = now
+	}
+
+	exhausted := f.VisionAttempts >= visionMaxAttempts ||
+		now.Sub(f.VisionStartedAt) >= visionMaxDuration
+	if o.Class == ClassPermanent || exhausted {
+		f.State = FileEmpty
+		return OK()
+	}
+	o.WaitingOn = ""
+
+	return o
 }

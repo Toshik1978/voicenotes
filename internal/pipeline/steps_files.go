@@ -30,19 +30,51 @@ func (s *stepRunner) collect(_ context.Context, c capture.Capture) (capture.Capt
 }
 
 // skipUnreadFiles marks every pending video skipped, since a video is never
-// read, and every pending photo and document too when no document reader is
-// wired. Audio and files already settled (failed downloads among them) are
-// left alone.
-func skipUnreadFiles(files []capture.File, reader bool) {
+// read, every pending document when no document reader is wired, and every
+// pending photo when neither a document reader nor a vision model is. Audio
+// and files already settled (failed downloads among them) are left alone.
+func skipUnreadFiles(files []capture.File, reader, vision bool) {
 	for i := range files {
 		f := &files[i]
 		if f.State != capture.FilePending {
 			continue
 		}
-		if f.Kind == capture.FileVideo || (!reader && f.Kind != capture.FileAudio) {
+		switch f.Kind {
+		case capture.FileVideo:
 			f.State = capture.FileSkipped
+		case capture.FileDocument:
+			if !reader {
+				f.State = capture.FileSkipped
+			}
+		case capture.FileImage:
+			if !reader && !vision {
+				f.State = capture.FileSkipped
+			}
+		case capture.FileAudio:
 		}
 	}
+}
+
+// readHeld reads the local copy of c.Files[i]. A missing copy fails the file
+// (it cannot be recovered) and returns ok=false with an OK outcome, so the
+// batch goes on; any other read error is Temporary.
+func (s *stepRunner) readHeld(c *capture.Capture, i int) ([]byte, capture.Outcome, bool) {
+	f := &c.Files[i]
+	data, err := s.d.Files.Read(f.LocalPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		s.log(*c, "file missing, not read", err)
+		// Nothing is held: the placeholder must say so.
+		f.LocalPath, f.State, f.Failure = "", capture.FileFailed, "file missing"
+
+		return nil, capture.OK(), false
+	}
+	if err != nil {
+		s.log(*c, "file read failed", err)
+
+		return nil, capture.Temporary("file store: " + err.Error()), false
+	}
+
+	return data, capture.OK(), true
 }
 
 // readDocument sends the photo or document c.Files[i] to the document reader
@@ -51,20 +83,11 @@ func skipUnreadFiles(files []capture.File, reader bool) {
 // keeps the file pending and waits on the reader. A missing local copy fails
 // the file: it cannot be recovered. Content is never logged.
 func (s *stepRunner) readDocument(ctx context.Context, c *capture.Capture, i int) capture.Outcome {
+	data, out, ok := s.readHeld(c, i)
+	if !ok {
+		return out
+	}
 	f := &c.Files[i]
-	data, err := s.d.Files.Read(f.LocalPath)
-	if errors.Is(err, fs.ErrNotExist) {
-		s.log(*c, "file missing, not read", err)
-		// Nothing is held: the placeholder must say so.
-		f.LocalPath, f.State, f.Failure = "", capture.FileFailed, "file missing"
-
-		return capture.OK()
-	}
-	if err != nil {
-		s.log(*c, "file read failed", err)
-
-		return capture.Temporary("file store: " + err.Error())
-	}
 	name := cmp.Or(SanitizeFileName(f.FileName), path.Base(f.LocalPath))
 	start := time.Now()
 	res, out := s.d.Extractor.Convert(ctx, name, f.MimeType, data)
@@ -88,6 +111,40 @@ func (s *stepRunner) readDocument(ctx context.Context, c *capture.Capture, i int
 	if strings.TrimSpace(res.Markdown) == "" {
 		f.Text, f.State = "", capture.FileEmpty
 	}
+
+	return capture.OK()
+}
+
+// describePhoto sends the photo c.Files[i] to the vision model and records
+// its answer as the file's text. The vision model never makes the capture
+// wait (FR-123): a failure within the per-file budget is recorded and
+// returned as Progress, so the next attempt retries at once without a waiting
+// state or a queued reply; a permanent failure, an empty answer or a spent
+// budget leaves the photo empty and the batch goes on (OK). Content is never
+// logged.
+func (s *stepRunner) describePhoto(ctx context.Context, c *capture.Capture, i int) capture.Outcome {
+	data, out, ok := s.readHeld(c, i)
+	if !ok {
+		return out
+	}
+	f := &c.Files[i]
+	start := time.Now()
+	text, out := s.d.Describer.Describe(ctx, data, f.MimeType)
+	s.d.Log.Debug("photo described",
+		zap.Int64("capture", c.ID), zap.Int("position", f.Position),
+		zap.Int("bytes", len(data)), zap.Duration("took", time.Since(start)),
+		zap.Stringer("class", out.Class), zap.Int("text_bytes", len(text)))
+	if out.Class == capture.ClassOK && strings.TrimSpace(text) == "" {
+		out = capture.Permanent("vision: empty answer")
+	}
+	if out.Class != capture.ClassOK {
+		if capture.VisionFailed(f, out, time.Now()).Class != capture.ClassOK {
+			return capture.Progress()
+		}
+
+		return capture.OK()
+	}
+	f.Text, f.TextSource, f.State = text, capture.TextVision, capture.FileDone
 
 	return capture.OK()
 }
