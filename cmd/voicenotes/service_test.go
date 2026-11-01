@@ -22,6 +22,7 @@ import (
 	"github.com/Toshik1978/voicenotes/internal/config"
 	"github.com/Toshik1978/voicenotes/internal/health"
 	"github.com/Toshik1978/voicenotes/internal/pipeline"
+	"github.com/Toshik1978/voicenotes/internal/store/sqlite"
 	"github.com/Toshik1978/voicenotes/internal/telegram"
 )
 
@@ -134,6 +135,76 @@ func TestDigestGoroutinesOnlyWhenEnabled(t *testing.T) {
 	}
 }
 
+// buildConfig is a valid minimal configuration with DATA_DIR set to dir.
+func buildConfig(t *testing.T, dir string) config.Config {
+	t.Helper()
+
+	cfg, err := config.Parse(map[string]string{
+		"TELEGRAM_BOT_TOKEN":     "123456:FAKE-TOKEN",
+		"TELEGRAM_ALLOWED_USERS": "111",
+		"STT_BASE_URL":           "http://stt.example.org:8000/v1",
+		"STT_MODEL":              "whisper-1",
+		"MEMOS_URL":              "http://memos.example.org:5230",
+		"MEMOS_TOKEN":            "memos_pat_FAKE",
+		"DATA_DIR":               dir,
+		// Any free port: build listens and these tests never close it.
+		"HTTP_ADDR": "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	return cfg
+}
+
+// TestBuildPostponesHalfReceivedBatches is quickstart §3: a batch left at
+// collect by a restart is pushed to now + quiet before the workers start,
+// so Telegram's redelivered album parts still join it.
+func TestBuildPostponesHalfReceivedBatches(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sqlite.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, _ := capture.New(capture.KindFiles, capture.StepCollect, time.Now())
+	item.Source, item.SourceChatID, item.SourceMessageID, item.AlbumID = "telegram", 7, 1, "FAKE-ALBUM"
+	item.Files = []capture.File{{
+		Source: "telegram", SourceChatID: 7, SourceMessageID: 1,
+		Kind: capture.FileImage, State: capture.FilePending, FileID: "FAKE-FILE",
+	}}
+	// A negative quiet period leaves the deadline long past, as after a
+	// long downtime.
+	if _, err = db.AppendFile(t.Context(), item, -time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := buildConfig(t, dir)
+	started := time.Now()
+	svc, err := build(cfg, zap.NewNop(), started)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if err = svc.closeStore(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = sqlite.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	got, ok, err := db.OldestUnfinished(t.Context())
+	if err != nil || !ok {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	if !got.NextAttemptAt.After(started.Add(cfg.BatchQuietPeriod / 2)) {
+		t.Fatalf("NextAttemptAt = %v, want about build time + %v", got.NextAttemptAt, cfg.BatchQuietPeriod)
+	}
+}
+
 func TestBuildSweepsAgedOrphanAudio(t *testing.T) {
 	dir := t.TempDir()
 	audio := filepath.Join(dir, "audio")
@@ -149,19 +220,7 @@ func TestBuildSweepsAgedOrphanAudio(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg, err := config.Parse(map[string]string{
-		"TELEGRAM_BOT_TOKEN":     "123456:FAKE-TOKEN",
-		"TELEGRAM_ALLOWED_USERS": "111",
-		"STT_BASE_URL":           "http://stt.example.org:8000/v1",
-		"STT_MODEL":              "whisper-1",
-		"MEMOS_URL":              "http://memos.example.org:5230",
-		"MEMOS_TOKEN":            "memos_pat_FAKE",
-		"DATA_DIR":               dir,
-	})
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	svc, err := build(cfg, zap.NewNop(), time.Now())
+	svc, err := build(buildConfig(t, dir), zap.NewNop(), time.Now())
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}

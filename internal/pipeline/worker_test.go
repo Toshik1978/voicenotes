@@ -614,3 +614,40 @@ func TestWorkerWakesPeersWhenACaptureChangesLane(t *testing.T) {
 		t.Fatal("peer lane was not woken after the capture moved to it")
 	}
 }
+
+func TestCollectAdvanceYieldsToALateJoin(t *testing.T) {
+	clock := newFakeClock(t0())
+	batch, _ := capture.New(capture.KindFiles, capture.StepCollect, t0())
+	batch.ID = 1
+	batch.Files = []capture.File{{ID: 1, CaptureID: 1, Kind: capture.FileImage, State: capture.FilePending}}
+	s := newFakeStore(batch)
+
+	joined := false
+	w := newWorker(t, s, clock, allSteps(func(_ context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
+		if c.Step == capture.StepCollect && !joined {
+			joined = true
+			// A late album item lands between the worker's read and its save.
+			s.join(
+				c.ID,
+				capture.File{ID: 2, CaptureID: 1, Position: 1, Kind: capture.FileImage},
+				t0().Add(3*time.Second),
+			)
+		}
+
+		return c, capture.OK()
+	}))
+	start(t, w)
+
+	// The refused advance re-reads the batch, which is no longer due.
+	if d := clock.awaitSleep(t); d != 3*time.Second {
+		t.Fatalf("slept %v, want the moved deadline 3s", d)
+	}
+	if ups := s.Updates(); len(ups) != 0 {
+		t.Fatalf("stale collect result saved: %+v", ups)
+	}
+	clock.Advance(3 * time.Second)
+	got := s.awaitUpdate(t)
+	if got.Step != capture.StepDownload || len(got.Files) != 2 {
+		t.Fatalf("advanced batch = %+v, want download with both files", got)
+	}
+}

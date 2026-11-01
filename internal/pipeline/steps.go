@@ -23,8 +23,11 @@ import (
 
 // ErrFileTooLarge is returned (possibly wrapped) by a Downloader for a file
 // the source refuses to serve; no retry can fetch it. telegram.ErrTooLarge is
-// this value.
+// this value. IngestFile returns it for a TooLarge item it did not store.
 var ErrFileTooLarge = errors.New("pipeline: file too large to download")
+
+// reasonTooLarge is the failure recorded for a file over the download limit.
+const reasonTooLarge = "too large for Telegram bots"
 
 // ErrRejected is wrapped (with %w) by an adapter for a request the source
 // refused for good, such as Telegram 400 or 403. Retrying cannot succeed, so
@@ -261,7 +264,7 @@ func (s *stepRunner) downloadFile(ctx context.Context, c *capture.Capture, i int
 	switch {
 	case errors.Is(err, ErrFileTooLarge):
 		s.log(*c, "file too large to download", err)
-		reason = "too large for Telegram bots"
+		reason = reasonTooLarge
 	case errors.Is(err, ErrRejected):
 		s.log(*c, "file download rejected", err)
 		reason = "unavailable from Telegram"

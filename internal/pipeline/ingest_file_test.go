@@ -15,22 +15,42 @@ type fakeAppender struct {
 	got     capture.Capture
 	quiet   time.Duration
 	created bool
+	moved   bool
 	err     error
+	// joinOnly counts JoinOpenBatch calls; noOpen makes them find no batch.
+	joinOnly int
+	noOpen   bool
+}
+
+func (f *fakeAppender) JoinOpenBatch(
+	ctx context.Context,
+	item capture.Capture,
+	quiet time.Duration,
+) (capture.AppendResult, bool, error) {
+	f.joinOnly++
+	if f.noOpen {
+		f.got, f.quiet = item, quiet
+
+		return capture.AppendResult{}, false, f.err
+	}
+	res, err := f.AppendFile(ctx, item, quiet)
+
+	return res, err == nil, err
 }
 
 func (f *fakeAppender) AppendFile(
 	_ context.Context,
 	item capture.Capture,
 	quiet time.Duration,
-) (capture.Capture, bool, error) {
+) (capture.AppendResult, error) {
 	f.got, f.quiet = item, quiet
 	if f.err != nil {
-		return capture.Capture{}, false, f.err
+		return capture.AppendResult{}, f.err
 	}
 	f.nextID++
 	item.ID = f.nextID
 
-	return item, f.created, nil
+	return capture.AppendResult{Capture: item, Created: f.created, DeadlineMoved: f.moved}, nil
 }
 
 func fileItem() pipeline.FileItem {
@@ -54,9 +74,10 @@ func newFileIngester(t *testing.T, app *fakeAppender, w *fakeWaker) *pipeline.In
 }
 
 func TestIngestFileBuildsCollectCapture(t *testing.T) {
-	app, w := &fakeAppender{created: true}, &fakeWaker{}
+	app, w := &fakeAppender{created: true, moved: true}, &fakeWaker{}
 	in := newFileIngester(t, app, w)
 	item := fileItem()
+	item.LocalPath = "files/a.pdf"
 
 	var acked []capture.Capture
 	got, err := in.IngestFile(context.Background(), item, func(_ context.Context, c capture.Capture) {
@@ -72,8 +93,9 @@ func TestIngestFileBuildsCollectCapture(t *testing.T) {
 	if c.SourceChatID != item.ChatID || c.SourceMessageID != item.MessageID || c.Source != "telegram" {
 		t.Fatalf("identity = %+v", c)
 	}
-	if want := item.ReceivedAt.Add(3 * time.Second); !c.NextAttemptAt.Equal(want) || app.quiet != 3*time.Second {
-		t.Fatalf("NextAttemptAt = %v quiet = %v, want %v", c.NextAttemptAt, app.quiet, want)
+	// The store owns the deadline (capture.JoinBatch); ingest only passes quiet.
+	if app.quiet != 3*time.Second || !c.ReceivedAt.Equal(item.ReceivedAt) {
+		t.Fatalf("quiet = %v received = %v", app.quiet, c.ReceivedAt)
 	}
 	if len(c.Files) != 1 {
 		t.Fatalf("files = %+v", c.Files)
@@ -81,7 +103,7 @@ func TestIngestFileBuildsCollectCapture(t *testing.T) {
 	f := c.Files[0]
 	if f.Position != 0 || f.State != capture.FilePending || f.Kind != capture.FileDocument ||
 		f.FileID != "FAKE-FILE" || f.MimeType != "application/pdf" || f.FileName != "a.pdf" || f.FileSize != 10 ||
-		f.SourceMessageID != 7 {
+		f.LocalPath != "files/a.pdf" || f.SourceMessageID != 7 {
 		t.Fatalf("file = %+v", f)
 	}
 	if got.ID != 1 || len(acked) != 1 || acked[0].ID != 1 || w.n != 1 {
@@ -89,21 +111,32 @@ func TestIngestFileBuildsCollectCapture(t *testing.T) {
 	}
 }
 
-func TestIngestFileNotCreatedSkipsAck(t *testing.T) {
-	app, w := &fakeAppender{created: false}, &fakeWaker{}
-	in := newFileIngester(t, app, w)
+func TestIngestFileJoinSkipsAckAndWakesOnlyWhenDeadlineMoved(t *testing.T) {
+	for name, tc := range map[string]struct {
+		moved bool
+		wakes int
+	}{
+		"deadline moved": {moved: true, wakes: 1},
+		// The hold was not deferred, so its release does not wake either.
+		"deadline kept": {moved: false, wakes: 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			app, w := &fakeAppender{created: false, moved: tc.moved}, &fakeWaker{}
+			in := newFileIngester(t, app, w)
 
-	acked := false
-	_, err := in.IngestFile(
-		context.Background(),
-		fileItem(),
-		func(context.Context, capture.Capture) { acked = true },
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if acked {
-		t.Fatal("ack ran although no capture was created")
+			acked := false
+			_, err := in.IngestFile(
+				context.Background(),
+				fileItem(),
+				func(context.Context, capture.Capture) { acked = true },
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if acked || w.n != tc.wakes {
+				t.Fatalf("acked=%v wakes=%d, want no ack and %d wakes", acked, w.n, tc.wakes)
+			}
+		})
 	}
 }
 
@@ -163,4 +196,53 @@ func TestIngestFileRequiresConfiguration(t *testing.T) {
 	if _, err := in.IngestFile(context.Background(), fileItem(), nil); err == nil {
 		t.Fatal("want error without WithFiles")
 	}
+}
+
+func TestIngestFileTooLargeAlbumItemIsAppendedFailed(t *testing.T) {
+	app, w := &fakeAppender{created: true, moved: true}, &fakeWaker{}
+	in := newFileIngester(t, app, w)
+	item := fileItem()
+	item.TooLarge = true
+
+	acked := false
+	ack := func(context.Context, capture.Capture) { acked = true }
+	if _, err := in.IngestFile(context.Background(), item, ack); err != nil {
+		t.Fatal(err)
+	}
+	f := app.got.Files[0]
+	if app.joinOnly != 0 || f.State != capture.FileFailed || f.Failure != "too large for Telegram bots" {
+		t.Fatalf("joinOnly=%d file=%+v, want an appended failed file", app.joinOnly, f)
+	}
+	// The album's first item created the batch: it carries the ⏳.
+	if !acked || w.n != 1 {
+		t.Fatalf("acked=%v wakes=%d", acked, w.n)
+	}
+}
+
+func TestIngestFileTooLargeStandaloneItemOnlyJoinsAnOpenBatch(t *testing.T) {
+	t.Run("open batch", func(t *testing.T) {
+		app, w := &fakeAppender{moved: true}, &fakeWaker{}
+		in := newFileIngester(t, app, w)
+		item := fileItem()
+		item.AlbumID, item.TooLarge = "", true
+
+		if _, err := in.IngestFile(context.Background(), item, nil); err != nil {
+			t.Fatal(err)
+		}
+		if app.joinOnly != 1 || app.got.Files[0].State != capture.FileFailed || w.n != 1 {
+			t.Fatalf("joinOnly=%d file=%+v wakes=%d", app.joinOnly, app.got.Files[0], w.n)
+		}
+	})
+	t.Run("no open batch", func(t *testing.T) {
+		app, w := &fakeAppender{noOpen: true}, &fakeWaker{}
+		in := newFileIngester(t, app, w)
+		item := fileItem()
+		item.AlbumID, item.TooLarge = "", true
+
+		acked := false
+		_, err := in.IngestFile(context.Background(), item, func(context.Context, capture.Capture) { acked = true })
+		if !errors.Is(err, pipeline.ErrFileTooLarge) || acked || w.n != 0 {
+			t.Fatalf("err=%v acked=%v wakes=%d, want ErrFileTooLarge, no ack, no wake", err, acked, w.n)
+		}
+	})
 }

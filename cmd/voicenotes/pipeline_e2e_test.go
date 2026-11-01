@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -31,7 +33,9 @@ type e2eWorld struct {
 	mu          sync.Mutex
 	notes       []pipeline.NoteInput
 	attachments []string
-	replies     []string
+	// attached holds each attachment's bytes, which name its file ID.
+	attached []string
+	replies  []string
 }
 
 func (w *e2eWorld) Create(_ context.Context, n pipeline.NoteInput) (string, string, capture.Outcome) {
@@ -42,10 +46,11 @@ func (w *e2eWorld) Create(_ context.Context, n pipeline.NoteInput) (string, stri
 	return "memos/1", "https://memos.example.org/m/1", capture.OK()
 }
 
-func (w *e2eWorld) Attach(_ context.Context, _, filename, _ string, _ []byte) capture.Outcome {
+func (w *e2eWorld) Attach(_ context.Context, _, filename, _ string, data []byte) capture.Outcome {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.attachments = append(w.attachments, filename)
+	w.attached = append(w.attached, string(data))
 
 	return capture.OK()
 }
@@ -66,8 +71,15 @@ func (w *e2eWorld) Edit(_ context.Context, _, msgID int64, text string) (int64, 
 	return msgID, nil
 }
 
-func (w *e2eWorld) Download(context.Context, string) ([]byte, error) {
-	return []byte("jpeg bytes"), nil
+func (w *e2eWorld) Download(_ context.Context, fileID string) ([]byte, error) {
+	return []byte("jpeg " + fileID), nil
+}
+
+func (w *e2eWorld) attachedData() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return append([]string(nil), w.attached...)
 }
 
 func (w *e2eWorld) snapshot() (notes []pipeline.NoteInput, attachments, replies []string) {
@@ -171,5 +183,130 @@ func TestPhotoFlowsFromHandlerToSavedNote(t *testing.T) {
 	}
 	if replies[0] != "⏳" {
 		t.Errorf("first reply = %q, want the hourglass acknowledgement", replies[0])
+	}
+}
+
+// photo is one compressed photo of album (empty for a standalone one).
+func photo(id int64, album, caption string) telegram.Message {
+	return telegram.Message{
+		ChatID: 7, ID: id, SenderID: 111, Date: time.Now(),
+		Files: &telegram.FileItem{
+			FileID: fmt.Sprintf("photo-%d", id), MIME: "image/jpeg", Kind: capture.FileImage, Size: 10,
+			Caption: caption, AlbumID: album,
+		},
+	}
+}
+
+// batchConfig leaves room for a slow -race run to deliver a whole send
+// within one quiet period.
+func batchConfig() config.Config {
+	cfg := e2eConfig()
+	cfg.BatchQuietPeriod = 500 * time.Millisecond
+
+	return cfg
+}
+
+// waitForIdle waits until every capture is done and returns the world.
+func (e *e2e) waitForIdle(t *testing.T) (notes []pipeline.NoteInput, attachments, replies []string) {
+	t.Helper()
+	waitFor(t, "an empty queue", func() bool {
+		n, err := e.db.CountUnfinished(t.Context())
+		return err == nil && n == 0
+	})
+
+	return e.world.snapshot()
+}
+
+func count(replies []string, prefix string) int {
+	n := 0
+	for _, r := range replies {
+		if strings.HasPrefix(r, prefix) {
+			n++
+		}
+	}
+
+	return n
+}
+
+// US3 scenario 1-2: one album, one ⏳, one note with every photo in order
+// and the 3rd item's caption as its text.
+func TestAlbumWithCaptionOnThirdItemYieldsOneNote(t *testing.T) {
+	e := startE2E(t, batchConfig(), e2eTranscriber{})
+	for id := int64(1); id <= 4; id++ {
+		caption := ""
+		if id == 3 {
+			caption = "Receipts from the trip"
+		}
+		e.handler.Handle(t.Context(), photo(id, "FAKE-ALBUM-1", caption))
+	}
+
+	notes, _, replies := e.waitForIdle(t)
+	if len(notes) != 1 || !strings.HasPrefix(notes[0].Content, "Receipts from the trip") ||
+		!strings.Contains(notes[0].Content, "📷 4 photos") {
+		t.Fatalf("notes = %+v, want one note with the caption and one hint", notes)
+	}
+	want := []string{"jpeg photo-1", "jpeg photo-2", "jpeg photo-3", "jpeg photo-4"}
+	if got := e.world.attachedData(); !slices.Equal(got, want) {
+		t.Errorf("attachments = %q, want %q", got, want)
+	}
+	if count(replies, "⏳") != 1 || count(replies, "✓ saved") != 1 {
+		t.Errorf("replies = %q, want one ⏳ edited into one saved reply", replies)
+	}
+}
+
+// US3 scenario 7: 15 photos arrive as two albums and still make one note.
+func TestFifteenPhotosAcrossTwoAlbumsYieldOneNote(t *testing.T) {
+	e := startE2E(t, batchConfig(), e2eTranscriber{})
+	for id := int64(1); id <= 15; id++ {
+		album := "FAKE-ALBUM-1"
+		if id > 10 {
+			album = "FAKE-ALBUM-2"
+		}
+		e.handler.Handle(t.Context(), photo(id, album, ""))
+	}
+
+	notes, attachments, replies := e.waitForIdle(t)
+	if len(notes) != 1 || len(attachments) != 15 {
+		t.Fatalf("%d notes, %d attachments; want 1 note with 15", len(notes), len(attachments))
+	}
+	if count(replies, "⏳") != 1 || count(replies, "✓ saved") != 1 {
+		t.Errorf("replies = %q, want one ⏳ and one saved reply", replies)
+	}
+}
+
+// US3 scenario 9: a voice message within the quiet period never joins the
+// photo's batch.
+func TestPhotoThenVoiceYieldTwoNotes(t *testing.T) {
+	e := startE2E(t, batchConfig(), voiceTranscriber{text: "buy milk"})
+	e.handler.Handle(t.Context(), photo(1, "", ""))
+	e.handler.Handle(t.Context(), voiceMessage(2))
+
+	notes, attachments, replies := e.waitForIdle(t)
+	if len(notes) != 2 || len(attachments) != 2 {
+		t.Fatalf("%d notes, %d attachments; want 2 notes with one each", len(notes), len(attachments))
+	}
+	if count(replies, "⏳") != 2 || count(replies, "✓ saved") != 2 {
+		t.Errorf("replies = %q, want a ⏳ and a saved reply per note", replies)
+	}
+}
+
+// US3 scenario 6: an album item over the download limit is kept as failed;
+// the note keeps the others and the reply names it.
+func TestAlbumKeepsOtherItemsWhenOneIsTooLarge(t *testing.T) {
+	e := startE2E(t, batchConfig(), e2eTranscriber{})
+	for id := int64(1); id <= 4; id++ {
+		m := photo(id, "FAKE-ALBUM-1", "")
+		if id == 2 {
+			m.Files.Size = telegram.MaxFileSize + 1
+		}
+		e.handler.Handle(t.Context(), m)
+	}
+
+	notes, attachments, replies := e.waitForIdle(t)
+	if len(notes) != 1 || len(attachments) != 3 {
+		t.Fatalf("%d notes, %d attachments; want 1 note with 3", len(notes), len(attachments))
+	}
+	if count(replies, "⏳") != 1 || count(replies, "⚠ saved, 1 of 4 not kept — too large for Telegram bots") != 1 {
+		t.Errorf("replies = %q, want one ⏳ and a reply naming the item not kept", replies)
 	}
 }

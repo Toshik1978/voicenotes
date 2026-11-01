@@ -23,10 +23,14 @@ import (
 
 // Store is the slice of the capture queue the worker needs. NextDue returns
 // the lowest-ID due capture of the lane, else the lane's earliest wake time
-// (capture.Due).
+// (capture.Due). AdvanceCollect saves next, the collect step's result for
+// read, only while the stored batch is still at collect with read's
+// next_attempt_at and file count; false means a batch join landed since
+// read and nothing was written.
 type Store interface {
 	NextDue(ctx context.Context, now time.Time, lane capture.Lane) (capture.Due, error)
 	Update(ctx context.Context, c capture.Capture) error
+	AdvanceCollect(ctx context.Context, read, next capture.Capture) (bool, error)
 }
 
 // Clock is the worker's time source. After returns a channel that receives
@@ -101,6 +105,10 @@ type Worker struct {
 	// retried before any new step runs, so a completed step is never re-run
 	// because of a store failure (Constitution VI). Only Run touches it.
 	pending *capture.Capture
+	// pendingRead is the capture a pending collect result was computed
+	// from: the result is saved only while the batch is unchanged, since a
+	// file item may join it while collect runs. Nil for every other step.
+	pendingRead *capture.Capture
 	// failures counts consecutive store errors for the retry backoff.
 	failures int
 }
@@ -194,13 +202,19 @@ func keyOf(c capture.Capture) sourceKey {
 type ackHold struct {
 	key   sourceKey
 	until time.Time
+	// deferred is set when the worker skipped a due capture because of
+	// this hold, so release must wake it. Guarded by holdsMu.
+	deferred bool
 }
 
 // HoldAck keeps the worker off the capture with c's source identity while
 // its acknowledgement is in flight, so finalize_reply edits that reply
 // instead of sending a second one (FR-025). Call it before the insert, so no
-// scan sees the row unheld. The hold ends when release is called (which
-// wakes the worker) or after AckHoldLimit. Holds live only in memory, so a
+// scan sees the row unheld. The hold ends when release is called or after
+// AckHoldLimit. Release wakes the worker only if it deferred the capture
+// meanwhile: otherwise nothing waits on the hold, and the caller wakes the
+// worker itself when there is new work (a file item that joined a batch
+// without moving its deadline must not wake it). Holds live only in memory, so a
 // restart cannot leave a capture blocked.
 func (w *Worker) HoldAck(c capture.Capture) (release func()) {
 	h := &ackHold{key: keyOf(c), until: w.clock.Now().Add(AckHoldLimit)}
@@ -211,8 +225,11 @@ func (w *Worker) HoldAck(c capture.Capture) (release func()) {
 	return func() {
 		w.holdsMu.Lock()
 		delete(w.holds, h)
+		deferred := h.deferred
 		w.holdsMu.Unlock()
-		w.Wake()
+		if deferred {
+			w.Wake()
+		}
 	}
 }
 
@@ -294,6 +311,9 @@ func (w *Worker) step(ctx context.Context, c capture.Capture) time.Duration {
 		zap.Int64("capture", c.ID), zap.Stringer("step", c.Step),
 		zap.Stringer("outcome", out.Class), zap.String("reason", out.Reason))
 	w.pending = &res
+	if c.Step == capture.StepCollect {
+		w.pendingRead = &c
+	}
 	if d := w.persist(ctx); d != 0 || !res.QueueReplyEdit || w.notify == nil {
 		return d
 	}
@@ -332,17 +352,30 @@ func (w *Worker) run(ctx context.Context, c capture.Capture) (capture.Capture, c
 }
 
 // persist writes the pending result. On failure it keeps the result and
-// asks for a backoff before retrying.
+// asks for a backoff before retrying. A collect result whose batch changed
+// meanwhile is dropped unsaved: the next iteration re-reads the batch and
+// runs collect again once it is due.
 func (w *Worker) persist(ctx context.Context) time.Duration {
-	if err := w.store.Update(ctx, *w.pending); err != nil {
-		return w.storeFailed(ctx, "update", err)
+	saved := true
+	if w.pendingRead == nil {
+		if err := w.store.Update(ctx, *w.pending); err != nil {
+			return w.storeFailed(ctx, "update", err)
+		}
+	} else {
+		var err error
+		if saved, err = w.store.AdvanceCollect(ctx, *w.pendingRead, *w.pending); err != nil {
+			return w.storeFailed(ctx, "advance collect", err)
+		}
+		if !saved {
+			w.log.Debug("batch changed during collect, re-reading", zap.Int64("capture", w.pending.ID))
+		}
 	}
-	if capture.LaneOf(*w.pending) != w.lane {
+	if saved && capture.LaneOf(*w.pending) != w.lane {
 		for _, p := range w.peers {
 			p.Wake()
 		}
 	}
-	w.pending = nil
+	w.pending, w.pendingRead = nil, nil
 	w.failures = 0
 	w.storeDown.Store(false)
 
@@ -382,7 +415,8 @@ func (w *Worker) sleep(ctx context.Context, d time.Duration) bool {
 	return true
 }
 
-// heldFor returns how long c is still held, or 0 when it is free.
+// heldFor returns how long c is still held, or 0 when it is free. Every
+// hold that keeps c back is marked deferred, so its release wakes the worker.
 func (w *Worker) heldFor(c capture.Capture, now time.Time) time.Duration {
 	w.holdsMu.Lock()
 	defer w.holdsMu.Unlock()
@@ -390,7 +424,8 @@ func (w *Worker) heldFor(c capture.Capture, now time.Time) time.Duration {
 	var d time.Duration
 	key := keyOf(c)
 	for h := range w.holds {
-		if h.key == key {
+		if h.key == key && h.until.After(now) {
+			h.deferred = true
 			d = max(d, h.until.Sub(now))
 		}
 	}

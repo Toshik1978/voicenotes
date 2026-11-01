@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -735,10 +737,14 @@ func TestPurgeDoneCascadesFiles(t *testing.T) {
 }
 
 func fileItemCapture(msgID int64, caption string) capture.Capture {
-	c, _ := capture.New(capture.KindFiles, capture.StepCollect, ts0())
+	return fileItemAt(msgID, caption, "", ts0())
+}
+
+// fileItemAt is a one-file item received at at; the store sets its deadline.
+func fileItemAt(msgID int64, caption, album string, at time.Time) capture.Capture {
+	c, _ := capture.New(capture.KindFiles, capture.StepCollect, at)
 	c.Source, c.SourceChatID, c.SourceMessageID = "telegram", -1001234567890, msgID
-	c.Text = caption
-	c.NextAttemptAt = ts0().Add(3 * time.Second)
+	c.Text, c.AlbumID = caption, album
 	c.Files = []capture.File{{
 		Source: c.Source, SourceChatID: c.SourceChatID, SourceMessageID: msgID,
 		Kind: capture.FileImage, State: capture.FilePending, FileID: "FAKE-FILE",
@@ -751,10 +757,12 @@ func TestAppendFileCreatesCollectCapture(t *testing.T) {
 	ctx := context.Background()
 	s := open(t, t.TempDir())
 
-	got, created, err := s.AppendFile(ctx, fileItemCapture(5, "cap"), 3*time.Second)
-	if err != nil || !created {
-		t.Fatalf("created=%v err=%v", created, err)
+	s.SetNow(ts0)
+	res, err := s.AppendFile(ctx, fileItemCapture(5, "cap"), 3*time.Second)
+	if err != nil || !res.Created || !res.DeadlineMoved {
+		t.Fatalf("result=%+v err=%v", res, err)
 	}
+	got := res.Capture
 	if got.ID == 0 || got.Files[0].ID == 0 || got.Files[0].CaptureID != got.ID || got.Files[0].Position != 0 {
 		t.Fatalf("IDs not assigned: %+v", got)
 	}
@@ -774,25 +782,373 @@ func TestAppendFileRedeliveryIsDuplicate(t *testing.T) {
 	ctx := context.Background()
 	s := open(t, t.TempDir())
 
-	if _, _, err := s.AppendFile(ctx, fileItemCapture(5, ""), time.Second); err != nil {
+	if _, err := s.AppendFile(ctx, fileItemCapture(5, ""), time.Second); err != nil {
 		t.Fatal(err)
 	}
 	// Same identity: both the capture and the file UNIQUE constraints apply.
-	_, created, err := s.AppendFile(ctx, fileItemCapture(5, ""), time.Second)
-	if !errors.Is(err, sqlite.ErrDuplicate) || created {
-		t.Fatalf("created=%v err=%v, want ErrDuplicate", created, err)
+	res, err := s.AppendFile(ctx, fileItemCapture(5, ""), time.Second)
+	if !errors.Is(err, sqlite.ErrDuplicate) || res.Created {
+		t.Fatalf("created=%v err=%v, want ErrDuplicate", res.Created, err)
 	}
 	// A new capture identity whose file identity was already stored.
 	other := fileItemCapture(6, "")
 	other.Files[0].SourceMessageID = 5
-	if _, _, err := s.AppendFile(ctx, other, time.Second); !errors.Is(err, sqlite.ErrDuplicate) {
+	if _, err := s.AppendFile(ctx, other, time.Second); !errors.Is(err, sqlite.ErrDuplicate) {
 		t.Fatalf("want ErrDuplicate via the file constraint, got %v", err)
 	}
 	if n, err := s.CountUnfinished(ctx); err != nil || n != 1 {
 		t.Fatalf("unfinished = %d err=%v", n, err)
 	}
 	// The connection is usable after the rolled-back transaction.
-	if _, _, err := s.AppendFile(ctx, fileItemCapture(7, ""), time.Second); err != nil {
+	if _, err := s.AppendFile(ctx, fileItemCapture(7, ""), time.Second); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// appended is one AppendFile result, with short names for the assertions.
+type appended struct {
+	c              capture.Capture
+	created, moved bool
+}
+
+// appendItem appends item with the store clock set to item.ReceivedAt, so
+// each call reads as "this item arrives now".
+func appendItem(t *testing.T, s *sqlite.DB, item capture.Capture, quiet time.Duration) appended {
+	t.Helper()
+
+	s.SetNow(func() time.Time { return item.ReceivedAt })
+	res, err := s.AppendFile(context.Background(), item, quiet)
+	if err != nil {
+		t.Fatalf("AppendFile(%d): %v", item.SourceMessageID, err)
+	}
+
+	return appended{res.Capture, res.Created, res.DeadlineMoved}
+}
+
+func TestAppendFileConcurrentAppendsYieldOneBatch(t *testing.T) {
+	s := open(t, t.TempDir())
+	s.SetNow(ts0)
+	const n = 8
+
+	var (
+		wg      sync.WaitGroup
+		created atomic.Int32
+		errs    = make(chan error, n)
+	)
+	for i := range n {
+		wg.Go(func() {
+			res, err := s.AppendFile(context.Background(), fileItemAt(int64(100+i), "", "", ts0()), 3*time.Second)
+			if err != nil {
+				errs <- err
+
+				return
+			}
+			if res.Created {
+				created.Add(1)
+			}
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+
+	if created.Load() != 1 {
+		t.Fatalf("captures created = %d, want 1", created.Load())
+	}
+	read, ok, err := s.OldestUnfinished(context.Background())
+	if err != nil || !ok {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	if cnt, err := s.CountUnfinished(context.Background()); err != nil || cnt != 1 || len(read.Files) != n {
+		t.Fatalf("unfinished=%d files=%d err=%v", cnt, len(read.Files), err)
+	}
+	for i, f := range read.Files {
+		if f.Position != i || f.CaptureID != read.ID {
+			t.Fatalf("file %d = %+v", i, f)
+		}
+	}
+}
+
+func TestAppendFileJoinsOpenBatch(t *testing.T) {
+	s := open(t, t.TempDir())
+
+	first := appendItem(t, s, fileItemAt(1, "one", "", ts0()), 3*time.Second)
+	second := appendItem(t, s, fileItemAt(2, "", "", ts0().Add(time.Second)), 3*time.Second)
+	third := appendItem(t, s, fileItemAt(3, "three", "", ts0().Add(2*time.Second)), 3*time.Second)
+
+	if !first.created || second.created || third.created || !second.moved || !third.moved {
+		t.Fatalf("results %+v / %+v / %+v", first, second, third)
+	}
+	read, ok, err := s.Get(first.c.ID)
+	if err != nil || !ok {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	if !reflect.DeepEqual(read, third.c) {
+		t.Fatalf("returned differs from stored\n got %+v\nwant %+v", third.c, read)
+	}
+	if read.Text != "one\n\nthree" || !read.NextAttemptAt.Equal(ts0().Add(5*time.Second)) || len(read.Files) != 3 {
+		t.Fatalf("batch = %+v", read)
+	}
+	if read.Files[2].Position != 2 || read.Files[2].SourceMessageID != 3 || read.Files[2].ID == 0 {
+		t.Fatalf("joined file = %+v", read.Files[2])
+	}
+}
+
+func TestAppendFileJoinNeverShortensDeadline(t *testing.T) {
+	s := open(t, t.TempDir())
+
+	first := appendItem(t, s, fileItemAt(1, "", "", ts0()), 10*time.Second)
+	joined := appendItem(t, s, fileItemAt(2, "", "", ts0().Add(time.Second)), 3*time.Second)
+	if joined.created || joined.moved {
+		t.Fatalf("created=%v moved=%v, want a join that keeps the deadline", joined.created, joined.moved)
+	}
+	read, _, err := s.Get(first.c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := ts0().Add(10 * time.Second); !read.NextAttemptAt.Equal(want) || !joined.c.NextAttemptAt.Equal(want) {
+		t.Fatalf("deadline stored %v returned %v, want %v", read.NextAttemptAt, joined.c.NextAttemptAt, want)
+	}
+}
+
+func TestAppendFileAfterDeadlineStartsNewBatch(t *testing.T) {
+	s := open(t, t.TempDir())
+
+	first := appendItem(t, s, fileItemAt(1, "", "", ts0()), 3*time.Second)
+	late := appendItem(t, s, fileItemAt(2, "", "", ts0().Add(3*time.Second)), 3*time.Second)
+	if !late.created || !late.moved || late.c.ID == first.c.ID || late.c.Files[0].Position != 0 {
+		t.Fatalf("late item = %+v created=%v", late.c, late.created)
+	}
+	if !late.c.NextAttemptAt.Equal(ts0().Add(6 * time.Second)) {
+		t.Fatalf("NextAttemptAt = %v", late.c.NextAttemptAt)
+	}
+}
+
+func TestAppendFileSameAlbumJoinsLateWithinCollect(t *testing.T) {
+	s := open(t, t.TempDir())
+
+	first := appendItem(t, s, fileItemAt(1, "", "alb", ts0()), 3*time.Second)
+	late := appendItem(t, s, fileItemAt(2, "", "alb", ts0().Add(10*time.Second)), 3*time.Second)
+	if late.created || !late.moved || late.c.ID != first.c.ID || len(late.c.Files) != 2 {
+		t.Fatalf("late album item = %+v created=%v moved=%v", late.c, late.created, late.moved)
+	}
+	if !late.c.NextAttemptAt.Equal(ts0().Add(13 * time.Second)) {
+		t.Fatalf("NextAttemptAt = %v", late.c.NextAttemptAt)
+	}
+	// Another album, late, opens its own batch.
+	other := appendItem(t, s, fileItemAt(3, "", "other", ts0().Add(20*time.Second)), 3*time.Second)
+	if !other.created {
+		t.Fatal("a different late album joined")
+	}
+}
+
+func TestAppendFileOnlyJoinsSameChatAtCollect(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+
+	first := appendItem(t, s, fileItemAt(1, "", "", ts0()), 3*time.Second)
+	otherChat := fileItemAt(2, "", "", ts0())
+	otherChat.SourceChatID = -1009999999999
+	otherChat.Files[0].SourceChatID = otherChat.SourceChatID
+	if got := appendItem(t, s, otherChat, 3*time.Second); !got.created {
+		t.Fatal("an item from another chat joined")
+	}
+
+	moved := first.c
+	moved.Step = capture.StepExtract
+	if err := s.Update(ctx, moved); err != nil {
+		t.Fatal(err)
+	}
+	if got := appendItem(t, s, fileItemAt(3, "", "", ts0().Add(time.Second)), 3*time.Second); !got.created {
+		t.Fatal("an item joined a batch past collect")
+	}
+}
+
+func TestAppendFileJoinedRedeliveryIsDuplicate(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+
+	appendItem(t, s, fileItemAt(1, "", "", ts0()), 3*time.Second)
+	appendItem(t, s, fileItemAt(2, "two", "", ts0().Add(time.Second)), 3*time.Second)
+	s.SetNow(func() time.Time { return ts0().Add(2 * time.Second) })
+	res, err := s.AppendFile(ctx, fileItemAt(2, "two", "", ts0().Add(2*time.Second)), 3*time.Second)
+	if !errors.Is(err, sqlite.ErrDuplicate) || res.Created || res.DeadlineMoved {
+		t.Fatalf("result=%+v err=%v, want ErrDuplicate", res, err)
+	}
+	read, _, err := s.OldestUnfinished(ctx)
+	if err != nil || read.Text != "two" || len(read.Files) != 2 || !read.NextAttemptAt.Equal(ts0().Add(4*time.Second)) {
+		t.Fatalf("batch changed by a duplicate: %+v err=%v", read, err)
+	}
+}
+
+func TestAppendFileRejectsItemWithoutOneFile(t *testing.T) {
+	s := open(t, t.TempDir())
+	item := fileItemCapture(1, "")
+	item.Files = nil
+	if res, err := s.AppendFile(context.Background(), item, time.Second); err == nil || res.Created {
+		t.Fatalf("result=%+v err=%v, want an error", res, err)
+	}
+}
+
+func TestAppendFileDecidesByWallClockNotReceivedAt(t *testing.T) {
+	s := open(t, t.TempDir())
+
+	// A long-delayed delivery: sent an hour ago, arriving now.
+	s.SetNow(ts0)
+	first, err := s.AppendFile(context.Background(), fileItemAt(1, "", "", ts0().Add(-time.Hour)), 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.Capture.NextAttemptAt.Equal(ts0().Add(3 * time.Second)) {
+		t.Fatalf("NextAttemptAt = %v, want now + quiet", first.Capture.NextAttemptAt)
+	}
+	// Sent long after the first, but arriving within its quiet period.
+	s.SetNow(func() time.Time { return ts0().Add(time.Second) })
+	second, err := s.AppendFile(context.Background(), fileItemAt(2, "", "", ts0().Add(time.Hour)), 3*time.Second)
+	if err != nil || second.Created || second.Capture.ID != first.Capture.ID {
+		t.Fatalf("second = %+v err=%v, want a join", second, err)
+	}
+}
+
+// advanced is c as the collect step leaves it.
+func advanced(c capture.Capture) capture.Capture {
+	c.Step, c.NextAttemptAt = capture.StepDownload, ts0().Add(time.Minute)
+
+	return c
+}
+
+func TestAdvanceCollectWritesWhenUnchanged(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+	first := appendItem(t, s, fileItemAt(1, "", "alb", ts0()), 3*time.Second)
+
+	read, _, err := s.Get(first.c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok, err := s.AdvanceCollect(ctx, read, advanced(read))
+	if err != nil || !ok {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	if got, _, _ := s.Get(read.ID); got.Step != capture.StepDownload {
+		t.Fatalf("step = %s, want download", got.Step)
+	}
+	// Past collect, a second attempt finds nothing to advance.
+	if ok, err = s.AdvanceCollect(ctx, read, advanced(read)); err != nil || ok {
+		t.Fatalf("second advance ok=%v err=%v", ok, err)
+	}
+}
+
+func TestAdvanceCollectYieldsToALateJoin(t *testing.T) {
+	for name, tc := range map[string]struct {
+		firstQuiet, joinAt, joinQuiet time.Duration
+		album                         string
+	}{
+		// A late album member moves the deadline.
+		"deadline moved": {3 * time.Second, 10 * time.Second, 3 * time.Second, "alb"},
+		// An in-time member that keeps a later deadline adds only a file.
+		"files changed only": {10 * time.Second, time.Second, 3 * time.Second, ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			s := open(t, t.TempDir())
+			first := appendItem(t, s, fileItemAt(1, "", tc.album, ts0()), tc.firstQuiet)
+
+			read, _, err := s.Get(first.c.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			appendItem(t, s, fileItemAt(2, "", tc.album, ts0().Add(tc.joinAt)), tc.joinQuiet)
+
+			ok, err := s.AdvanceCollect(ctx, read, advanced(read))
+			if err != nil || ok {
+				t.Fatalf("ok=%v err=%v, want a refused advance", ok, err)
+			}
+			got, _, err := s.Get(read.ID)
+			if err != nil || got.Step != capture.StepCollect || len(got.Files) != 2 {
+				t.Fatalf("batch after refused advance = %+v err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestJoinOpenBatchJoinsOnlyAnOpenBatch(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+	s.SetNow(ts0)
+
+	// No open batch: nothing is stored.
+	res, joined, err := s.JoinOpenBatch(ctx, fileItemCapture(1, ""), 3*time.Second)
+	if err != nil || joined || res.Created {
+		t.Fatalf("without a batch: res=%+v joined=%v err=%v", res, joined, err)
+	}
+	if n, cerr := s.CountUnfinished(ctx); cerr != nil || n != 0 {
+		t.Fatalf("unfinished = %d err=%v, want nothing stored", n, cerr)
+	}
+
+	first := appendItem(t, s, fileItemAt(2, "one", "", ts0()), 3*time.Second)
+	s.SetNow(func() time.Time { return ts0().Add(time.Second) })
+	failed := fileItemCapture(3, "")
+	failed.Files[0].State, failed.Files[0].Failure = capture.FileFailed, "too large for Telegram bots"
+	res, joined, err = s.JoinOpenBatch(ctx, failed, 3*time.Second)
+	if err != nil || !joined || res.Created || !res.DeadlineMoved || res.Capture.ID != first.c.ID {
+		t.Fatalf("with a batch: res=%+v joined=%v err=%v", res, joined, err)
+	}
+	read, _, err := s.Get(first.c.ID)
+	if err != nil || len(read.Files) != 2 || read.Files[1].State != capture.FileFailed ||
+		read.Files[1].Failure != "too large for Telegram bots" {
+		t.Fatalf("stored batch = %+v err=%v", read, err)
+	}
+
+	// Past the deadline the batch is no longer open.
+	s.SetNow(func() time.Time { return ts0().Add(time.Hour) })
+	if _, joined, err = s.JoinOpenBatch(ctx, fileItemCapture(4, ""), 3*time.Second); err != nil || joined {
+		t.Fatalf("after the deadline: joined=%v err=%v", joined, err)
+	}
+}
+
+func TestPostponeOpenBatchesPushesOnlyEarlierCollectDeadlines(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+	stale := appendItem(t, s, fileItemAt(1, "", "alb", ts0()), 3*time.Second)
+	text := textCapture(t, 2)
+	if err := s.Insert(ctx, &text); err != nil {
+		t.Fatal(err)
+	}
+	later := appendItem(t, s, fileItemAt(3, "", "", ts0().Add(2*time.Hour)), time.Hour)
+
+	now := ts0().Add(time.Hour)
+	s.SetNow(func() time.Time { return now })
+	n, err := s.PostponeOpenBatches(ctx, 3*time.Second)
+	if err != nil || n != 1 {
+		t.Fatalf("postponed %d err=%v, want 1", n, err)
+	}
+	cases := []struct {
+		id   int64
+		want time.Time
+	}{
+		{stale.c.ID, now.Add(3 * time.Second)},
+		{text.ID, text.NextAttemptAt},
+		{later.c.ID, later.c.NextAttemptAt},
+	}
+	for _, tc := range cases {
+		got, _, gerr := s.Get(tc.id)
+		if gerr != nil || !got.NextAttemptAt.Equal(tc.want) {
+			t.Errorf("capture %d NextAttemptAt = %v err=%v, want %v", tc.id, got.NextAttemptAt, gerr, tc.want)
+		}
+	}
+}
+
+func textCapture(t *testing.T, msgID int64) capture.Capture {
+	t.Helper()
+
+	c, err := capture.New(capture.KindText, capture.StepEnrich, ts0())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Source, c.SourceChatID, c.SourceMessageID, c.Text = "telegram", -1001234567890, msgID, "hi"
+
+	return c
 }

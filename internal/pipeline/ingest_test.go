@@ -58,6 +58,9 @@ func (w *fakeWaker) Wake() {
 func (w *fakeWaker) HoldAck(c capture.Capture) func() {
 	w.note(fmt.Sprintf("hold %s/%d/%d", c.Source, c.SourceChatID, c.SourceMessageID))
 
+	// The real release wakes only when the worker deferred the held
+	// capture; this fake has no worker and never defers, so release is not
+	// a wake.
 	return func() { w.note("release") }
 }
 

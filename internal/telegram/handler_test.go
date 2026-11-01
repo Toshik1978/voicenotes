@@ -103,6 +103,9 @@ type fakeIngester struct {
 	withAck []bool
 	// fileAtInsert records whether the audio file was on disk at insert.
 	fileAtInsert []bool
+	// joined makes IngestFile act as a join into an open batch: stored,
+	// but not created, so the acknowledgement does not run.
+	joined bool
 }
 
 // Ingest mirrors pipeline.Ingester: insert, then the acknowledgement, then
@@ -144,7 +147,7 @@ func (f *fakeIngester) IngestFile(
 		return capture.Capture{}, f.err
 	}
 	c := capture.Capture{ID: 7}
-	if ack != nil {
+	if ack != nil && !f.joined {
 		ack(ctx, c)
 	}
 	f.ev.addf("wake")
@@ -558,21 +561,96 @@ func TestFileSizeFallsBackToDownloaded(t *testing.T) {
 	}
 }
 
-func TestFileTooLargeIsRejected(t *testing.T) {
-	r := newRig(t)
+func standaloneFileMsg(size int64) telegram.Message {
+	m := fileMsg("a.pdf", size)
+	m.Files.AlbumID = ""
 
-	r.handle(t, fileMsg("a.pdf", telegram.MaxFileSize+1))
-
-	wantEvents(t, r, `send "⚠ too large for Telegram bots (max 20 MB) — not saved."`)
+	return m
 }
 
-func TestFileTooLargeDiscoveredAtDownloadIsRejected(t *testing.T) {
+func TestFileJoiningABatchGetsNoAck(t *testing.T) {
 	r := newRig(t)
-	r.dl.err = fmt.Errorf("wrapped: %w", telegram.ErrTooLarge)
+	r.in.joined = true
 
-	r.handle(t, fileMsg("a.pdf", 0))
+	r.handle(t, fileMsg("a.pdf", 1000))
 
-	wantEvents(t, r, `download FAKE-FILE-ID`, `send "⚠ too large for Telegram bots (max 20 MB) — not saved."`)
+	wantEvents(t, r, `download FAKE-FILE-ID`, `ingestfile`, `wake`)
+}
+
+func TestFileTooLargeStandaloneIsRejected(t *testing.T) {
+	for name, tc := range map[string]struct {
+		size  int64
+		dlErr error
+		want  []string
+	}{
+		"reported size": {
+			size: telegram.MaxFileSize + 1,
+			want: []string{`ingestfile`, `send "⚠ too large for Telegram bots (max 20 MB) — not saved."`},
+		},
+		"download error": {
+			dlErr: fmt.Errorf("wrapped: %w", telegram.ErrTooLarge),
+			want: []string{
+				`download FAKE-FILE-ID`, `ingestfile`,
+				`send "⚠ too large for Telegram bots (max 20 MB) — not saved."`,
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newRig(t)
+			r.dl.err = tc.dlErr
+			// No open batch: the ingester stores nothing.
+			r.in.err = pipeline.ErrFileTooLarge
+
+			r.handle(t, standaloneFileMsg(tc.size))
+
+			wantEvents(t, r, tc.want...)
+			if it := r.in.items[0]; !it.TooLarge || it.LocalPath != "" || it.AlbumID != "" {
+				t.Fatalf("item = %+v, want a too-large item with no local file", it)
+			}
+		})
+	}
+}
+
+func TestFileTooLargeInAlbumIsKeptAsFailed(t *testing.T) {
+	for name, tc := range map[string]struct {
+		size  int64
+		dlErr error
+		want  []string
+	}{
+		"reported size": {
+			size: telegram.MaxFileSize + 1,
+			want: []string{`ingestfile`, `send "⏳"`, `reply 7=9001`, `wake`},
+		},
+		"download error": {
+			dlErr: fmt.Errorf("wrapped: %w", telegram.ErrTooLarge),
+			want:  []string{`download FAKE-FILE-ID`, `ingestfile`, `send "⏳"`, `reply 7=9001`, `wake`},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newRig(t)
+			r.dl.err = tc.dlErr
+
+			r.handle(t, fileMsg("a.pdf", tc.size))
+
+			wantEvents(t, r, tc.want...)
+			it := r.in.items[0]
+			if !it.TooLarge || it.LocalPath != "" || it.AlbumID != "FAKE-ALBUM" || it.FileID != "FAKE-FILE-ID" {
+				t.Fatalf("item = %+v, want a too-large album item", it)
+			}
+		})
+	}
+}
+
+func TestFileTooLargeJoiningOpenBatchIsKeptWithoutAck(t *testing.T) {
+	r := newRig(t)
+	r.in.joined = true
+
+	r.handle(t, standaloneFileMsg(telegram.MaxFileSize+1))
+
+	wantEvents(t, r, `ingestfile`, `wake`)
+	if it := r.in.items[0]; !it.TooLarge {
+		t.Fatalf("item = %+v", it)
+	}
 }
 
 func TestFileDownloadFailureIngestsWithoutLocalPath(t *testing.T) {

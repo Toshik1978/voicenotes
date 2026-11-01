@@ -6,6 +6,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"embed"
 	"errors"
 	"fmt"
@@ -55,14 +56,25 @@ type Store interface {
 	// AppendFile adds one incoming file item to the chat's open batch, or
 	// starts a new one, in a single BEGIN IMMEDIATE transaction (research
 	// R3). item is a new files capture at collect holding that one file.
-	// It returns the stored capture and whether it was created. In this
-	// phase it always creates; batch joining arrives with T022. It returns
+	// capture.JoinBatch decides join or new at the wall-clock now with quiet
+	// and sets the batch deadline. The result holds the stored batch,
+	// whether it was created, and whether its deadline moved later, so the
+	// caller wakes the worker only then. It returns
 	// ErrDuplicate if the item's identity was already stored.
 	AppendFile(
 		ctx context.Context,
 		item capture.Capture,
 		quiet time.Duration,
-	) (stored capture.Capture, created bool, err error)
+	) (capture.AppendResult, error)
+	// JoinOpenBatch is AppendFile that never starts a batch: it adds item
+	// only when capture.JoinBatch joins it to the chat's open batch, and
+	// otherwise stores nothing and reports joined false. A file over the
+	// Telegram download limit uses it, since alone it is rejected.
+	JoinOpenBatch(
+		ctx context.Context,
+		item capture.Capture,
+		quiet time.Duration,
+	) (res capture.AppendResult, joined bool, err error)
 	// NextDue is due-first within a lane (FR-114a): it returns, with OK
 	// true, the lowest-ID unfinished capture of the lane whose NextAttemptAt
 	// is not after now; a capture that is not due never blocks later ones.
@@ -76,6 +88,14 @@ type Store interface {
 	// identity, kind and position are never changed. A zero ReplyMessageID keeps the stored one: a
 	// worker copy read before ingest recorded the reply must not erase it.
 	Update(ctx context.Context, c capture.Capture) error
+	// AdvanceCollect is Update for the collect step's result next, as a
+	// compare-and-set against read, the capture the worker ran collect on:
+	// it writes only while the row is still at collect with read's
+	// next_attempt_at and file count. It returns false, writing nothing,
+	// when a batch join landed since read (or the row is gone), so the
+	// worker re-reads instead of dropping the joined file's caption and
+	// deadline.
+	AdvanceCollect(ctx context.Context, read, next capture.Capture) (bool, error)
 	// SetReplyMessageID records the reply to edit, touching no other
 	// column, so it cannot race the worker's step updates. A reply already
 	// recorded is kept. It returns ErrNotFound if id does not exist.
@@ -96,6 +116,8 @@ var migrationsFS embed.FS
 // DB is the SQLite-backed implementation of Store.
 type DB struct {
 	db *sql.DB
+	// now is the wall clock batching decides by.
+	now func() time.Time
 }
 
 var _ Store = (*DB)(nil)
@@ -117,7 +139,7 @@ func Open(dataDir string) (*DB, error) {
 		return nil, err
 	}
 
-	return &DB{db: db}, nil
+	return &DB{db: db, now: time.Now}, nil
 }
 
 // dsn is the connection string for $dataDir/voicenotes.db. Pragmas are set
@@ -204,6 +226,23 @@ const (
 	mainLane      = "NOT " + documentsLane
 )
 
+// updateCapture writes every mutable column of a capture.
+const updateCapture = `UPDATE captures SET
+kind=?, received_at=?, album_id=?, text=?,
+language=?, enriched_json=?, llm_skipped=?, failure=?, note_name=?, note_url=?,
+task_count=?, reply_message_id=COALESCE(?, reply_message_id), step=?, status=?, waiting_on=?, attempts=?,
+next_attempt_at=?, updated_at=?, misconfig=?, last_error=?, queue_reply_edit=?,
+minimal_note=?, send_new_reply=?, enrich_started_at=?
+WHERE id=?`
+
+// advanceCollect is updateCapture guarded for AdvanceCollect: the row is
+// still at collect with the deadline and file count the worker read.
+const advanceCollect = updateCapture + " AND step = 'collect' AND next_attempt_at = ?" +
+	" AND (SELECT count(*) FROM capture_files WHERE capture_id = captures.id) = ?"
+
+// errBatchChanged means AdvanceCollect's guard matched no row.
+var errBatchChanged = errors.New("batch changed since read")
+
 // errFileNotInserted means Update was given a file without a row: files are
 // inserted at ingest, never by Update.
 var errFileNotInserted = errors.New("file was never inserted")
@@ -228,38 +267,126 @@ func (s *DB) Insert(ctx context.Context, c *capture.Capture) error {
 }
 
 // AppendFile stores item inside BEGIN IMMEDIATE, so the write lock is taken
-// up front and the join-or-create of T022 can read the open batch in the
-// same transaction. For now it always creates a capture: the file keeps
-// position 0 and the capture is due at its NextAttemptAt, which the caller
-// set to received + quiet. quiet is for the join and is unused until then.
-func (s *DB) AppendFile(ctx context.Context, item capture.Capture, _ time.Duration) (capture.Capture, bool, error) {
-	conn, err := s.db.Conn(ctx)
+// before the open batch is read and concurrent appends serialise (research
+// R3). capture.JoinBatch, applied at the wall-clock now once the lock is
+// held (not item.ReceivedAt, the sender's clock), decides: a join adds
+// the file at the next position, updates the batch text and moves
+// next_attempt_at only when the deadline moved later; otherwise item becomes
+// a new capture due at the decision's deadline. JoinBatch is the single
+// source of truth for that deadline; item.NextAttemptAt is ignored.
+func (s *DB) AppendFile(
+	ctx context.Context, item capture.Capture, quiet time.Duration,
+) (capture.AppendResult, error) {
+	res, _, err := s.appendTx(ctx, item, quiet, false)
+
+	return res, err
+}
+
+// JoinOpenBatch is AppendFile restricted to a join; see Store.
+func (s *DB) JoinOpenBatch(
+	ctx context.Context, item capture.Capture, quiet time.Duration,
+) (capture.AppendResult, bool, error) {
+	return s.appendTx(ctx, item, quiet, true)
+}
+
+// PostponeOpenBatches pushes the deadline of every files capture still at
+// collect to the wall-clock now plus quiet, where it is earlier, and returns
+// how many it moved. Run before the worker starts, it lets parts of an album
+// that Telegram redelivers after a restart join their half batch
+// (quickstart §3).
+func (s *DB) PostponeOpenBatches(ctx context.Context, quiet time.Duration) (int64, error) {
+	deadline := ts(s.now().Add(quiet))
+	res, err := s.db.ExecContext(ctx, "UPDATE captures SET next_attempt_at = ?"+
+		" WHERE kind = 'files' AND step = 'collect' AND status != 'done' AND next_attempt_at < ?",
+		deadline, deadline)
 	if err != nil {
-		return capture.Capture{}, false, fmt.Errorf("sqlite: append file: %w", err)
+		return 0, fmt.Errorf("sqlite: postpone open batches: %w", err)
 	}
-	defer func() { _ = conn.Close() }()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("sqlite: postpone open batches: %w", err)
+	}
 
-	if _, err = conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
-		return capture.Capture{}, false, fmt.Errorf("sqlite: append file: %w", err)
+	return n, nil
+}
+
+// appendFile is AppendFile's body inside the open transaction. It reports
+// whether item was stored: always, unless joinOnly and it would start a
+// batch.
+func appendFile(
+	ctx context.Context, conn *sql.Conn, item capture.Capture, now time.Time, quiet time.Duration,
+	joinOnly bool,
+) (capture.AppendResult, bool, error) {
+	openBatch, err := queryOpenBatch(ctx, conn, item)
+	if err != nil {
+		return capture.AppendResult{}, false, err
 	}
-	committed := false
-	defer func() {
-		if !committed {
-			// Not the request context: a cancelled one must still roll back.
-			_, _ = conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
+
+	d := capture.JoinBatch(openBatch, capture.BatchItem{AlbumID: item.AlbumID, Caption: item.Text},
+		now, quiet)
+	if !d.Join && joinOnly {
+		return capture.AppendResult{}, false, nil
+	}
+	if !d.Join {
+		item.NextAttemptAt, item.Text = d.NextAttemptAt, d.Text
+		item.Files = slices.Clone(item.Files)
+		item.Files[0].Position = 0
+		if insErr := insertCapture(ctx, conn, &item); insErr != nil {
+			return capture.AppendResult{}, false, insErr
 		}
-	}()
 
-	stored := item
-	if insErr := insertCapture(ctx, conn, &stored); insErr != nil {
-		return capture.Capture{}, false, insErr
+		return capture.AppendResult{Capture: item, Created: true, DeadlineMoved: true}, true, nil
 	}
-	if _, err = conn.ExecContext(ctx, "COMMIT"); err != nil {
-		return capture.Capture{}, false, fmt.Errorf("sqlite: append file: %w", err)
-	}
-	committed = true
 
-	return stored, true, nil
+	open := *openBatch
+	f := item.Files[0]
+	f.CaptureID, f.Position = open.ID, d.Position
+	if insErr := insertFile(ctx, conn, &f); insErr != nil {
+		return capture.AppendResult{}, false, insErr
+	}
+	open.Text = d.Text
+	if d.DeadlineMoved {
+		open.NextAttemptAt = d.NextAttemptAt
+	}
+	_, err = conn.ExecContext(ctx, "UPDATE captures SET text=?, next_attempt_at=? WHERE id=?",
+		nullStr(open.Text), ts(open.NextAttemptAt), open.ID)
+	if err != nil {
+		return capture.AppendResult{}, false, fmt.Errorf("sqlite: join batch %d: %w", open.ID, err)
+	}
+	open.Files = append(open.Files, f)
+
+	return capture.AppendResult{Capture: open, DeadlineMoved: d.DeadlineMoved}, true, nil
+}
+
+// queryOpenBatch reads the chat's newest files capture at collect with its
+// files, or nil when there is none.
+func queryOpenBatch(ctx context.Context, conn *sql.Conn, item capture.Capture) (*capture.Capture, error) {
+	open, ok, err := scanCapture(conn.QueryRowContext(ctx, "SELECT "+columns+
+		" FROM captures WHERE kind = 'files' AND step = 'collect' AND status != 'done'"+
+		" AND source = ? AND source_chat_id = ? ORDER BY id DESC LIMIT 1",
+		item.Source, item.SourceChatID))
+	if err != nil || !ok {
+		return nil, err
+	}
+	if open.Files, err = queryFiles(ctx, conn, open.ID); err != nil {
+		return nil, err
+	}
+
+	return &open, nil
+}
+
+// rollback ends conn's open transaction. A failed ROLLBACK may leave the
+// transaction open, so the connection is then discarded rather than
+// returned to the pool.
+func rollback(ctx context.Context, conn *sql.Conn) error {
+	// Not the request context: a cancelled one must still roll back.
+	_, err := conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
+	if err == nil {
+		return nil
+	}
+	_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+
+	return fmt.Errorf("sqlite: append file: rollback: %w", err)
 }
 
 // execer is the part of *sql.Tx and *sql.Conn that inserts need.
@@ -340,43 +467,21 @@ VALUES (?,?,?,?,?, ?,?,?,?,?,?,?,?, ?,?,?,?,?,?)`,
 // transaction. A file's identity, kind and position are fixed at ingest; a
 // file without a row is an error, not an insert.
 func (s *DB) Update(ctx context.Context, c capture.Capture) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("sqlite: update capture %d: %w", c.ID, err)
-	}
-	defer func() { _ = tx.Rollback() }()
+	return s.update(ctx, c, nil)
+}
 
-	res, err := tx.ExecContext(ctx, `UPDATE captures SET
-kind=?, received_at=?, album_id=?, text=?,
-language=?, enriched_json=?, llm_skipped=?, failure=?, note_name=?, note_url=?,
-task_count=?, reply_message_id=COALESCE(?, reply_message_id), step=?, status=?, waiting_on=?, attempts=?,
-next_attempt_at=?, updated_at=?, misconfig=?, last_error=?, queue_reply_edit=?,
-minimal_note=?, send_new_reply=?, enrich_started_at=?
-WHERE id=?`,
-		string(c.Kind), ts(c.ReceivedAt), nullStr(c.AlbumID), nullStr(c.Text),
-		nullStr(c.Language), nullStr(c.EnrichedJSON), nullStr(c.LLMSkipped),
-		nullStr(c.Failure), nullStr(c.NoteName), nullStr(c.NoteURL),
-		c.TaskCount, nullInt(c.ReplyMessageID), string(c.Step), string(c.Status),
-		nullStr(string(c.WaitingOn)), c.Attempts,
-		ts(c.NextAttemptAt), ts(c.UpdatedAt), c.Misconfig, nullStr(c.LastError),
-		c.QueueReplyEdit, c.MinimalNote, c.SendNewReply, nullTS(c.EnrichStartedAt),
-		c.ID)
-	if err != nil {
-		return fmt.Errorf("sqlite: update capture %d: %w", c.ID, err)
+// AdvanceCollect persists next only while the batch is as read left it; see
+// Store. A missing row also reads as changed.
+func (s *DB) AdvanceCollect(ctx context.Context, read, next capture.Capture) (bool, error) {
+	if read.ID != next.ID {
+		return false, fmt.Errorf("sqlite: advance collect: read %d, next %d", read.ID, next.ID)
 	}
-	if err := oneRow(res); err != nil {
-		return fmt.Errorf("sqlite: update capture %d: %w", c.ID, err)
-	}
-	for i := range c.Files {
-		if err := updateFile(ctx, tx, c.ID, &c.Files[i]); err != nil {
-			return err
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("sqlite: update capture %d: %w", c.ID, err)
+	err := s.update(ctx, next, &read)
+	if errors.Is(err, errBatchChanged) {
+		return false, nil
 	}
 
-	return nil
+	return err == nil, err
 }
 
 func updateFile(ctx context.Context, tx *sql.Tx, captureID int64, f *capture.File) error {
@@ -525,6 +630,88 @@ func (s *DB) Close() error {
 	return nil
 }
 
+// appendTx runs appendFile in its BEGIN IMMEDIATE transaction and reports
+// whether item was stored; with joinOnly it is stored only on a join.
+func (s *DB) appendTx(
+	ctx context.Context, item capture.Capture, quiet time.Duration, joinOnly bool,
+) (res capture.AppendResult, stored bool, err error) {
+	if len(item.Files) != 1 {
+		return capture.AppendResult{}, false, fmt.Errorf("sqlite: append file: item holds %d files, want 1",
+			len(item.Files))
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return capture.AppendResult{}, false, fmt.Errorf("sqlite: append file: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if _, err = conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return capture.AppendResult{}, false, fmt.Errorf("sqlite: append file: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			err = errors.Join(err, rollback(ctx, conn))
+		}
+	}()
+
+	res, stored, err = appendFile(ctx, conn, item, s.now(), quiet, joinOnly)
+	if err != nil {
+		return capture.AppendResult{}, false, err
+	}
+	if _, err = conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return capture.AppendResult{}, false, fmt.Errorf("sqlite: append file: %w", err)
+	}
+	committed = true
+
+	return res, stored, nil
+}
+
+// update persists c and its files. With read set it is guarded by
+// advanceCollect and returns errBatchChanged when the guard matches no row.
+func (s *DB) update(ctx context.Context, c capture.Capture, read *capture.Capture) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sqlite: update capture %d: %w", c.ID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	query, args := updateCapture, []any{
+		string(c.Kind), ts(c.ReceivedAt), nullStr(c.AlbumID), nullStr(c.Text),
+		nullStr(c.Language), nullStr(c.EnrichedJSON), nullStr(c.LLMSkipped),
+		nullStr(c.Failure), nullStr(c.NoteName), nullStr(c.NoteURL),
+		c.TaskCount, nullInt(c.ReplyMessageID), string(c.Step), string(c.Status),
+		nullStr(string(c.WaitingOn)), c.Attempts,
+		ts(c.NextAttemptAt), ts(c.UpdatedAt), c.Misconfig, nullStr(c.LastError),
+		c.QueueReplyEdit, c.MinimalNote, c.SendNewReply, nullTS(c.EnrichStartedAt),
+		c.ID,
+	}
+	if read != nil {
+		query, args = advanceCollect, append(args, ts(read.NextAttemptAt), len(read.Files))
+	}
+	res, err := tx.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("sqlite: update capture %d: %w", c.ID, err)
+	}
+	if err := oneRow(res); err != nil {
+		if read != nil && errors.Is(err, ErrNotFound) {
+			return errBatchChanged
+		}
+
+		return fmt.Errorf("sqlite: update capture %d: %w", c.ID, err)
+	}
+	for i := range c.Files {
+		if err := updateFile(ctx, tx, c.ID, &c.Files[i]); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sqlite: update capture %d: %w", c.ID, err)
+	}
+
+	return nil
+}
+
 // queryOne reads the first capture query selects, with its files, in one
 // transaction so the two never disagree.
 func (s *DB) queryOne(ctx context.Context, query string, args ...any) (capture.Capture, bool, error) {
@@ -585,8 +772,13 @@ func scanCapture(row *sql.Row) (capture.Capture, bool, error) {
 	return c, true, nil
 }
 
+// querier is the part of *sql.Tx and *sql.Conn that reading files needs.
+type querier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
 // queryFiles reads a capture's files in position order; nil when it has none.
-func queryFiles(ctx context.Context, tx *sql.Tx, captureID int64) ([]capture.File, error) {
+func queryFiles(ctx context.Context, tx querier, captureID int64) ([]capture.File, error) {
 	rows, err := tx.QueryContext(ctx,
 		"SELECT "+fileColumns+" FROM capture_files WHERE capture_id = ? ORDER BY position", captureID)
 	if err != nil {

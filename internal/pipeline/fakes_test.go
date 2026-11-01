@@ -164,6 +164,32 @@ func (s *fakeStore) Update(_ context.Context, c capture.Capture) error {
 	return nil
 }
 
+// AdvanceCollect mirrors the store's compare-and-set: it writes next only
+// while the row is still at collect with read's deadline and file count.
+func (s *fakeStore) AdvanceCollect(ctx context.Context, read, next capture.Capture) (bool, error) {
+	s.mu.Lock()
+	cur := s.rows[read.ID]
+	stale := cur.Step != capture.StepCollect || !cur.NextAttemptAt.Equal(read.NextAttemptAt) ||
+		len(cur.Files) != len(read.Files)
+	s.mu.Unlock()
+	if stale {
+		return false, nil
+	}
+
+	return true, s.Update(ctx, next)
+}
+
+// join adds f to the batch id and moves its deadline, as a late join does.
+func (s *fakeStore) join(id int64, f capture.File, deadline time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	c := s.rows[id]
+	c.Files = append(slices.Clone(c.Files), f)
+	c.NextAttemptAt = deadline
+	s.rows[id] = c
+}
+
 func (s *fakeStore) Insert(c capture.Capture) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

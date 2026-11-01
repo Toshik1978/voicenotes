@@ -293,3 +293,104 @@ VALUES (?, 'telegram', -1001234567890, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.Fatalf("steps run %v, want %v", counts, wantCounts)
 	}
 }
+
+func TestReopenedDatabaseKeepsHalfReceivedBatch(t *testing.T) {
+	dir := t.TempDir()
+	s, err := sqlite.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := appendItem(t, s, fileItemAt(1, "one", "alb", ts0()), 3*time.Second)
+	appendItem(t, s, fileItemAt(2, "", "alb", ts0().Add(time.Second)), 3*time.Second)
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s = open(t, dir)
+	read, ok, err := s.Get(first.c.ID)
+	if err != nil || !ok || read.Step != capture.StepCollect || len(read.Files) != 2 {
+		t.Fatalf("after reopen: %+v ok=%v err=%v", read, ok, err)
+	}
+	rest := appendItem(t, s, fileItemAt(3, "three", "alb", ts0().Add(2*time.Second)), 3*time.Second)
+	if rest.created || rest.c.ID != first.c.ID || len(rest.c.Files) != 3 || rest.c.Text != "one\n\nthree" {
+		t.Fatalf("rest of the batch after reopen = %+v created=%v", rest.c, rest.created)
+	}
+}
+
+// TestLateJoinDuringCollectReachesTheNextStep drives the real worker: a
+// same-album item joins the batch while the worker runs collect on it, and
+// the next step must still see that file and its caption.
+func TestLateJoinDuringCollectReachesTheNextStep(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+	if _, err := s.AppendFile(ctx, fileItemAt(1, "first", "alb", ts0()), 10*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+
+	var joined atomic.Bool
+	seen := make(chan capture.Capture, 1)
+	hs := handlers(&stepLog{}, "", func() {})
+	hs[capture.StepCollect] = func(ctx context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
+		if joined.CompareAndSwap(false, true) {
+			// The join lands between the worker's read and its save.
+			if _, err := s.AppendFile(ctx, fileItemAt(2, "late", "alb", ts0()), 50*time.Millisecond); err != nil {
+				t.Error(err)
+			}
+		}
+
+		return c, capture.OK()
+	}
+	hs[capture.StepDownload] = func(_ context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
+		select {
+		case seen <- c:
+		default:
+		}
+
+		return c, capture.OK()
+	}
+
+	runCtx, stop := context.WithCancel(ctx)
+	done := runWorker(runCtx, t, s, hs)
+	defer func() { stop(); <-done }()
+
+	select {
+	case c := <-seen:
+		if len(c.Files) != 2 || c.Text != "first\n\nlate" {
+			t.Fatalf("download saw %d files and text %q: the late join was dropped", len(c.Files), c.Text)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the batch never left collect")
+	}
+}
+
+// TestRestartPostponesAHalfReceivedAlbum is quickstart §3: after a long
+// restart the half batch's deadline has passed, so before the worker starts
+// it is pushed to now + quiet and Telegram's redelivered parts still join.
+func TestRestartPostponesAHalfReceivedAlbum(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	s, err := sqlite.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := appendItem(t, s, fileItemAt(1, "one", "alb", ts0()), 3*time.Second)
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s = open(t, dir)
+	now := ts0().Add(time.Hour)
+	s.SetNow(func() time.Time { return now })
+	if _, err = s.PostponeOpenBatches(ctx, 3*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if due, derr := s.NextDue(ctx, now, capture.LaneMain); derr != nil || due.OK {
+		t.Fatalf("the half album is due at once after restart: %+v err=%v", due, derr)
+	}
+	// A redelivered part of the send's second album joins by quiet period
+	// alone.
+	rest := appendItem(t, s, fileItemAt(2, "two", "alb2", now.Add(time.Second)), 3*time.Second)
+	if rest.created || rest.c.ID != first.c.ID || len(rest.c.Files) != 2 {
+		t.Fatalf("redelivered part = %+v created=%v, want it in the first batch", rest.c, rest.created)
+	}
+}

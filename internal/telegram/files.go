@@ -10,6 +10,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/Toshik1978/voicenotes/internal/capture"
 	"github.com/Toshik1978/voicenotes/internal/pipeline"
 )
 
@@ -103,27 +104,28 @@ func filePattern(m Message) string {
 	return fmt.Sprintf("tg-%d-%d-*%s", m.ChatID, m.ID, ext)
 }
 
-// files stores one photo, document or video as a files capture. Like audio
-// it downloads and fsyncs first, then commits the row and sends ⏳. If the
-// file cannot be fetched or written, the item is still committed, with no
-// local path and no reply, and the pipeline's download step fetches it
-// later.
+// files stores one photo, document or video as part of a files capture
+// (a batch). Like audio it downloads and fsyncs first, then commits the item
+// and sends ⏳, which the ingester runs only when the item started a new
+// batch. If the file cannot be fetched or written, the item is still
+// committed, with no local path and no reply, and the pipeline's download
+// step fetches it later. A file over the download limit is kept in its batch
+// as failed (see tooLargeFile).
 func (h *Handler) files(ctx context.Context, m Message) {
-	if m.Files.Size > MaxFileSize {
-		h.tooLarge(ctx, m)
-
-		return
-	}
-
 	item := pipeline.FileItem{
 		Source: Source, ChatID: m.ChatID, MessageID: m.ID, ReceivedAt: m.Date,
 		Kind: m.Files.Kind, FileID: m.Files.FileID, MimeType: m.Files.MIME,
 		Name: m.Files.Name, Size: m.Files.Size, Caption: m.Files.Caption, AlbumID: m.Files.AlbumID,
 	}
+	if m.Files.Size > MaxFileSize {
+		h.tooLargeFile(ctx, m, item)
+
+		return
+	}
 
 	data, err := h.dl.Download(ctx, m.Files.FileID)
 	if errors.Is(err, ErrTooLarge) {
-		h.tooLarge(ctx, m)
+		h.tooLargeFile(ctx, m, item)
 
 		return
 	}
@@ -153,10 +155,35 @@ func (h *Handler) files(ctx context.Context, m Message) {
 	}
 }
 
+// tooLargeFile handles a file over the download limit (research R11). One
+// with an album ID, or one that joins the chat's open batch, is stored in
+// the batch as a failed file, so the note keeps the rest and the reply names
+// it (FR-126). A standalone one is stored nowhere and gets TextTooLarge, as
+// for audio.
+func (h *Handler) tooLargeFile(ctx context.Context, m Message, item pipeline.FileItem) {
+	item.TooLarge = true
+	stored, err := h.ingester.IngestFile(ctx, item, h.ack(m))
+	if errors.Is(err, pipeline.ErrFileTooLarge) {
+		h.tooLarge(ctx, m)
+
+		return
+	}
+	h.ingestFileResult(ctx, m, item, stored, err)
+}
+
 // ingestFile stores item and reports whether it was newly stored, with the
 // same duplicate and failure handling as ingest.
 func (h *Handler) ingestFile(ctx context.Context, m Message, item pipeline.FileItem, ack pipeline.Ack) bool {
 	stored, err := h.ingester.IngestFile(ctx, item, ack)
+
+	return h.ingestFileResult(ctx, m, item, stored, err)
+}
+
+// ingestFileResult logs IngestFile's outcome, asks the sender to resend on
+// a store failure and reports whether the item was newly stored.
+func (h *Handler) ingestFileResult(
+	ctx context.Context, m Message, item pipeline.FileItem, stored capture.Capture, err error,
+) bool {
 	switch {
 	case errors.Is(err, pipeline.ErrDuplicate):
 		h.log.Info("duplicate delivery ignored", zap.Int64("chat", m.ChatID), zap.Int64("message", m.ID))

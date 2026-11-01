@@ -251,3 +251,33 @@ func TestWorkerHoldIsBounded(t *testing.T) {
 		t.Fatalf("sends %q, want one new ✓ saved reply", sends)
 	}
 }
+
+// Release wakes the worker only when it actually deferred the held capture:
+// otherwise nothing waits on the hold, and a file item that joined a batch
+// without moving its deadline must not wake it.
+func TestHoldReleaseWakesOnlyWhenTheWorkerDeferred(t *testing.T) {
+	c := telegramText(t)
+	for name, deferred := range map[string]bool{"deferred": true, "not deferred": false} {
+		t.Run(name, func(t *testing.T) {
+			clock := newFakeClock(t0())
+			w := newWorker(
+				t,
+				newFakeStore(),
+				clock,
+				allSteps(func(_ context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
+					return c, capture.OK()
+				}),
+			)
+			release := w.HoldAck(c)
+			if deferred {
+				if d := w.HeldFor(c, clock.Now()); d != pipeline.AckHoldLimit {
+					t.Fatalf("held for %v, want %v", d, pipeline.AckHoldLimit)
+				}
+			}
+			release()
+			if got := w.WakePending(); got != deferred {
+				t.Fatalf("wake pending = %v, want %v", got, deferred)
+			}
+		})
+	}
+}

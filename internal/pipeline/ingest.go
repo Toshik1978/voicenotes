@@ -22,15 +22,25 @@ type Inserter interface {
 }
 
 // FileAppender is the slice of the capture queue file ingest needs.
-// AppendFile stores item, a files capture at collect holding one file, and
-// reports whether a capture was created. Duplicates are signalled like
+// AppendFile stores item, a files capture at collect holding one file, by
+// joining the chat's open batch or starting one; it owns the batch deadline
+// (capture.JoinBatch with quiet). It reports whether a capture was created
+// and whether the batch deadline moved later. Duplicates are signalled like
 // Inserter's.
 type FileAppender interface {
 	AppendFile(
 		ctx context.Context,
 		item capture.Capture,
 		quiet time.Duration,
-	) (stored capture.Capture, created bool, err error)
+	) (capture.AppendResult, error)
+	// JoinOpenBatch is AppendFile that never starts a batch: it stores
+	// item only when it joins the chat's open batch, and otherwise stores
+	// nothing and reports joined false.
+	JoinOpenBatch(
+		ctx context.Context,
+		item capture.Capture,
+		quiet time.Duration,
+	) (res capture.AppendResult, joined bool, err error)
 }
 
 // Waker is the worker as ingest sees it; *Worker implements it.
@@ -61,8 +71,8 @@ type Ingester struct {
 // IngesterOption configures optional ingest features.
 type IngesterOption func(*Ingester)
 
-// WithFiles enables IngestFile: items are appended through files and a new
-// batch is due quiet after its first item arrived.
+// WithFiles enables IngestFile: items are appended through files, which
+// applies quiet as the batch quiet period.
 func WithFiles(files FileAppender, quiet time.Duration) IngesterOption {
 	return func(i *Ingester) { i.files, i.quiet = files, quiet }
 }

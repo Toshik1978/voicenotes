@@ -126,6 +126,15 @@ func build(cfg config.Config, log *zap.Logger, started time.Time) (*service, err
 	if _, serr := pipeline.SweepOrphanFiles(context.Background(), filesDir, db, time.Now(), log); serr != nil {
 		log.Warn("orphan file sweep skipped", zap.Error(serr))
 	}
+	// Before the workers start (quickstart §3): a batch left collecting by a
+	// restart must not be picked before Telegram redelivers its other parts.
+	// Best effort: without it the batch may split into two notes, losing
+	// nothing.
+	if n, perr := db.PostponeOpenBatches(context.Background(), cfg.BatchQuietPeriod); perr != nil {
+		log.Warn("postponing open batches failed", zap.Error(perr))
+	} else if n > 0 {
+		log.Info("postponed open batches after restart", zap.Int64("batches", n))
+	}
 	svc, err := wire(cfg, log, db, filesDir, started)
 	if err != nil {
 		_ = db.Close()

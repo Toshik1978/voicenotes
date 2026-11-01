@@ -209,12 +209,12 @@ packages are in `internal/` (see plan.md Structure). `COVERPKG` stays unchanged.
 
 **Independent Test**: an album of 4 photos with a caption on the 3rd, 15 photos at once, and two photos 1 s apart each yield one note. A photo followed by a voice message yields two. A restart mid-album loses nothing (quickstart §3).
 
-- [ ] T021 [P] [US3] Implement the batching rule in new `internal/capture/batch.go` (tests in `internal/capture/batch_test.go`), per data-model.md "Batching rule":
+- [x] T021 [P] [US3] Implement the batching rule in new `internal/capture/batch.go` (tests in `internal/capture/batch_test.go`), per data-model.md "Batching rule":
   - `JoinBatch(open *Capture, item BatchItem, now, quiet)` returns join or new.
   - Join when an open `files` capture at `collect` exists and (`open.NextAttemptAt > now` or the album IDs match and are non-empty).
   - On join: `NextAttemptAt = now + quiet`, next position, caption appended with a blank line.
   - Audio and text never batch.
-- [ ] T022 [US3] Join batches in `Store.AppendFile` in `internal/store/sqlite/store.go` (tests in `internal/store/sqlite/store_test.go`, `internal/store/sqlite/restart_test.go`):
+- [x] T022 [US3] Join batches in `Store.AppendFile` in `internal/store/sqlite/store.go` (tests in `internal/store/sqlite/store_test.go`, `internal/store/sqlite/restart_test.go`):
   - Inside `BEGIN IMMEDIATE`, load the chat's newest `files` capture at `collect`, apply `capture.JoinBatch`, then either insert the file row and update the capture's `next_attempt_at`/`text`, or create a new capture.
   - Return whether a capture was created.
   - Tests:
@@ -222,7 +222,7 @@ packages are in `internal/` (see plan.md Structure). `COVERPKG` stays unchanged.
     - an item after the deadline starts a new batch
     - same-album items join even when late within `collect`
     - a reopened database keeps a half-received batch
-- [ ] T023 [US3] Handle batches in `internal/telegram/handler.go` and `internal/pipeline/ingest.go` (tests in `internal/telegram/handler_test.go`, `internal/pipeline/ingest_test.go`):
+- [x] T023 [US3] Handle batches in `internal/telegram/handler.go` and `internal/pipeline/ingest.go` (tests in `internal/telegram/handler_test.go`, `internal/pipeline/ingest_test.go`):
   - ⏳ is sent only when `AppendFile` created the capture.
   - An item over 20 MB that has an album ID, or arrives while the chat has an open batch, is appended as a `failed` file ("too large for Telegram bots") instead of being rejected; a standalone one keeps `TextTooLarge`.
   - End-to-end with fakes:

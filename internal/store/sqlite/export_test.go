@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"time"
 
 	"github.com/Toshik1978/voicenotes/internal/capture"
 )
@@ -56,6 +57,9 @@ func OpenAtVersion(dataDir string, version int) (*sql.DB, error) {
 
 	return db, nil
 }
+
+// SetNow replaces the store's wall clock, which batching decides by.
+func (s *DB) SetNow(now func() time.Time) { s.now = now }
 
 // Get reads one capture by ID, files included.
 func (s *DB) Get(id int64) (capture.Capture, bool, error) {
