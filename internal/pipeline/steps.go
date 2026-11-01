@@ -7,6 +7,7 @@ import (
 	"html"
 	"io/fs"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -78,10 +79,10 @@ type Downloader interface {
 	Download(ctx context.Context, fileID string) ([]byte, error)
 }
 
-// AudioStore holds audio files by name, relative to the audio directory.
+// FileStore holds capture files by name, relative to the files directory.
 // Write is durable and replaces an existing file; Remove of a missing file
 // is not an error.
-type AudioStore interface {
+type FileStore interface {
 	Write(name string, data []byte) error
 	Read(name string) ([]byte, error)
 	Exists(name string) (bool, error)
@@ -101,7 +102,7 @@ type Deps struct {
 	Notes       NotesWriter
 	Replier     Replier
 	Downloader  Downloader
-	Audio       AudioStore
+	Files       FileStore
 	Enricher    Enricher
 	Log         *zap.Logger
 }
@@ -131,8 +132,8 @@ func NewHandlers(d Deps, cfg StepsConfig) (map[capture.Step]Handler, error) {
 		return nil, errors.New("pipeline: nil replier")
 	case d.Downloader == nil:
 		return nil, errors.New("pipeline: nil downloader")
-	case d.Audio == nil:
-		return nil, errors.New("pipeline: nil audio store")
+	case d.Files == nil:
+		return nil, errors.New("pipeline: nil file store")
 	}
 	if d.Log == nil {
 		d.Log = zap.NewNop()
@@ -141,7 +142,7 @@ func NewHandlers(d Deps, cfg StepsConfig) (map[capture.Step]Handler, error) {
 
 	return map[capture.Step]Handler{
 		capture.StepDownload:      s.download,
-		capture.StepTranscribe:    s.transcribe,
+		capture.StepExtract:       s.extract,
 		capture.StepEnrich:        s.enrich,
 		capture.StepWriteNote:     s.writeNote,
 		capture.StepFinalizeReply: s.finalizeReply,
@@ -171,47 +172,26 @@ func (s *stepRunner) log(c capture.Capture, msg string, err error) {
 	s.d.Log.Warn(msg, fields...)
 }
 
-// download stores the audio locally and only then acknowledges with the
-// hourglass. Re-running reuses a file that is already on disk and does not
-// resend the hourglass once a reply id is recorded. A failed hourglass never
-// fails the step: finalize_reply sends a new reply instead.
+// download stores each file locally, one per attempt, and only after the last
+// one acknowledges with the hourglass. Progress is returned while files remain.
+// Re-running reuses a file that is already on disk and does not resend the
+// hourglass once a reply id is recorded. A failed hourglass never fails the
+// step: finalize_reply sends a new reply instead. A file the source refuses
+// for good is marked failed; for an audio capture, which holds that one file,
+// the step fails permanently and the capture degrades to a placeholder note.
 func (s *stepRunner) download(ctx context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
-	have := false
-	if c.AudioPath != "" {
-		ok, err := s.d.Audio.Exists(c.AudioPath)
-		if err != nil {
-			s.log(c, "audio check failed", err)
-
-			return c, capture.Temporary("audio store: " + err.Error())
-		}
-		have = ok
+	c.Files = slices.Clone(c.Files)
+	i, out := s.nextDownload(c)
+	if out.Class != capture.ClassOK {
+		return c, out
 	}
-	if !have {
-		data, err := s.d.Downloader.Download(ctx, c.FileID)
-		if errors.Is(err, ErrFileTooLarge) {
-			s.log(c, "audio too large to download", err)
-			c.AudioPath = "" // nothing is held: the placeholder must say so
-
-			return c, capture.Permanent("audio too large for Telegram bots")
+	if i >= 0 {
+		if out = s.downloadFile(ctx, &c, i); out.Class != capture.ClassOK {
+			return c, out
 		}
-		if errors.Is(err, ErrRejected) {
-			s.log(c, "audio download rejected", err)
-			c.AudioPath = ""
-
-			return c, capture.Permanent("audio unavailable from Telegram")
+		if slices.ContainsFunc(c.Files[i+1:], wantsDownload) {
+			return c, capture.Progress()
 		}
-		if err != nil {
-			s.log(c, "audio download failed", err)
-
-			return c, capture.Temporary("download: " + err.Error()).On(capture.WaitingTelegram)
-		}
-		name := audioName(c)
-		if err := s.d.Audio.Write(name, data); err != nil {
-			s.log(c, "audio write failed", err)
-
-			return c, capture.Temporary("audio store: " + err.Error())
-		}
-		c.AudioPath = name
 	}
 
 	if c.ReplyMessageID == 0 {
@@ -226,56 +206,154 @@ func (s *stepRunner) download(ctx context.Context, c capture.Capture) (capture.C
 	return c, capture.OK()
 }
 
-// transcribe sends the audio to speech-to-text. The language is forced only
-// when exactly one source language is configured; a reported language outside
-// several configured sources is rechecked once. The stored language is the
-// normalised ISO-639-1 code, or empty when unknown. An empty transcript is a
-// result, not an error. A missing audio file is permanent: it cannot be
-// recovered, so the capture degrades to a placeholder note.
-func (s *stepRunner) transcribe(ctx context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
-	data, err := s.d.Audio.Read(c.AudioPath)
-	if errors.Is(err, fs.ErrNotExist) {
-		s.log(c, "audio file missing", err)
-		c.AudioPath = "" // nothing is held: the placeholder must say so
+// wantsDownload reports whether download must make sure f is held locally.
+func wantsDownload(f capture.File) bool { return f.State == capture.FilePending }
 
-		return c, capture.Permanent("audio file missing")
+// nextDownload returns the index of the first file that is still pending and
+// not on disk, or -1 when none is.
+func (s *stepRunner) nextDownload(c capture.Capture) (int, capture.Outcome) {
+	for i := range c.Files {
+		f := c.Files[i]
+		if !wantsDownload(f) {
+			continue
+		}
+		if f.LocalPath == "" {
+			return i, capture.OK()
+		}
+		ok, err := s.d.Files.Exists(f.LocalPath)
+		if err != nil {
+			s.log(c, "file check failed", err)
+
+			return -1, capture.Temporary("file store: " + err.Error())
+		}
+		if !ok {
+			return i, capture.OK()
+		}
+	}
+
+	return -1, capture.OK()
+}
+
+// downloadFile fetches c.Files[i] and stores it durably. A file the source
+// refuses for good is marked failed: permanent for an audio capture, OK (the
+// batch goes on) for the others.
+func (s *stepRunner) downloadFile(ctx context.Context, c *capture.Capture, i int) capture.Outcome {
+	f := &c.Files[i]
+	data, err := s.d.Downloader.Download(ctx, f.FileID)
+	reason := ""
+	switch {
+	case errors.Is(err, ErrFileTooLarge):
+		s.log(*c, "file too large to download", err)
+		reason = "too large for Telegram bots"
+	case errors.Is(err, ErrRejected):
+		s.log(*c, "file download rejected", err)
+		reason = "unavailable from Telegram"
+	case err != nil:
+		s.log(*c, "file download failed", err)
+
+		return capture.Temporary("download: " + err.Error()).On(capture.WaitingTelegram)
+	}
+	if reason != "" {
+		// Nothing is held: the placeholder must say so.
+		f.LocalPath, f.State, f.Failure = "", capture.FileFailed, reason
+		if c.Kind == capture.KindAudio {
+			return capture.Permanent("audio " + reason)
+		}
+
+		return capture.OK()
+	}
+	name := localName(c.ID, *f)
+	if err := s.d.Files.Write(name, data); err != nil {
+		s.log(*c, "file write failed", err)
+
+		return capture.Temporary("file store: " + err.Error())
+	}
+	f.LocalPath = name
+
+	return capture.OK()
+}
+
+// extract turns the pending audio files into text, one per attempt, and
+// returns Progress while any remain. A file already done is not sent again.
+// Once none remain, an audio capture takes its file's text and language, so
+// enrich and render see a voice note as before.
+func (s *stepRunner) extract(ctx context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
+	c.Files = slices.Clone(c.Files)
+	if i := slices.IndexFunc(c.Files, pendingAudio); i >= 0 {
+		if out := s.transcribeFile(ctx, &c, i); out.Class != capture.ClassOK {
+			return c, out
+		}
+		if slices.ContainsFunc(c.Files[i+1:], pendingAudio) {
+			return c, capture.Progress()
+		}
+	}
+	if c.Kind == capture.KindAudio {
+		if i := slices.IndexFunc(c.Files, func(f capture.File) bool { return f.Kind == capture.FileAudio }); i >= 0 {
+			c.Text, c.Language = c.Files[i].Text, c.Files[i].Language
+		}
+	}
+
+	return c, capture.OK()
+}
+
+func pendingAudio(f capture.File) bool {
+	return f.Kind == capture.FileAudio && f.State == capture.FilePending
+}
+
+// transcribeFile sends c.Files[i] to speech-to-text. The language is forced
+// only when exactly one source language is configured; a reported language
+// outside several configured sources is rechecked once. The stored language
+// is the normalised ISO-639-1 code, or empty when unknown. An empty transcript
+// is a result, not an error. A missing file is permanent: it cannot be
+// recovered, so the capture degrades to a placeholder note. A permanent
+// outcome marks the file failed.
+func (s *stepRunner) transcribeFile(ctx context.Context, c *capture.Capture, i int) capture.Outcome {
+	f := &c.Files[i]
+	data, err := s.d.Files.Read(f.LocalPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		s.log(*c, "audio file missing", err)
+		// Nothing is held: the placeholder must say so.
+		f.LocalPath, f.State, f.Failure = "", capture.FileFailed, "audio file missing"
+
+		return capture.Permanent(f.Failure)
 	}
 	if err != nil {
-		s.log(c, "audio read failed", err)
+		s.log(*c, "audio read failed", err)
 
-		return c, capture.Temporary("audio store: " + err.Error())
+		return capture.Temporary("file store: " + err.Error())
 	}
 	forced, isForced := language.Plan(s.cfg.SourceLanguages)
-	req := TranscribeRequest{ID: strconv.FormatInt(c.ID, 10), Ext: path.Ext(c.AudioPath), Audio: data}
+	req := TranscribeRequest{ID: strconv.FormatInt(c.ID, 10), Ext: path.Ext(f.LocalPath), Audio: data}
 	if isForced {
 		req.Language = forced
 	}
 	res, out := s.d.Transcriber.Transcribe(ctx, req)
-	if out.Class != capture.ClassOK {
-		return c, out
-	}
 	// A reported language outside the configured sources is retried once with
 	// the first source. The step's result is persisted only after it returns,
 	// so a restart between the two calls re-runs the whole step rather than
 	// adding a third call; the retry result is final, never checked again.
-	if with, again := language.Recheck(s.cfg.SourceLanguages, res.Language); again {
+	if with, again := language.Recheck(s.cfg.SourceLanguages, res.Language); out.Class == capture.ClassOK && again {
 		req.Language = with
-		if res, out = s.d.Transcriber.Transcribe(ctx, req); out.Class != capture.ClassOK {
-			return c, out
-		}
+		res, out = s.d.Transcriber.Transcribe(ctx, req)
 	}
-	c.Text = res.Text
-	c.Language = ""
+	if out.Class != capture.ClassOK {
+		if out.Class == capture.ClassPermanent {
+			f.State, f.Failure = capture.FileFailed, out.Reason
+		}
+
+		return out
+	}
+	f.Text, f.TextSource, f.Language, f.State = res.Text, capture.TextSTT, "", capture.FileDone
 	reported := res.Language
 	if strings.TrimSpace(reported) == "" {
 		// Nothing reported (json format): a forced language is still known.
 		reported = req.Language
 	}
 	if iso, ok := language.Normalize(reported); ok {
-		c.Language = iso
+		f.Language = iso
 	}
 
-	return c, capture.OK()
+	return capture.OK()
 }
 
 // enrich runs the optional LLM step. Without an Enricher it records
@@ -358,13 +436,41 @@ func (s *stepRunner) noteInput(c capture.Capture) render.Input {
 }
 
 // writeNote renders and creates the note (Create is idempotent through its
-// deterministic memo id) and then attaches the audio (Attach dedupes). The
-// note name is kept even when the attach fails, so a retry resumes there.
-// MinimalNote keeps the raw text (truncated to the limit) and drops the
-// attachment and the LLM output.
+// deterministic memo id) and then attaches the held files, one per attempt
+// (Attach dedupes), returning Progress while any remain. The note name is
+// kept even when an attach fails, so a retry resumes there without creating
+// the note again; each attached file is recorded, so a re-run never sends it
+// twice. MinimalNote keeps the raw text (truncated to the limit) and drops the
+// attachments and the LLM output.
 func (s *stepRunner) writeNote(ctx context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
+	c.Files = slices.Clone(c.Files)
+	if c.NoteName == "" || c.MinimalNote {
+		var out capture.Outcome
+		if c, out = s.createNote(ctx, c); out.Class != capture.ClassOK {
+			return c, out
+		}
+	}
+	if c.MinimalNote {
+		return c, capture.OK()
+	}
+	i := slices.IndexFunc(c.Files, attachable)
+	if i < 0 {
+		return c, capture.OK()
+	}
+	if out := s.attach(ctx, &c, i); out.Class != capture.ClassOK {
+		return c, out
+	}
+	if slices.ContainsFunc(c.Files[i+1:], attachable) {
+		return c, capture.Progress()
+	}
+
+	return c, capture.OK()
+}
+
+// createNote renders and creates the note and records its name and link.
+func (s *stepRunner) createNote(ctx context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
 	in := s.noteInput(c)
-	if c.MinimalNote && c.AudioPath != "" && c.Failure == "" {
+	if c.MinimalNote && holdsFile(c) && c.Failure == "" {
 		// The full note was rejected (typically the attachment): the text
 		// stays in the note, the audio does not, and the reply says so.
 		// LastError holds the reason recorded by the failed attempt.
@@ -391,12 +497,11 @@ func (s *stepRunner) writeNote(ctx context.Context, c capture.Capture) (capture.
 	}
 	c.NoteName, c.NoteURL, c.TaskCount = name, link, len(in.Actions)
 
-	if c.AudioPath == "" || c.MinimalNote {
-		return c, capture.OK()
-	}
-
-	return s.attach(ctx, c)
+	return c, capture.OK()
 }
+
+// attachable reports whether f is held locally and not yet attached.
+func attachable(f capture.File) bool { return f.LocalPath != "" && !f.Attached }
 
 // logRendered records at debug whether the note carries the LLM result, so a
 // live deploy can tell a dropped result from an answer that kept the text.
@@ -408,31 +513,33 @@ func (s *stepRunner) logRendered(c capture.Capture, in render.Input) {
 		zap.Int("actions", len(in.Actions)))
 }
 
-// attach uploads the audio to the note. A missing file is not an error: the
-// note exists and the audio cannot be recovered.
-func (s *stepRunner) attach(ctx context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
-	data, err := s.d.Audio.Read(c.AudioPath)
+// attach uploads c.Files[i] to the note and records it as attached. A missing
+// file is not an error: the note exists and the file cannot be recovered.
+func (s *stepRunner) attach(ctx context.Context, c *capture.Capture, i int) capture.Outcome {
+	f := &c.Files[i]
+	data, err := s.d.Files.Read(f.LocalPath)
 	if errors.Is(err, fs.ErrNotExist) {
-		s.log(c, "audio file missing, note saved without attachment", err)
-		c.AudioPath = "" // the reply must not claim the audio was kept
+		s.log(*c, "file missing, note saved without attachment", err)
+		f.LocalPath = "" // the reply must not claim the file was kept
 
-		return c, capture.OK()
+		return capture.OK()
 	}
 	if err != nil {
-		s.log(c, "audio read failed", err)
+		s.log(*c, "file read failed", err)
 
-		return c, capture.Temporary("audio store: " + err.Error())
+		return capture.Temporary("file store: " + err.Error())
 	}
-	out := s.d.Notes.Attach(ctx, c.NoteName, s.attachmentName(c), audioMime(c.AudioPath), data)
+	out := s.d.Notes.Attach(ctx, c.NoteName, s.attachmentName(c.ReceivedAt, *f), audioMime(f.LocalPath), data)
 	if out.Class != capture.ClassOK {
 		// Policy.Next drops the reason of a permanent outcome; the minimal
 		// rerun reads it back from LastError.
 		c.LastError = out.Reason
 
-		return c, out
+		return out
 	}
+	f.Attached = true
 
-	return c, capture.OK()
+	return capture.OK()
 }
 
 // finalizeReply edits the hourglass to the result. With no reply to edit, or
@@ -513,15 +620,17 @@ func QueuedText(on capture.WaitingOn) string {
 		return "⏳ queued — notes unavailable, will retry"
 	case capture.WaitingTelegram:
 		return "⏳ queued — Telegram unavailable, will retry"
+	case capture.WaitingDocling:
+		return "⏳ queued — document reader unavailable, will retry"
 	}
 
 	return "⏳ queued — will retry"
 }
 
-// cleanup removes the audio and the content (FR-012); the identity needed
-// for dedupe stays. Policy.Next clears SendNewReply when finalize_reply fails
-// permanently and the step advances, so the new reply it asked for is
-// delivered here, before anything is erased.
+// cleanup removes every local file and the content (FR-012); the identity
+// needed for dedupe stays. Policy.Next clears SendNewReply when
+// finalize_reply fails permanently and the step advances, so the new reply it
+// asked for is delivered here, before anything is erased.
 func (s *stepRunner) cleanup(ctx context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
 	if c.SendNewReply {
 		var out capture.Outcome
@@ -529,22 +638,32 @@ func (s *stepRunner) cleanup(ctx context.Context, c capture.Capture) (capture.Ca
 			return c, out
 		}
 	}
-	if c.AudioPath != "" {
-		if err := s.d.Audio.Remove(c.AudioPath); err != nil {
-			s.log(c, "audio remove failed", err)
+	c.Files = slices.Clone(c.Files)
+	for i := range c.Files {
+		f := &c.Files[i]
+		if f.LocalPath != "" {
+			if err := s.d.Files.Remove(f.LocalPath); err != nil {
+				s.log(c, "file remove failed", err)
 
-			return c, capture.Temporary("audio store: " + err.Error())
+				return c, capture.Temporary("file store: " + err.Error())
+			}
 		}
+		f.LocalPath, f.FileID, f.FileName, f.Text = "", "", "", ""
 	}
-	c.Text, c.Language, c.EnrichedJSON, c.AudioPath, c.FileID = "", "", "", "", ""
+	c.Text, c.Language, c.EnrichedJSON = "", "", ""
 
 	return c, capture.OK()
+}
+
+// holdsFile reports whether a local copy of any file is known.
+func holdsFile(c capture.Capture) bool {
+	return slices.ContainsFunc(c.Files, func(f capture.File) bool { return f.LocalPath != "" })
 }
 
 // holdsAudio reports whether the note carries (or will carry) the audio: a
 // local file is known and the note is not a minimal one, which drops it.
 func holdsAudio(c capture.Capture) bool {
-	return c.AudioPath != "" && !c.MinimalNote
+	return holdsFile(c) && !c.MinimalNote
 }
 
 // replyText builds the final reply (contracts/telegram-ux.md), HTML-escaped.
@@ -584,9 +703,19 @@ const (
 	extWebM = ".webm"
 )
 
-// audioName is "<id>.<ext>": Ogg unless the MIME type says otherwise.
-func audioName(c capture.Capture) string {
-	return strconv.FormatInt(c.ID, 10) + audioExt(c.MimeType)
+// localName is "<id>.<ext>" for the first file and "<id>-<position>.<ext>"
+// for the others. An audio file's extension comes from its MIME type (Ogg
+// unless it says otherwise), any other file's from its original name.
+func localName(captureID int64, f capture.File) string {
+	name := strconv.FormatInt(captureID, 10)
+	if f.Position > 0 {
+		name += "-" + strconv.Itoa(f.Position)
+	}
+	if f.Kind != capture.FileAudio {
+		return name + path.Ext(f.FileName)
+	}
+
+	return name + audioExt(f.MimeType)
 }
 
 func audioExt(mime string) string {
@@ -610,17 +739,17 @@ func audioExt(mime string) string {
 // voice-<received_at local date>.<ext>. It never carries the local file name,
 // which holds the Telegram chat ID. Attach dedupes within the capture's own
 // memo, so same-day captures cannot collide.
-func (s *stepRunner) attachmentName(c capture.Capture) string {
+func (s *stepRunner) attachmentName(receivedAt time.Time, f capture.File) string {
 	loc := s.cfg.Location
 	if loc == nil {
 		loc = time.UTC
 	}
-	ext := path.Ext(c.AudioPath)
+	ext := path.Ext(f.LocalPath)
 	if ext == "" {
 		ext = extOgg
 	}
 
-	return "voice-" + c.ReceivedAt.In(loc).Format(time.DateOnly) + ext
+	return "voice-" + receivedAt.In(loc).Format(time.DateOnly) + ext
 }
 
 // audioMime is the attachment MIME type for a stored file name.

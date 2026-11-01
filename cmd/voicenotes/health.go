@@ -23,6 +23,31 @@ const (
 	httpShutdownTimeout = 5 * time.Second
 )
 
+// bothLanes is the health view of the two lane workers (research R12): the
+// service is alive and its store usable only when every lane is. It never
+// looks at vision state (FR-128).
+type bothLanes []health.Worker
+
+func (l bothLanes) Alive() bool {
+	for _, w := range l {
+		if !w.Alive() {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (l bothLanes) StoreOK() bool {
+	for _, w := range l {
+		if !w.StoreOK() {
+			return false
+		}
+	}
+
+	return true
+}
+
 // runHealth implements `voicenotes health [--strict]`: it GETs the local
 // health endpoint (the distroless image has no curl), prints the body and
 // exits 0 on HTTP 200 and 1 otherwise. With --strict, degraded also exits 1.

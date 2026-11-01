@@ -15,6 +15,7 @@ import (
 
 	"github.com/Toshik1978/voicenotes/internal/capture"
 	"github.com/Toshik1978/voicenotes/internal/digest"
+	"github.com/Toshik1978/voicenotes/internal/health"
 	"github.com/Toshik1978/voicenotes/internal/store/sqlite"
 )
 
@@ -178,7 +179,8 @@ func TestHealthQueueAdapter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.Source, c.SourceChatID, c.SourceMessageID, c.FileID = "telegram", -1001234567890, 1, "FAKE-FILE"
+	c.Source, c.SourceChatID, c.SourceMessageID = "telegram", -1001234567890, 1
+	c.Files = []capture.File{{Kind: capture.FileAudio, State: capture.FilePending, FileID: "FAKE-FILE"}}
 	c.Status, c.WaitingOn = capture.StatusWaiting, capture.WaitingOn("stt")
 	if err = db.Insert(ctx, &c); err != nil {
 		t.Fatal(err)
@@ -220,5 +222,48 @@ func TestHealthQueueAdapter(t *testing.T) {
 	}
 	if d, derr := q.LastDigestDate(ctx); derr != nil || d != "2026-10-30" {
 		t.Errorf("digest date after empty and skipped days = %q, %v, want 2026-10-30", d, derr)
+	}
+}
+
+type fakeLane struct{ alive, storeOK bool }
+
+func (f fakeLane) Alive() bool   { return f.alive }
+func (f fakeLane) StoreOK() bool { return f.storeOK }
+
+func TestBothLanesRequireEveryLane(t *testing.T) {
+	up := fakeLane{alive: true, storeOK: true}
+	tests := []struct {
+		name              string
+		lanes             bothLanes
+		wantAlive, wantOK bool
+	}{
+		{"both up", bothLanes{up, up}, true, true},
+		{"main down", bothLanes{fakeLane{}, up}, false, false},
+		{"documents down", bothLanes{up, fakeLane{}}, false, false},
+		{"documents store down", bothLanes{up, fakeLane{alive: true}}, true, false},
+		{"main store down", bothLanes{fakeLane{alive: true}, up}, true, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.lanes.Alive(); got != tc.wantAlive {
+				t.Errorf("Alive() = %v, want %v", got, tc.wantAlive)
+			}
+			if got := tc.lanes.StoreOK(); got != tc.wantOK {
+				t.Errorf("StoreOK() = %v, want %v", got, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestHealthNotOKWhenEitherLaneIsDown(t *testing.T) {
+	up := fakeLane{alive: true, storeOK: true}
+	for name, lanes := range map[string]bothLanes{"main": {fakeLane{}, up}, "documents": {up, fakeLane{}}} {
+		rep := health.Compute(health.Input{
+			Now: time.Now(), Started: time.Now(), Threshold: time.Hour,
+			WorkerAlive: lanes.Alive(), StoreOK: lanes.StoreOK(),
+		})
+		if rep.Status == health.StatusOK {
+			t.Errorf("%s lane down: status = %v, want not ok", name, rep.Status)
+		}
 	}
 }

@@ -54,7 +54,7 @@ packages are in `internal/` (see plan.md Structure). `COVERPKG` stays unchanged.
 
 **Purpose**: generalise the single audio file to a list of files, rename `transcribe` to `extract`, add per-file progress and worker lanes. No user-visible behaviour changes except FR-114a's due-first scheduling: a capture waiting on a dependency no longer holds back later ones. Notes still sort by receive time. **Checkpoint**: every existing test still passes, except strict-FIFO assertions, which are updated to the due-first rule.
 
-- [ ] T002 Extend the capture model in `internal/capture/capture.go`, `internal/capture/next.go`, `internal/capture/classify.go` (tests alongside):
+- [x] T002 Extend the capture model in `internal/capture/capture.go`, `internal/capture/next.go`, `internal/capture/classify.go` (tests alongside):
   - `KindFiles` (`"files"`)
   - `File` struct (fields per data-model.md "Capture file"), `FileKind` (`audio|image|document|video`), `FileState` (`pending|done|empty|failed|skipped`), `Capture.Files []File`, `Capture.AlbumID`
   - `StepCollect`; rename `StepTranscribe` to `StepExtract` (value `"extract"`); `collect → download` in `next()`
@@ -62,10 +62,10 @@ packages are in `internal/` (see plan.md Structure). `COVERPKG` stays unchanged.
   - `ClassProgress` with `Progress()` constructor. `Policy.Next` on progress keeps the step, resets `Attempts`, `WaitingOn`, `Misconfig`, `LastError` and `EnrichStartedAt`, sets `Status=pending` and `NextAttemptAt=now`, and never sets `QueueReplyEdit`.
   - `WaitingDocling = "docling"`
   - remove `FileID`/`FileSize`/`MimeType`/`AudioPath` from `Capture` (moved to `File`)
-- [ ] T003 Add lanes to `internal/capture/lane.go` (tests in `internal/capture/lane_test.go`):
+- [x] T003 Add lanes to `internal/capture/lane.go` (tests in `internal/capture/lane_test.go`):
   - `Lane` (`LaneMain`, `LaneDocuments`)
   - `LaneOf(c)`: documents = `KindFiles` at `StepExtract`, main otherwise
-- [ ] T004 Write migration `internal/store/sqlite/migrations/002_capture_files.sql` and update `internal/store/sqlite/store.go` per data-model.md and research R10 (tests in `internal/store/sqlite/store_test.go`, upgrade case in `internal/store/sqlite/restart_test.go`).
+- [x] T004 Write migration `internal/store/sqlite/migrations/002_capture_files.sql` and update `internal/store/sqlite/store.go` per data-model.md and research R10 (tests in `internal/store/sqlite/store_test.go`, upgrade case in `internal/store/sqlite/restart_test.go`).
   - Migration:
     - create `capture_files` with "UNIQUE (source, source_chat_id, source_message_id)", "UNIQUE (capture_id, position)" and "FK → captures(id) ON DELETE CASCADE"
     - copy each capture's `file_id`/`file_size`/`mime_type`/`audio_path` into one `audio` row at position 0. State is `done` when the step is past `transcribe` (transcript already in `captures.text`), else `pending`.
@@ -78,20 +78,20 @@ packages are in `internal/` (see plan.md Structure). `COVERPKG` stays unchanged.
     - rename `AudioPaths` → `FilePaths` over `capture_files.local_path`
     - `PurgeDone` cascades
   - Upgrade test: a 001 database with queued audio captures migrates and the captures resume.
-- [ ] T005 [P] Rename the local file store, rename the data directory and update the orphan sweep (tests alongside).
+- [x] T005 [P] Rename the local file store, rename the data directory and update the orphan sweep (tests alongside).
   - In `internal/pipeline/audiofs.go` → `internal/pipeline/files.go`: `AudioStore` → `FileStore`, `DirAudio` → `DirFiles`.
   - In `internal/pipeline/orphans.go`: the orphan sweep scans the files dir and is fed by `FilePaths`. Rename `OrphanAudio*` to `OrphanFile*`.
   - Add a startup helper `MigrateFilesDir(dataDir)` (research R9):
     - rename `audio/` to `files/` when only `audio/` exists
     - merge entries and remove `audio/` when both exist
     - no-op otherwise
-- [ ] T006 Generalise the step handlers in `internal/pipeline/steps.go` to per-file work for audio, keeping 001 behaviour (existing tests in `internal/pipeline/steps_test.go` must pass unchanged in meaning):
+- [x] T006 Generalise the step handlers in `internal/pipeline/steps.go` to per-file work for audio, keeping 001 behaviour (existing tests in `internal/pipeline/steps_test.go` must pass unchanged in meaning):
   - `download`: fetches each file without a local copy, one per attempt, returning `Progress` until none remain. A too-large or rejected file is marked `failed`; for an audio capture this keeps today's permanent outcome.
   - `extract`: replaces `transcribe`. For an audio file it runs today's STT logic, stores `File.Text`/`File.Language`, `state=done`, and copies the text and language to `Capture.Text`/`Capture.Language` once the last file is done.
   - `writeNote`: attaches each unattached file, one per attempt (`Progress`), and records `File.Attached`. A permanent attach failure keeps today's minimal-note behaviour for audio.
   - `cleanup`: removes every local file and clears per-file text, `file_id` and `file_name`.
   - `holdsAudio` and `replyText` read from `Files`. Audio reply texts are unchanged.
-- [ ] T007 Run two worker lanes (tests in `internal/pipeline/worker_test.go`, `cmd/voicenotes/service_test.go`).
+- [x] T007 Run two worker lanes (tests in `internal/pipeline/worker_test.go`, `cmd/voicenotes/service_test.go`).
   - In `internal/pipeline/worker.go`: `Worker` takes a `capture.Lane`, passes it to `Store.NextDue`, and validates handlers only for the steps that lane runs (documents: `extract`; main: all).
   - In `cmd/voicenotes/service.go`:
     - build both workers

@@ -21,6 +21,9 @@ const (
 	ClassMisconfig
 	// ClassPermanent will not succeed on retry: 400, 413, 415, 422.
 	ClassPermanent
+	// ClassProgress means one unit of a multi-file step finished and more
+	// remain: the step stays, with its retry state cleared, and is due now.
+	ClassProgress
 )
 
 func (c Class) String() string {
@@ -33,6 +36,8 @@ func (c Class) String() string {
 		return "misconfig"
 	case ClassPermanent:
 		return "permanent"
+	case ClassProgress:
+		return "progress"
 	default:
 		return fmt.Sprintf("class(%d)", int(c))
 	}
@@ -59,6 +64,10 @@ func OK() Outcome                     { return Outcome{Class: ClassOK} }
 func Temporary(reason string) Outcome { return Outcome{Class: ClassTemporary, Reason: reason} }
 func Misconfig(reason string) Outcome { return Outcome{Class: ClassMisconfig, Reason: reason} }
 func Permanent(reason string) Outcome { return Outcome{Class: ClassPermanent, Reason: reason} }
+
+// Progress builds the outcome of a multi-file step that handled one file and
+// has more left.
+func Progress() Outcome { return Outcome{Class: ClassProgress} }
 
 // ClassifyHTTP is the single definition of research R10 shared by every HTTP
 // client. 2xx is OK; 408, 429 and 5xx are temporary; 401, 403 and 404 are

@@ -15,6 +15,8 @@ type Kind string
 const (
 	KindAudio Kind = "audio"
 	KindText  Kind = "text"
+	// KindFiles is a batch of photos, documents or videos sent together.
+	KindFiles Kind = "files"
 )
 
 func (k Kind) String() string { return string(k) }
@@ -24,8 +26,9 @@ type Step string
 
 // Pipeline steps, in order.
 const (
+	StepCollect       Step = "collect"
 	StepDownload      Step = "download"
-	StepTranscribe    Step = "transcribe"
+	StepExtract       Step = "extract"
 	StepEnrich        Step = "enrich"
 	StepWriteNote     Step = "write_note"
 	StepFinalizeReply Step = "finalize_reply"
@@ -38,9 +41,11 @@ func (s Step) String() string { return string(s) }
 // next returns the step that follows s on success; done is terminal.
 func (s Step) next() Step {
 	switch s {
+	case StepCollect:
+		return StepDownload
 	case StepDownload:
-		return StepTranscribe
-	case StepTranscribe:
+		return StepExtract
+	case StepExtract:
 		return StepEnrich
 	case StepEnrich:
 		return StepWriteNote
@@ -77,6 +82,7 @@ const (
 	WaitingTelegram WaitingOn = "telegram"
 	WaitingSTT      WaitingOn = "stt"
 	WaitingMemos    WaitingOn = "memos"
+	WaitingDocling  WaitingOn = "docling"
 )
 
 // LLMSkipped reasons, stored in Capture.LLMSkipped.
@@ -96,12 +102,11 @@ type Capture struct {
 	SourceChatID    int64
 	SourceMessageID int64
 
-	// FileID, FileSize and MimeType describe the Telegram audio file.
-	FileID   string
-	FileSize int64
-	MimeType string
-	// AudioPath is relative to the audio directory; empty when no file is held.
-	AudioPath string
+	// AlbumID is the Telegram media group of a files batch's first album item.
+	AlbumID string
+	// Files are the capture's attachments in send order: the one audio file
+	// of an audio capture, or the items of a files batch.
+	Files []File
 	// Text is the original text or the transcript.
 	Text string
 	// Language is the ISO-639-1 code; empty if unknown.
@@ -150,15 +155,17 @@ type Capture struct {
 	EnrichStartedAt time.Time
 }
 
-// New returns a pending capture starting at start (Ruling R1): audio already
-// downloaded at ingest starts at transcribe, audio without a local file at
-// download, and text at enrich.
+// New returns a pending capture starting at start (Ruling R1): a files batch
+// starts at collect, audio already downloaded at ingest starts at extract,
+// audio without a local file at download, and text at enrich.
 func New(kind Kind, start Step, receivedAt time.Time) (Capture, error) {
 	var valid bool
 
 	switch kind {
+	case KindFiles:
+		valid = start == StepCollect
 	case KindAudio:
-		valid = start == StepDownload || start == StepTranscribe
+		valid = start == StepDownload || start == StepExtract
 	case KindText:
 		valid = start == StepEnrich
 	default:

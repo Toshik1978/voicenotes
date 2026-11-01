@@ -73,7 +73,7 @@ func (r *recorder) Calls() []call {
 func allSteps(h pipeline.Handler) map[capture.Step]pipeline.Handler {
 	return map[capture.Step]pipeline.Handler{
 		capture.StepDownload:      h,
-		capture.StepTranscribe:    h,
+		capture.StepExtract:       h,
 		capture.StepEnrich:        h,
 		capture.StepWriteNote:     h,
 		capture.StepFinalizeReply: h,
@@ -84,7 +84,7 @@ func allSteps(h pipeline.Handler) map[capture.Step]pipeline.Handler {
 func newWorker(t *testing.T, s pipeline.Store, c pipeline.Clock, h map[capture.Step]pipeline.Handler) *pipeline.Worker {
 	t.Helper()
 
-	w, err := pipeline.New(s, c, testPolicy, h, zap.NewNop())
+	w, err := pipeline.New(capture.LaneMain, s, c, testPolicy, h, zap.NewNop())
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -122,31 +122,31 @@ func TestNewValidates(t *testing.T) {
 	clock := newFakeClock(t0())
 
 	for _, step := range []capture.Step{
-		capture.StepDownload, capture.StepTranscribe, capture.StepEnrich,
+		capture.StepDownload, capture.StepExtract, capture.StepEnrich,
 		capture.StepWriteNote, capture.StepFinalizeReply, capture.StepCleanup,
 	} {
 		h := allSteps(ok[step])
 		delete(h, step)
-		_, err := pipeline.New(newFakeStore(), clock, testPolicy, h, nil)
+		_, err := pipeline.New(capture.LaneMain, newFakeStore(), clock, testPolicy, h, nil)
 		if err == nil || !strings.Contains(err.Error(), string(step)) {
 			t.Errorf("missing %s: err = %v, want it named", step, err)
 		}
 		h[step] = nil
-		if _, err := pipeline.New(newFakeStore(), clock, testPolicy, h, nil); err == nil {
+		if _, err := pipeline.New(capture.LaneMain, newFakeStore(), clock, testPolicy, h, nil); err == nil {
 			t.Errorf("nil handler for %s accepted", step)
 		}
 	}
 
-	if _, err := pipeline.New(nil, clock, testPolicy, ok, nil); err == nil {
+	if _, err := pipeline.New(capture.LaneMain, nil, clock, testPolicy, ok, nil); err == nil {
 		t.Error("nil store accepted")
 	}
-	if _, err := pipeline.New(newFakeStore(), nil, testPolicy, ok, nil); err == nil {
+	if _, err := pipeline.New(capture.LaneMain, newFakeStore(), nil, testPolicy, ok, nil); err == nil {
 		t.Error("nil clock accepted")
 	}
-	if _, err := pipeline.New(newFakeStore(), clock, capture.Policy{}, ok, nil); err == nil {
+	if _, err := pipeline.New(capture.LaneMain, newFakeStore(), clock, capture.Policy{}, ok, nil); err == nil {
 		t.Error("zero MaxInterval accepted")
 	}
-	if _, err := pipeline.New(newFakeStore(), clock, testPolicy, ok, nil); err != nil {
+	if _, err := pipeline.New(capture.LaneMain, newFakeStore(), clock, testPolicy, ok, nil); err != nil {
 		t.Errorf("valid worker (nil logger): %v", err)
 	}
 }
@@ -527,5 +527,65 @@ func TestStoreOKTracksStoreOutage(t *testing.T) {
 	store.awaitIdle(t)
 	if !w.StoreOK() {
 		t.Error("StoreOK() = false after the store recovered")
+	}
+}
+
+func TestNewValidatesHandlersPerLane(t *testing.T) {
+	clock := newFakeClock(t0())
+	noop := func(_ context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
+		return c, capture.OK()
+	}
+
+	build := func(lane capture.Lane, h map[capture.Step]pipeline.Handler) error {
+		_, err := pipeline.New(lane, newFakeStore(), clock, testPolicy, h, nil)
+		return err
+	}
+	extractOnly := map[capture.Step]pipeline.Handler{capture.StepExtract: noop}
+
+	// The documents lane runs extract only.
+	if err := build(capture.LaneDocuments, extractOnly); err != nil {
+		t.Errorf("documents lane with only extract: %v", err)
+	}
+	err := build(capture.LaneDocuments, map[capture.Step]pipeline.Handler{capture.StepEnrich: noop})
+	if err == nil || !strings.Contains(err.Error(), string(capture.StepExtract)) {
+		t.Errorf("documents lane without extract: err = %v, want it named", err)
+	}
+	// The main lane still needs every step.
+	if err := build(capture.LaneMain, extractOnly); err == nil {
+		t.Error("main lane with only extract accepted")
+	}
+	if err := build(capture.Lane("bogus"), allSteps(noop)); err == nil {
+		t.Error("unknown lane accepted")
+	}
+}
+
+func TestLanesRunOnlyTheirOwnCaptures(t *testing.T) {
+	doc := textCapture(t, 1)
+	doc.Kind, doc.Step = capture.KindFiles, capture.StepExtract
+	main := textCapture(t, 2)
+	store := newFakeStore(doc, main)
+	clock := newFakeClock(t0())
+
+	docRec, mainRec := &recorder{}, &recorder{}
+	// Park the capture after one step so each lane runs exactly one attempt.
+	docRec.result = func(capture.Capture, int) capture.Outcome { return capture.Temporary("park") }
+	mainRec.result = docRec.result
+
+	dw, err := pipeline.New(capture.LaneDocuments, store, clock, testPolicy, docRec.handlers(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mw := newWorker(t, store, clock, mainRec.handlers())
+	start(t, dw)
+	start(t, mw)
+
+	store.awaitUpdate(t)
+	store.awaitUpdate(t)
+
+	if got := docRec.Calls(); len(got) != 1 || got[0].id != 1 {
+		t.Errorf("documents lane calls = %v, want only capture 1", got)
+	}
+	if got := mainRec.Calls(); len(got) != 1 || got[0].id != 2 {
+		t.Errorf("main lane calls = %v, want only capture 2", got)
 	}
 }

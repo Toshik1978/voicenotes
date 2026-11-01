@@ -103,7 +103,7 @@ func newAckRig(t *testing.T) *ackRig {
 	}
 	hs, err := pipeline.NewHandlers(pipeline.Deps{
 		Transcriber: &fakeTranscriber{out: capture.OK()}, Notes: &fakeNotes{}, Replier: r.rep,
-		Downloader: &fakeDownloader{}, Audio: newFakeAudio(),
+		Downloader: &fakeDownloader{}, Files: newFakeAudio(),
 	}, pipeline.StepsConfig{InboxTag: "inbox", TodoTag: "todo", NoteLimit: 1000})
 	if err != nil {
 		t.Fatal(err)

@@ -93,8 +93,8 @@ type ReplyRecorder interface {
 // accepted); every other field except Log is required.
 type HandlerConfig struct {
 	AllowedUsers []int64
-	// AudioDir is $DATA_DIR/audio; it is created if missing.
-	AudioDir   string
+	// FilesDir is $DATA_DIR/files; it is created if missing.
+	FilesDir   string
 	Replier    Replier
 	Downloader Downloader
 	Ingester   Ingester
@@ -118,7 +118,7 @@ type Handler struct {
 // Handler.
 func NewHandler(cfg HandlerConfig) (*Handler, error) {
 	switch {
-	case cfg.AudioDir == "":
+	case cfg.FilesDir == "":
 		return nil, errors.New("telegram: empty audio dir")
 	case cfg.Replier == nil:
 		return nil, errors.New("telegram: nil replier")
@@ -129,7 +129,7 @@ func NewHandler(cfg HandlerConfig) (*Handler, error) {
 	case cfg.Replies == nil:
 		return nil, errors.New("telegram: nil reply recorder")
 	}
-	if err := os.MkdirAll(cfg.AudioDir, 0o700); err != nil {
+	if err := os.MkdirAll(cfg.FilesDir, 0o700); err != nil {
 		return nil, fmt.Errorf("telegram: create audio dir: %w", err)
 	}
 	log := cfg.Log
@@ -139,7 +139,7 @@ func NewHandler(cfg HandlerConfig) (*Handler, error) {
 
 	return &Handler{
 		allowed:  slices.Clone(cfg.AllowedUsers),
-		audioDir: cfg.AudioDir,
+		audioDir: cfg.FilesDir,
 		replier:  cfg.Replier,
 		dl:       cfg.Downloader,
 		ingester: cfg.Ingester,
@@ -212,10 +212,11 @@ func (h *Handler) audio(ctx context.Context, m Message) {
 		return
 	}
 
-	c := h.newAudioCapture(m, capture.StepTranscribe)
-	c.AudioPath = name
-	if c.FileSize == 0 {
-		c.FileSize = int64(len(data))
+	c := h.newAudioCapture(m, capture.StepExtract)
+	f := &c.Files[0]
+	f.LocalPath = name
+	if f.FileSize == 0 {
+		f.FileSize = int64(len(data))
 	}
 	if !h.ingest(ctx, m, c, h.ack(m)) {
 		// Duplicate or store failure: the file belongs to no row.
@@ -231,7 +232,11 @@ func (h *Handler) ingestUndownloaded(ctx context.Context, m Message) {
 
 func (h *Handler) newAudioCapture(m Message, start capture.Step) capture.Capture {
 	c := h.newCapture(m, capture.KindAudio, start)
-	c.FileID, c.MimeType, c.FileSize = m.Audio.FileID, m.Audio.MimeType, m.Audio.Size
+	c.Files = []capture.File{{
+		Source: c.Source, SourceChatID: c.SourceChatID, SourceMessageID: c.SourceMessageID,
+		Kind: capture.FileAudio, State: capture.FilePending,
+		FileID: m.Audio.FileID, MimeType: m.Audio.MimeType, FileSize: m.Audio.Size,
+	}}
 
 	return c
 }

@@ -15,33 +15,33 @@ import (
 	"github.com/Toshik1978/voicenotes/internal/pipeline"
 )
 
-func TestOrphanAudio(t *testing.T) {
+func TestOrphanFiles(t *testing.T) {
 	now := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
-	old := now.Add(-pipeline.OrphanAudioAge - time.Second)
-	files := []pipeline.AudioFile{
-		{Name: "tg--1001234567890-5-123.ogg", ModTime: old, Regular: true},         // orphan
-		{Name: ".tmp-456", ModTime: old, Regular: true},                            // orphan temp file
-		{Name: "7.ogg", ModTime: old, Regular: true},                               // referenced
-		{Name: "8.ogg", ModTime: now.Add(-time.Minute), Regular: true},             // too young
-		{Name: "9.ogg", ModTime: now.Add(-pipeline.OrphanAudioAge), Regular: true}, // exactly the age: kept
-		{Name: "sub", ModTime: old, Regular: false},                                // not a regular file
-		{Name: "10.ogg", ModTime: now.Add(time.Hour), Regular: true},               // clock skew: future
+	old := now.Add(-pipeline.OrphanFileAge - time.Second)
+	files := []pipeline.StoredFile{
+		{Name: "tg--1001234567890-5-123.ogg", ModTime: old, Regular: true},        // orphan
+		{Name: ".tmp-456", ModTime: old, Regular: true},                           // orphan temp file
+		{Name: "7.ogg", ModTime: old, Regular: true},                              // referenced
+		{Name: "8.ogg", ModTime: now.Add(-time.Minute), Regular: true},            // too young
+		{Name: "9.ogg", ModTime: now.Add(-pipeline.OrphanFileAge), Regular: true}, // exactly the age: kept
+		{Name: "sub", ModTime: old, Regular: false},                               // not a regular file
+		{Name: "10.ogg", ModTime: now.Add(time.Hour), Regular: true},              // clock skew: future
 	}
 	referenced := map[string]bool{"7.ogg": true}
 
-	got := pipeline.OrphanAudio(files, referenced, now)
+	got := pipeline.OrphanFiles(files, referenced, now)
 	want := []string{"tg--1001234567890-5-123.ogg", ".tmp-456"}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("OrphanAudio = %v, want %v", got, want)
+		t.Fatalf("OrphanFiles = %v, want %v", got, want)
 	}
-	if pipeline.OrphanAudioAge != time.Hour {
-		t.Errorf("OrphanAudioAge = %v, want 1h", pipeline.OrphanAudioAge)
+	if pipeline.OrphanFileAge != time.Hour {
+		t.Errorf("OrphanFileAge = %v, want 1h", pipeline.OrphanFileAge)
 	}
 }
 
-func TestOrphanAudioEmpty(t *testing.T) {
-	if got := pipeline.OrphanAudio(nil, nil, time.Now()); len(got) != 0 {
-		t.Fatalf("OrphanAudio(nil) = %v", got)
+func TestOrphanFilesEmpty(t *testing.T) {
+	if got := pipeline.OrphanFiles(nil, nil, time.Now()); len(got) != 0 {
+		t.Fatalf("OrphanFiles(nil) = %v", got)
 	}
 }
 
@@ -50,7 +50,7 @@ type fakeRefs struct {
 	err   error
 }
 
-func (f fakeRefs) AudioPaths(context.Context) ([]string, error) { return f.paths, f.err }
+func (f fakeRefs) FilePaths(context.Context) ([]string, error) { return f.paths, f.err }
 
 func writeAged(t *testing.T, dir, name string, mod time.Time) {
 	t.Helper()
@@ -63,7 +63,7 @@ func writeAged(t *testing.T, dir, name string, mod time.Time) {
 	}
 }
 
-func TestSweepOrphanAudio(t *testing.T) {
+func TestSweepOrphanFiles(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now()
 	old := now.Add(-2 * time.Hour)
@@ -75,9 +75,9 @@ func TestSweepOrphanAudio(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	n, err := pipeline.SweepOrphanAudio(context.Background(), dir, fakeRefs{paths: []string{"5.ogg"}}, now, nil)
+	n, err := pipeline.SweepOrphanFiles(context.Background(), dir, fakeRefs{paths: []string{"5.ogg"}}, now, nil)
 	if err != nil || n != 2 {
-		t.Fatalf("SweepOrphanAudio = %d, %v; want 2, nil", n, err)
+		t.Fatalf("SweepOrphanFiles = %d, %v; want 2, nil", n, err)
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -92,22 +92,22 @@ func TestSweepOrphanAudio(t *testing.T) {
 	}
 }
 
-func TestSweepOrphanAudioDeletesNothingWhenRefsFail(t *testing.T) {
+func TestSweepOrphanFilesDeletesNothingWhenRefsFail(t *testing.T) {
 	dir := t.TempDir()
 	writeAged(t, dir, "tg-1-2-3.ogg", time.Now().Add(-2*time.Hour))
 
 	refs := fakeRefs{err: errors.New("db locked")}
-	n, err := pipeline.SweepOrphanAudio(context.Background(), dir, refs, time.Now(), nil)
+	n, err := pipeline.SweepOrphanFiles(context.Background(), dir, refs, time.Now(), nil)
 	if err == nil || n != 0 {
-		t.Fatalf("SweepOrphanAudio = %d, %v; want 0 and an error", n, err)
+		t.Fatalf("SweepOrphanFiles = %d, %v; want 0 and an error", n, err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "tg-1-2-3.ogg")); err != nil {
 		t.Fatalf("file removed despite the error: %v", err)
 	}
 }
 
-func TestSweepOrphanAudioMissingDir(t *testing.T) {
-	n, err := pipeline.SweepOrphanAudio(
+func TestSweepOrphanFilesMissingDir(t *testing.T) {
+	n, err := pipeline.SweepOrphanFiles(
 		context.Background(),
 		filepath.Join(t.TempDir(), "none"),
 		fakeRefs{},
@@ -115,7 +115,7 @@ func TestSweepOrphanAudioMissingDir(t *testing.T) {
 		nil,
 	)
 	if err != nil || n != 0 {
-		t.Fatalf("SweepOrphanAudio = %d, %v; want 0, nil", n, err)
+		t.Fatalf("SweepOrphanFiles = %d, %v; want 0, nil", n, err)
 	}
 }
 
@@ -123,22 +123,22 @@ func TestSweepOrphanAudioMissingDir(t *testing.T) {
 // is after the directory listing: the file then vanishes before its Remove.
 type vanishingRefs struct{ path string }
 
-func (v vanishingRefs) AudioPaths(context.Context) ([]string, error) {
+func (v vanishingRefs) FilePaths(context.Context) ([]string, error) {
 	return nil, os.Remove(v.path)
 }
 
-func TestSweepOrphanAudioDoesNotCountVanishedFile(t *testing.T) {
+func TestSweepOrphanFilesDoesNotCountVanishedFile(t *testing.T) {
 	dir := t.TempDir()
 	writeAged(t, dir, "tg-1-2-3.ogg", time.Now().Add(-2*time.Hour))
 
 	refs := vanishingRefs{path: filepath.Join(dir, "tg-1-2-3.ogg")}
-	n, err := pipeline.SweepOrphanAudio(context.Background(), dir, refs, time.Now(), nil)
+	n, err := pipeline.SweepOrphanFiles(context.Background(), dir, refs, time.Now(), nil)
 	if err != nil || n != 0 {
-		t.Fatalf("SweepOrphanAudio = %d, %v; want 0, nil", n, err)
+		t.Fatalf("SweepOrphanFiles = %d, %v; want 0, nil", n, err)
 	}
 }
 
-func TestSweepOrphanAudioCountsFailedRemoval(t *testing.T) {
+func TestSweepOrphanFilesCountsFailedRemoval(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores directory permissions")
 	}
@@ -150,11 +150,11 @@ func TestSweepOrphanAudioCountsFailedRemoval(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
 
 	core, logs := observer.New(zap.InfoLevel)
-	n, err := pipeline.SweepOrphanAudio(context.Background(), dir, fakeRefs{}, time.Now(), zap.New(core))
+	n, err := pipeline.SweepOrphanFiles(context.Background(), dir, fakeRefs{}, time.Now(), zap.New(core))
 	if err != nil || n != 0 {
-		t.Fatalf("SweepOrphanAudio = %d, %v; want 0, nil", n, err)
+		t.Fatalf("SweepOrphanFiles = %d, %v; want 0, nil", n, err)
 	}
-	entries := logs.FilterMessage("swept orphan audio files").All()
+	entries := logs.FilterMessage("swept orphan files").All()
 	if len(entries) != 1 || entries[0].ContextMap()["failed"] != int64(1) {
 		t.Fatalf("log = %v, want one entry with failed=1", entries)
 	}

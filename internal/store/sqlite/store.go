@@ -9,6 +9,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -47,18 +48,21 @@ func (duplicateError) Duplicate() bool { return true }
 // "" or 0, and zero values are written as NULL. Timestamps are stored as
 // Unix nanoseconds and read back in UTC.
 type Store interface {
-	// Insert stores c, sets c.ID, and returns ErrDuplicate if the identity
-	// already exists.
+	// Insert stores c and its files in one transaction, sets c.ID and each
+	// file's ID and CaptureID, and returns ErrDuplicate if the capture's or
+	// any file's identity already exists (nothing is stored then).
 	Insert(ctx context.Context, c *capture.Capture) error
-	// NextDue enforces strict FIFO: it considers only the unfinished
-	// capture with the lowest ID (the head). If the head is due
-	// (NextAttemptAt not after now) it is returned with OK true. If the head
-	// is not due, later captures wait too: OK is false and WakeAt is the
-	// head's NextAttemptAt (UTC) so the worker can sleep until then. With an
-	// empty queue OK is false and WakeAt is the zero time.
-	NextDue(ctx context.Context, now time.Time) (capture.Due, error)
-	// Update persists every mutable field of c, returning ErrNotFound if
-	// c.ID does not exist. A zero ReplyMessageID keeps the stored one: a
+	// NextDue is due-first within a lane (FR-114a): it returns, with OK
+	// true, the lowest-ID unfinished capture of the lane whose NextAttemptAt
+	// is not after now; a capture that is not due never blocks later ones.
+	// When none is due, OK is false and WakeAt is the lane's earliest
+	// NextAttemptAt (UTC) so the worker can sleep until then; with an empty
+	// lane WakeAt is the zero time. Lane membership matches capture.LaneOf.
+	NextDue(ctx context.Context, now time.Time, lane capture.Lane) (capture.Due, error)
+	// Update persists every mutable field of c and of its files in one
+	// transaction, returning ErrNotFound if c.ID does not exist. Files are
+	// inserted only at ingest: each must already have a row, and its
+	// identity, kind and position are never changed. A zero ReplyMessageID keeps the stored one: a
 	// worker copy read before ingest recorded the reply must not erase it.
 	Update(ctx context.Context, c capture.Capture) error
 	// SetReplyMessageID records the reply to edit, touching no other
@@ -68,8 +72,8 @@ type Store interface {
 	// OldestUnfinished returns the unfinished capture with the lowest ID,
 	// due or not; ok is false when the queue is empty.
 	OldestUnfinished(ctx context.Context) (c capture.Capture, ok bool, err error)
-	// PurgeDone deletes done captures last updated before olderThan and
-	// returns how many were removed.
+	// PurgeDone deletes done captures last updated before olderThan, with
+	// their files, and returns how many captures were removed.
 	PurgeDone(ctx context.Context, olderThan time.Time) (int64, error)
 	// Close releases the database.
 	Close() error
@@ -90,15 +94,13 @@ var _ Store = (*DB)(nil)
 func Open(dataDir string) (*DB, error) {
 	// Pragmas are set per connection through the DSN. A single connection
 	// matches the single-writer service and avoids SQLITE_BUSY.
-	q := "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)" +
-		"&_pragma=foreign_keys(1)&_pragma=synchronous(FULL)"
-	db, err := sql.Open("sqlite", "file:"+filepath.Join(dataDir, DBFile)+"?"+q)
+	db, err := sql.Open("sqlite", dsn(dataDir))
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: open: %w", err)
 	}
 	db.SetMaxOpenConns(1)
 
-	if err := migrate(context.Background(), db); err != nil {
+	if err := migrateTo(context.Background(), db, math.MaxInt); err != nil {
 		_ = db.Close()
 
 		return nil, err
@@ -107,9 +109,19 @@ func Open(dataDir string) (*DB, error) {
 	return &DB{db: db}, nil
 }
 
-// migrate applies migrations/NNN_*.sql in order, each in one transaction,
-// tracking progress in PRAGMA user_version. It is forward-only.
-func migrate(ctx context.Context, db *sql.DB) error {
+// dsn is the connection string for $dataDir/voicenotes.db. Pragmas are set
+// per connection; foreign_keys makes PurgeDone cascade to capture_files.
+func dsn(dataDir string) string {
+	q := "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)" +
+		"&_pragma=foreign_keys(1)&_pragma=synchronous(FULL)"
+
+	return "file:" + filepath.Join(dataDir, DBFile) + "?" + q
+}
+
+// migrateTo applies migrations/NNN_*.sql up to version target in order, each
+// in one transaction, tracking progress in PRAGMA user_version. It is
+// forward-only.
+func migrateTo(ctx context.Context, db *sql.DB, target int) error {
 	entries, err := migrationsFS.ReadDir("migrations")
 	if err != nil {
 		return fmt.Errorf("sqlite: list migrations: %w", err)
@@ -131,7 +143,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		if err != nil {
 			return fmt.Errorf("sqlite: bad migration name %q: %w", name, err)
 		}
-		if version <= current {
+		if version <= current || version > target {
 			continue
 		}
 		body, err := migrationsFS.ReadFile("migrations/" + name)
@@ -165,24 +177,45 @@ func applyMigration(ctx context.Context, db *sql.DB, version int, body string) e
 }
 
 const columns = `id, source, source_chat_id, source_message_id, kind, received_at,
-file_id, file_size, mime_type, audio_path, text, language, enriched_json,
+album_id, text, language, enriched_json,
 llm_skipped, failure, note_name, note_url, task_count, reply_message_id,
 step, status, waiting_on, attempts, next_attempt_at, updated_at,
 misconfig, last_error, queue_reply_edit, minimal_note, send_new_reply,
 enrich_started_at`
 
+const fileColumns = `id, capture_id, position, source, source_chat_id, source_message_id,
+kind, file_id, mime_type, file_name, file_size, local_path, state, text,
+text_source, language, failure, timeouts, attached, attach_failure`
+
+// Lane predicates over captures; they must agree with capture.LaneOf.
+const (
+	documentsLane = "(kind = 'files' AND step = 'extract')"
+	mainLane      = "NOT " + documentsLane
+)
+
+// errFileNotInserted means Update was given a file without a row: files are
+// inserted at ingest, never by Update.
+var errFileNotInserted = errors.New("file was never inserted")
+
+// Insert stores c and its files in one transaction, setting c.ID and each
+// file's ID and CaptureID.
 func (s *DB) Insert(ctx context.Context, c *capture.Capture) error {
-	res, err := s.db.ExecContext(ctx, `INSERT INTO captures (
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sqlite: insert capture: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx, `INSERT INTO captures (
 source, source_chat_id, source_message_id, kind, received_at,
-file_id, file_size, mime_type, audio_path, text, language, enriched_json,
+album_id, text, language, enriched_json,
 llm_skipped, failure, note_name, note_url, task_count, reply_message_id,
 step, status, waiting_on, attempts, next_attempt_at, updated_at,
 misconfig, last_error, queue_reply_edit, minimal_note, send_new_reply,
 enrich_started_at)
-VALUES (?,?,?,?,?, ?,?,?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?, ?)`,
+VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?, ?)`,
 		c.Source, c.SourceChatID, c.SourceMessageID, string(c.Kind), ts(c.ReceivedAt),
-		nullStr(c.FileID), nullInt(c.FileSize), nullStr(c.MimeType), nullStr(c.AudioPath),
-		nullStr(c.Text), nullStr(c.Language), nullStr(c.EnrichedJSON),
+		nullStr(c.AlbumID), nullStr(c.Text), nullStr(c.Language), nullStr(c.EnrichedJSON),
 		nullStr(c.LLMSkipped), nullStr(c.Failure), nullStr(c.NoteName), nullStr(c.NoteURL),
 		c.TaskCount, nullInt(c.ReplyMessageID),
 		string(c.Step), string(c.Status), nullStr(string(c.WaitingOn)), c.Attempts,
@@ -200,21 +233,66 @@ VALUES (?,?,?,?,?, ?,?,?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?, ?)`,
 	if err != nil {
 		return fmt.Errorf("sqlite: insert capture id: %w", err)
 	}
-	c.ID = id
+
+	// A clone, so copies of c sharing the slice never see half-assigned IDs.
+	files := slices.Clone(c.Files)
+	for i := range files {
+		files[i].CaptureID = id
+		if err := insertFile(ctx, tx, &files[i]); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sqlite: insert capture: %w", err)
+	}
+	c.ID, c.Files = id, files
 
 	return nil
 }
 
+func insertFile(ctx context.Context, tx *sql.Tx, f *capture.File) error {
+	res, err := tx.ExecContext(ctx, `INSERT INTO capture_files (
+capture_id, position, source, source_chat_id, source_message_id,
+kind, file_id, mime_type, file_name, file_size, local_path, state, text,
+text_source, language, failure, timeouts, attached, attach_failure)
+VALUES (?,?,?,?,?, ?,?,?,?,?,?,?,?, ?,?,?,?,?,?)`,
+		f.CaptureID, f.Position, f.Source, f.SourceChatID, f.SourceMessageID,
+		string(f.Kind), nullStr(f.FileID), nullStr(f.MimeType), nullStr(f.FileName),
+		nullInt(f.FileSize), nullStr(f.LocalPath), string(f.State), nullStr(f.Text),
+		nullStr(string(f.TextSource)), nullStr(f.Language), nullStr(f.Failure),
+		f.Timeouts, f.Attached, nullStr(f.AttachFailure))
+	if err != nil {
+		if isUnique(err) {
+			return ErrDuplicate
+		}
+
+		return fmt.Errorf("sqlite: insert file of capture %d: %w", f.CaptureID, err)
+	}
+	if f.ID, err = res.LastInsertId(); err != nil {
+		return fmt.Errorf("sqlite: insert file id of capture %d: %w", f.CaptureID, err)
+	}
+
+	return nil
+}
+
+// Update persists c and the mutable columns of its files in one
+// transaction. A file's identity, kind and position are fixed at ingest; a
+// file without a row is an error, not an insert.
 func (s *DB) Update(ctx context.Context, c capture.Capture) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE captures SET
-kind=?, received_at=?, file_id=?, file_size=?, mime_type=?, audio_path=?, text=?,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sqlite: update capture %d: %w", c.ID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx, `UPDATE captures SET
+kind=?, received_at=?, album_id=?, text=?,
 language=?, enriched_json=?, llm_skipped=?, failure=?, note_name=?, note_url=?,
 task_count=?, reply_message_id=COALESCE(?, reply_message_id), step=?, status=?, waiting_on=?, attempts=?,
 next_attempt_at=?, updated_at=?, misconfig=?, last_error=?, queue_reply_edit=?,
 minimal_note=?, send_new_reply=?, enrich_started_at=?
 WHERE id=?`,
-		string(c.Kind), ts(c.ReceivedAt), nullStr(c.FileID), nullInt(c.FileSize),
-		nullStr(c.MimeType), nullStr(c.AudioPath), nullStr(c.Text),
+		string(c.Kind), ts(c.ReceivedAt), nullStr(c.AlbumID), nullStr(c.Text),
 		nullStr(c.Language), nullStr(c.EnrichedJSON), nullStr(c.LLMSkipped),
 		nullStr(c.Failure), nullStr(c.NoteName), nullStr(c.NoteURL),
 		c.TaskCount, nullInt(c.ReplyMessageID), string(c.Step), string(c.Status),
@@ -225,9 +303,49 @@ WHERE id=?`,
 	if err != nil {
 		return fmt.Errorf("sqlite: update capture %d: %w", c.ID, err)
 	}
+	if err := oneRow(res); err != nil {
+		return fmt.Errorf("sqlite: update capture %d: %w", c.ID, err)
+	}
+	for i := range c.Files {
+		if err := updateFile(ctx, tx, c.ID, &c.Files[i]); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sqlite: update capture %d: %w", c.ID, err)
+	}
+
+	return nil
+}
+
+func updateFile(ctx context.Context, tx *sql.Tx, captureID int64, f *capture.File) error {
+	if f.ID == 0 {
+		return fmt.Errorf("sqlite: update capture %d: file %d: %w", captureID, f.Position, errFileNotInserted)
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE capture_files SET
+file_id=?, mime_type=?, file_name=?, file_size=?, local_path=?, state=?, text=?,
+text_source=?, language=?, failure=?, timeouts=?, attached=?, attach_failure=?
+WHERE id=? AND capture_id=?`,
+		nullStr(f.FileID), nullStr(f.MimeType), nullStr(f.FileName), nullInt(f.FileSize),
+		nullStr(f.LocalPath), string(f.State), nullStr(f.Text),
+		nullStr(string(f.TextSource)), nullStr(f.Language), nullStr(f.Failure),
+		f.Timeouts, f.Attached, nullStr(f.AttachFailure),
+		f.ID, captureID)
+	if err != nil {
+		return fmt.Errorf("sqlite: update file %d of capture %d: %w", f.ID, captureID, err)
+	}
+	if err := oneRow(res); err != nil {
+		return fmt.Errorf("sqlite: update file %d of capture %d: %w", f.ID, captureID, err)
+	}
+
+	return nil
+}
+
+// oneRow returns ErrNotFound when res affected no row.
+func oneRow(res sql.Result) error {
 	n, err := res.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("sqlite: update capture %d: %w", c.ID, err)
+		return err //nolint:wrapcheck // wrapped by the caller
 	}
 	if n == 0 {
 		return ErrNotFound
@@ -253,16 +371,33 @@ func (s *DB) SetReplyMessageID(ctx context.Context, id, msgID int64) error {
 	return nil
 }
 
-func (s *DB) NextDue(ctx context.Context, now time.Time) (capture.Due, error) {
-	head, ok, err := s.OldestUnfinished(ctx)
-	if err != nil || !ok {
-		return capture.Due{}, err
-	}
-	if head.NextAttemptAt.After(now) {
-		return capture.Due{WakeAt: head.NextAttemptAt}, nil
+func (s *DB) NextDue(ctx context.Context, now time.Time, lane capture.Lane) (capture.Due, error) {
+	var inLane string
+	switch lane {
+	case capture.LaneMain:
+		inLane = mainLane
+	case capture.LaneDocuments:
+		inLane = documentsLane
+	default:
+		return capture.Due{}, fmt.Errorf("sqlite: unknown lane %q", lane)
 	}
 
-	return capture.Due{Capture: head, OK: true}, nil
+	c, ok, err := s.queryOne(ctx, "SELECT "+columns+" FROM captures WHERE status != 'done' AND "+
+		inLane+" AND next_attempt_at <= ? ORDER BY id LIMIT 1", ts(now))
+	if err != nil || ok {
+		return capture.Due{Capture: c, OK: ok}, err
+	}
+	var wake sql.NullInt64
+	err = s.db.QueryRowContext(ctx,
+		"SELECT min(next_attempt_at) FROM captures WHERE status != 'done' AND "+inLane).Scan(&wake)
+	if err != nil {
+		return capture.Due{}, fmt.Errorf("sqlite: next wake in lane %s: %w", lane, err)
+	}
+	if !wake.Valid {
+		return capture.Due{}, nil
+	}
+
+	return capture.Due{WakeAt: fromTS(wake.Int64)}, nil
 }
 
 func (s *DB) OldestUnfinished(ctx context.Context) (capture.Capture, bool, error) {
@@ -281,30 +416,32 @@ func (s *DB) CountUnfinished(ctx context.Context) (int, error) {
 	return n, nil
 }
 
-// AudioPaths returns the audio file names referenced by any capture row,
-// finished or not, in insertion order.
-func (s *DB) AudioPaths(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx,
-		"SELECT audio_path FROM captures WHERE audio_path IS NOT NULL AND audio_path != '' ORDER BY id")
+// FilePaths returns the local file names referenced by any capture file,
+// finished or not, in capture and position order.
+func (s *DB) FilePaths(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT local_path FROM capture_files"+
+		" WHERE local_path IS NOT NULL AND local_path != '' ORDER BY capture_id, position")
 	if err != nil {
-		return nil, fmt.Errorf("sqlite: list audio paths: %w", err)
+		return nil, fmt.Errorf("sqlite: list file paths: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 	var out []string
 	for rows.Next() {
 		var p string
 		if err := rows.Scan(&p); err != nil {
-			return nil, fmt.Errorf("sqlite: list audio paths: %w", err)
+			return nil, fmt.Errorf("sqlite: list file paths: %w", err)
 		}
 		out = append(out, p)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("sqlite: list audio paths: %w", err)
+		return nil, fmt.Errorf("sqlite: list file paths: %w", err)
 	}
 
 	return out, nil
 }
 
+// PurgeDone deletes old done captures; their capture_files rows go with them
+// (ON DELETE CASCADE).
 func (s *DB) PurgeDone(ctx context.Context, olderThan time.Time) (int64, error) {
 	res, err := s.db.ExecContext(ctx,
 		"DELETE FROM captures WHERE status = 'done' AND updated_at < ?", ts(olderThan))
@@ -327,20 +464,39 @@ func (s *DB) Close() error {
 	return nil
 }
 
+// queryOne reads the first capture query selects, with its files, in one
+// transaction so the two never disagree.
 func (s *DB) queryOne(ctx context.Context, query string, args ...any) (capture.Capture, bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return capture.Capture{}, false, fmt.Errorf("sqlite: query capture: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	c, ok, err := scanCapture(tx.QueryRowContext(ctx, query, args...))
+	if err != nil || !ok {
+		return capture.Capture{}, false, err
+	}
+	if c.Files, err = queryFiles(ctx, tx, c.ID); err != nil {
+		return capture.Capture{}, false, err
+	}
+
+	return c, true, nil
+}
+
+func scanCapture(row *sql.Row) (capture.Capture, bool, error) {
 	var (
-		c                                       capture.Capture
-		kind, step, status                      string
-		received, next, updated                 int64
-		enrichStarted                           sql.NullInt64
-		fileID, mime, audio, text, lang, enrich sql.NullString
-		skipped, failure, noteName, noteURL     sql.NullString
-		waiting, lastErr                        sql.NullString
-		fileSize, replyID                       sql.NullInt64
+		c                                   capture.Capture
+		kind, step, status                  string
+		received, next, updated             int64
+		enrichStarted, replyID              sql.NullInt64
+		album, text, lang, enrich           sql.NullString
+		skipped, failure, noteName, noteURL sql.NullString
+		waiting, lastErr                    sql.NullString
 	)
-	err := s.db.QueryRowContext(ctx, query, args...).Scan(
+	err := row.Scan(
 		&c.ID, &c.Source, &c.SourceChatID, &c.SourceMessageID, &kind, &received,
-		&fileID, &fileSize, &mime, &audio, &text, &lang, &enrich,
+		&album, &text, &lang, &enrich,
 		&skipped, &failure, &noteName, &noteURL, &c.TaskCount, &replyID,
 		&step, &status, &waiting, &c.Attempts, &next, &updated,
 		&c.Misconfig, &lastErr, &c.QueueReplyEdit, &c.MinimalNote, &c.SendNewReply,
@@ -355,17 +511,56 @@ func (s *DB) queryOne(ctx context.Context, query string, args ...any) (capture.C
 
 	c.Kind, c.Step, c.Status = capture.Kind(kind), capture.Step(step), capture.Status(status)
 	c.ReceivedAt, c.NextAttemptAt, c.UpdatedAt = fromTS(received), fromTS(next), fromTS(updated)
-	c.FileID, c.MimeType, c.AudioPath = fileID.String, mime.String, audio.String
+	c.AlbumID = album.String
 	c.Text, c.Language, c.EnrichedJSON = text.String, lang.String, enrich.String
 	c.LLMSkipped, c.Failure = skipped.String, failure.String
 	c.NoteName, c.NoteURL = noteName.String, noteURL.String
 	c.WaitingOn, c.LastError = capture.WaitingOn(waiting.String), lastErr.String
-	c.FileSize, c.ReplyMessageID = fileSize.Int64, replyID.Int64
+	c.ReplyMessageID = replyID.Int64
 	if enrichStarted.Valid {
 		c.EnrichStartedAt = fromTS(enrichStarted.Int64)
 	}
 
 	return c, true, nil
+}
+
+// queryFiles reads a capture's files in position order; nil when it has none.
+func queryFiles(ctx context.Context, tx *sql.Tx, captureID int64) ([]capture.File, error) {
+	rows, err := tx.QueryContext(ctx,
+		"SELECT "+fileColumns+" FROM capture_files WHERE capture_id = ? ORDER BY position", captureID)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: query files of capture %d: %w", captureID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var files []capture.File
+	for rows.Next() {
+		var (
+			f                                   capture.File
+			kind, state                         string
+			fileID, mime, name, local, text     sql.NullString
+			source, lang, failure, attachFailed sql.NullString
+			size                                sql.NullInt64
+		)
+		err := rows.Scan(
+			&f.ID, &f.CaptureID, &f.Position, &f.Source, &f.SourceChatID, &f.SourceMessageID,
+			&kind, &fileID, &mime, &name, &size, &local, &state, &text,
+			&source, &lang, &failure, &f.Timeouts, &f.Attached, &attachFailed,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite: query files of capture %d: %w", captureID, err)
+		}
+		f.Kind, f.State = capture.FileKind(kind), capture.FileState(state)
+		f.FileID, f.MimeType, f.FileName, f.FileSize = fileID.String, mime.String, name.String, size.Int64
+		f.LocalPath, f.Text, f.TextSource = local.String, text.String, capture.TextSource(source.String)
+		f.Language, f.Failure, f.AttachFailure = lang.String, failure.String, attachFailed.String
+		files = append(files, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlite: query files of capture %d: %w", captureID, err)
+	}
+
+	return files, nil
 }
 
 func ts(t time.Time) int64 { return t.UTC().UnixNano() }

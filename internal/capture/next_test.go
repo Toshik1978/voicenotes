@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"reflect"
 	"testing"
 	"time"
 )
@@ -16,7 +17,7 @@ func at(step Step) Capture {
 }
 
 func TestNextOK(t *testing.T) {
-	order := []Step{StepDownload, StepTranscribe, StepEnrich, StepWriteNote, StepFinalizeReply, StepCleanup}
+	order := []Step{StepDownload, StepExtract, StepEnrich, StepWriteNote, StepFinalizeReply, StepCleanup}
 	for i, s := range order {
 		c := at(s)
 		c.Status, c.WaitingOn, c.Attempts, c.Misconfig = StatusWaiting, WaitingMemos, 3, true
@@ -41,19 +42,19 @@ func TestNextOK(t *testing.T) {
 
 func TestNextDoneIsTerminal(t *testing.T) {
 	c := Capture{Step: StepDone, Status: StatusDone}
-	for _, o := range []Outcome{OK(), Temporary("x"), Permanent("y")} {
-		if got := policy().Next(c, o, now0()); got != c {
+	for _, o := range []Outcome{OK(), Temporary("x"), Permanent("y"), Progress()} {
+		if got := policy().Next(c, o, now0()); !reflect.DeepEqual(got, c) {
 			t.Errorf("done changed: %+v", got)
 		}
 	}
 }
 
 func TestNextTemporary(t *testing.T) {
-	c := at(StepTranscribe)
+	c := at(StepExtract)
 	got := policy().Next(c, Temporary("http 503").On(WaitingSTT), now0())
 	if got.Status != StatusWaiting || got.Attempts != 1 || got.WaitingOn != WaitingSTT ||
 		!got.QueueReplyEdit || got.Misconfig || got.LastError != "http 503" ||
-		!got.NextAttemptAt.Equal(now0().Add(5*time.Second)) || got.Step != StepTranscribe {
+		!got.NextAttemptAt.Equal(now0().Add(5*time.Second)) || got.Step != StepExtract {
 		t.Errorf("first: %+v", got)
 	}
 	got2 := policy().Next(got, Temporary("http 503").On(WaitingSTT), now0().Add(10*time.Second))
@@ -76,7 +77,7 @@ func TestNextMisconfig(t *testing.T) {
 }
 
 func TestNextPermanentFallsBackToPlaceholder(t *testing.T) {
-	for _, s := range []Step{StepDownload, StepTranscribe} {
+	for _, s := range []Step{StepDownload, StepExtract} {
 		c := at(s)
 		c.Attempts = 2
 		got := policy().Next(c, Permanent("http 415"), now0())
@@ -164,5 +165,26 @@ func TestNextNilRand(t *testing.T) {
 	got := Policy{MaxInterval: time.Minute}.Next(at(StepDownload), Temporary("x"), now0())
 	if got.Status != StatusWaiting || got.NextAttemptAt.Before(now0()) {
 		t.Errorf("%+v", got)
+	}
+}
+
+func TestNextProgress(t *testing.T) {
+	for _, s := range []Step{StepDownload, StepExtract, StepWriteNote} {
+		c := at(s)
+		c.Status, c.WaitingOn, c.Attempts, c.Misconfig = StatusWaiting, WaitingSTT, 3, true
+		c.LastError, c.EnrichStartedAt, c.QueueReplyEdit = "http 503", now0().Add(-time.Minute), true
+		c.NextAttemptAt = now0().Add(time.Hour)
+		got := policy().Next(c, Progress(), now0())
+		if got.Step != s || got.Status != StatusPending || got.Attempts != 0 || got.WaitingOn != "" ||
+			got.Misconfig || got.LastError != "" || !got.EnrichStartedAt.IsZero() || got.QueueReplyEdit ||
+			!got.NextAttemptAt.Equal(now0()) || !got.UpdatedAt.Equal(now0()) {
+			t.Errorf("%s: %+v", s, got)
+		}
+	}
+}
+
+func TestProgressOutcome(t *testing.T) {
+	if o := Progress(); o.Class != ClassProgress || o.Class.String() != "progress" {
+		t.Errorf("%+v", o)
 	}
 }

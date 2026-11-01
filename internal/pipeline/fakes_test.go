@@ -1,6 +1,7 @@
 package pipeline_test
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"slices"
@@ -82,7 +83,8 @@ func (f *fakeClock) awaitSleep(t *testing.T) time.Duration {
 	}
 }
 
-// fakeStore is an in-memory strict-FIFO queue mirroring the sqlite contract.
+// fakeStore is an in-memory queue. Like the sqlite store it serves the lane's
+// due capture with the lowest ID first (FR-114a).
 type fakeStore struct {
 	mu        sync.Mutex
 	rows      map[int64]capture.Capture
@@ -107,7 +109,7 @@ func newFakeStore(cs ...capture.Capture) *fakeStore {
 	return s
 }
 
-func (s *fakeStore) NextDue(_ context.Context, now time.Time) (capture.Due, error) {
+func (s *fakeStore) NextDue(_ context.Context, now time.Time, lane capture.Lane) (capture.Due, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -116,22 +118,32 @@ func (s *fakeStore) NextDue(_ context.Context, now time.Time) (capture.Due, erro
 		s.nextErrs--
 		return capture.Due{}, errStore
 	}
-	ids := make([]int64, 0, len(s.rows))
-	for id := range s.rows {
-		if s.rows[id].Status != capture.StatusDone {
-			ids = append(ids, id)
+	var due, waiting []capture.Capture
+	for _, c := range s.rows { //nolint:gocritic // rangeValCopy: a test fake; the copy is harmless.
+		if c.Status == capture.StatusDone || capture.LaneOf(c) != lane {
+			continue
+		}
+		if c.NextAttemptAt.After(now) {
+			waiting = append(waiting, c)
+		} else {
+			due = append(due, c)
 		}
 	}
-	if len(ids) == 0 {
+	byID := func(a, b capture.Capture) int { return cmp.Compare(a.ID, b.ID) }
+	if len(due) == 0 {
 		s.idle <- struct{}{}
-		return capture.Due{}, nil
+		if len(waiting) == 0 {
+			return capture.Due{}, nil
+		}
+		// The lane's earliest wake time, like the real store.
+		slices.SortFunc(waiting, func(a, b capture.Capture) int {
+			return cmp.Or(a.NextAttemptAt.Compare(b.NextAttemptAt), byID(a, b))
+		})
+
+		return capture.Due{WakeAt: waiting[0].NextAttemptAt}, nil
 	}
-	slices.Sort(ids)
-	head := s.rows[ids[0]]
-	if head.NextAttemptAt.After(now) {
-		s.idle <- struct{}{}
-		return capture.Due{WakeAt: head.NextAttemptAt}, nil
-	}
+	slices.SortFunc(due, byID)
+	head := due[0]
 
 	return capture.Due{Capture: head, OK: true}, nil
 }

@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
+	"github.com/Toshik1978/voicenotes/internal/capture"
 	"github.com/Toshik1978/voicenotes/internal/config"
 )
 
@@ -161,5 +162,36 @@ func TestBuildSweepsAgedOrphanAudio(t *testing.T) {
 
 	if _, err := os.Stat(orphan); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("aged orphan survived build: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "audio")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("legacy audio dir survived the migration: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "files")); err != nil {
+		t.Errorf("files dir missing: %v", err)
+	}
+}
+
+type fakeWaker struct {
+	wakes, holds, releases int
+}
+
+func (f *fakeWaker) Wake() { f.wakes++ }
+func (f *fakeWaker) HoldAck(capture.Capture) func() {
+	f.holds++
+	return func() { f.releases++ }
+}
+
+func TestWakeAllReachesEveryLane(t *testing.T) {
+	a, b := &fakeWaker{}, &fakeWaker{}
+	w := wakeAll{a, b}
+
+	w.Wake()
+	release := w.HoldAck(capture.Capture{})
+	release()
+
+	for i, f := range []*fakeWaker{a, b} {
+		if f.wakes != 1 || f.holds != 1 || f.releases != 1 {
+			t.Errorf("lane %d: wakes=%d holds=%d releases=%d, want 1 each", i, f.wakes, f.holds, f.releases)
+		}
 	}
 }

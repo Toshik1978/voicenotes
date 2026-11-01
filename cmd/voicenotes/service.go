@@ -80,7 +80,7 @@ func newLogger(level string) (*zap.Logger, error) {
 // service is the wired application.
 type service struct {
 	// goroutines run until ctx is cancelled; they are the Telegram poller,
-	// the worker, the purge ticker and, when enabled, the morning digest.
+	// the two lane workers, the purge ticker and, when enabled, the morning digest.
 	goroutines []func(context.Context)
 	closeStore func() error
 }
@@ -108,8 +108,12 @@ func serve(ctx context.Context, goroutines []func(context.Context), closeStore f
 // build wires the components with plain constructors: data dir, store,
 // clients, handlers, worker, Telegram poller, purge ticker.
 func build(cfg config.Config, log *zap.Logger, started time.Time) (*service, error) {
-	audioDir := filepath.Join(cfg.DataDir, "audio")
-	if err := os.MkdirAll(audioDir, 0o700); err != nil {
+	// Rename a 001 audio/ directory to files/ before anything uses either.
+	if err := pipeline.MigrateFilesDir(cfg.DataDir); err != nil {
+		return nil, fmt.Errorf("migrate files dir: %w", err)
+	}
+	filesDir := filepath.Join(cfg.DataDir, "files")
+	if err := os.MkdirAll(filesDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 	db, err := sqlite.Open(cfg.DataDir)
@@ -118,10 +122,10 @@ func build(cfg config.Config, log *zap.Logger, started time.Time) (*service, err
 	}
 	// Before the worker and the poller start, so nothing writes audio yet.
 	// Best effort: a failure deletes nothing and never blocks startup.
-	if _, serr := pipeline.SweepOrphanAudio(context.Background(), audioDir, db, time.Now(), log); serr != nil {
-		log.Warn("orphan audio sweep skipped", zap.Error(serr))
+	if _, serr := pipeline.SweepOrphanFiles(context.Background(), filesDir, db, time.Now(), log); serr != nil {
+		log.Warn("orphan file sweep skipped", zap.Error(serr))
 	}
-	svc, err := wire(cfg, log, db, audioDir, started)
+	svc, err := wire(cfg, log, db, filesDir, started)
 	if err != nil {
 		_ = db.Close()
 		return nil, err
@@ -132,7 +136,7 @@ func build(cfg config.Config, log *zap.Logger, started time.Time) (*service, err
 }
 
 func wire(
-	cfg config.Config, log *zap.Logger, db *sqlite.DB, audioDir string, started time.Time,
+	cfg config.Config, log *zap.Logger, db *sqlite.DB, filesDir string, started time.Time,
 ) (*service, error) {
 	transcriber, notes := newClients(cfg)
 
@@ -141,23 +145,21 @@ func wire(
 		return nil, fmt.Errorf("telegram: %w", err)
 	}
 
-	handlers, err := newHandlers(cfg, log, tg, transcriber, notes, audioDir)
+	handlers, err := newHandlers(cfg, log, tg, transcriber, notes, filesDir)
 	if err != nil {
 		return nil, err
 	}
-	worker, err := pipeline.New(db, pipeline.SystemClock{},
-		capture.Policy{MaxInterval: cfg.RetryMaxInterval, Rand: rand.Float64}, handlers, log)
+	mainWorker, docsWorker, err := newWorkers(cfg, log, db, tg, handlers)
 	if err != nil {
-		return nil, fmt.Errorf("worker: %w", err)
+		return nil, err
 	}
-	worker.SetQueueNotifier(pipeline.NewQueueNotifier(tg, log))
-	ingester, err := pipeline.NewIngester(db, worker)
+	ingester, err := pipeline.NewIngester(db, wakeAll{mainWorker, docsWorker})
 	if err != nil {
 		return nil, fmt.Errorf("ingester: %w", err)
 	}
 	handler, err := telegram.NewHandler(telegram.HandlerConfig{
 		AllowedUsers: cfg.AllowedUsers,
-		AudioDir:     audioDir,
+		FilesDir:     filesDir,
 		Replier:      tg,
 		Downloader:   tg,
 		Ingester:     ingester,
@@ -177,7 +179,7 @@ func wire(
 		return nil, err
 	}
 	collector := health.NewCollector(health.CollectorConfig{
-		Queue: healthQueue{db: db}, Worker: worker, LastPoll: tg.LastPoll,
+		Queue: healthQueue{db: db}, Worker: bothLanes{mainWorker, docsWorker}, LastPoll: tg.LastPoll,
 		Clock: time.Now, Started: started, Threshold: cfg.HealthPendingThreshold,
 	})
 	mux := http.NewServeMux()
@@ -185,12 +187,34 @@ func wire(
 
 	goroutines := append([]func(context.Context){
 		func(ctx context.Context) { tg.Run(ctx, handler) },
-		worker.Run,
+		mainWorker.Run,
+		docsWorker.Run,
 		func(ctx context.Context) { serveHTTP(ctx, ln, mux, log) },
 		func(ctx context.Context) { pipeline.PurgeLoop(ctx, db, pipeline.PurgeInterval, time.Now, log) },
 	}, digestRun...)
 
 	return &service{goroutines: goroutines}, nil
+}
+
+// newWorkers builds the main and documents lane workers. Until docling lands
+// the documents lane runs the same handlers; it needs only extract.
+func newWorkers(
+	cfg config.Config, log *zap.Logger, db *sqlite.DB, tg *telegram.API, handlers map[capture.Step]pipeline.Handler,
+) (mainWorker, docsWorker *pipeline.Worker, err error) {
+	policy := capture.Policy{MaxInterval: cfg.RetryMaxInterval, Rand: rand.Float64}
+	notifier := pipeline.NewQueueNotifier(tg, log)
+	mainWorker, err = pipeline.New(capture.LaneMain, db, pipeline.SystemClock{}, policy, handlers, log)
+	if err != nil {
+		return nil, nil, fmt.Errorf("main worker: %w", err)
+	}
+	docsWorker, err = pipeline.New(capture.LaneDocuments, db, pipeline.SystemClock{}, policy, handlers, log)
+	if err != nil {
+		return nil, nil, fmt.Errorf("documents worker: %w", err)
+	}
+	mainWorker.SetQueueNotifier(notifier)
+	docsWorker.SetQueueNotifier(notifier)
+
+	return mainWorker, docsWorker, nil
 }
 
 // digestGoroutines returns the morning digest runner, or nothing when the
@@ -257,14 +281,14 @@ func newChat(cfg config.Config) *openai.Chat {
 // newHandlers builds the step handlers; the LLM is wired only when configured.
 func newHandlers(
 	cfg config.Config, log *zap.Logger, tg *telegram.API,
-	transcriber *openai.Transcriber, notes *memos.Client, audioDir string,
+	transcriber *openai.Transcriber, notes *memos.Client, filesDir string,
 ) (map[capture.Step]pipeline.Handler, error) {
 	deps := pipeline.Deps{
 		Transcriber: sttShim{t: transcriber},
 		Notes:       notesShim{c: notes},
 		Replier:     tg,
 		Downloader:  tg,
-		Audio:       pipeline.NewDirAudio(audioDir),
+		Files:       pipeline.NewDirFiles(filesDir),
 		Log:         log,
 	}
 	if cfg.LLMEnabled {
@@ -288,4 +312,27 @@ func newHandlers(
 	}
 
 	return handlers, nil
+}
+
+// wakeAll fans the ingest hooks out to every lane worker.
+type wakeAll []pipeline.Waker
+
+func (w wakeAll) Wake() {
+	for _, x := range w {
+		x.Wake()
+	}
+}
+
+// HoldAck holds the capture on every lane and releases all of them together.
+func (w wakeAll) HoldAck(c capture.Capture) (release func()) {
+	releases := make([]func(), len(w))
+	for i, x := range w {
+		releases[i] = x.HoldAck(c)
+	}
+
+	return func() {
+		for _, r := range releases {
+			r()
+		}
+	}
 }

@@ -110,8 +110,8 @@ func (f *fakeIngester) Ingest(ctx context.Context, c capture.Capture, ack pipeli
 	f.ev.addf("ingest %s", c.Step)
 	f.got = append(f.got, c)
 	f.withAck = append(f.withAck, ack != nil)
-	if c.AudioPath != "" {
-		_, err := os.Stat(filepath.Join(f.audioDir, c.AudioPath))
+	if len(c.Files) > 0 && c.Files[0].LocalPath != "" {
+		_, err := os.Stat(filepath.Join(f.audioDir, c.Files[0].LocalPath))
 		f.fileAtInsert = append(f.fileAtInsert, err == nil)
 	}
 	if f.err != nil {
@@ -165,7 +165,7 @@ func newRig(t *testing.T) *rig {
 	}
 	h, err := telegram.NewHandler(telegram.HandlerConfig{
 		AllowedUsers: []int64{owner},
-		AudioDir:     dir,
+		FilesDir:     dir,
 		Replier:      r.rep,
 		Downloader:   r.dl,
 		Ingester:     r.in,
@@ -231,7 +231,7 @@ func wantEvents(t *testing.T, r *rig, want ...string) {
 func TestNewHandlerValidates(t *testing.T) {
 	ev := &events{}
 	ok := telegram.HandlerConfig{
-		AudioDir:   filepath.Join(t.TempDir(), "a", "audio"),
+		FilesDir:   filepath.Join(t.TempDir(), "a", "audio"),
 		Replier:    &fakeReplier{ev: ev},
 		Downloader: &fakeDownloader{ev: ev},
 		Ingester:   &fakeIngester{ev: ev},
@@ -240,12 +240,12 @@ func TestNewHandlerValidates(t *testing.T) {
 	if _, err := telegram.NewHandler(ok); err != nil {
 		t.Fatalf("valid config: %v", err)
 	}
-	if fi, err := os.Stat(ok.AudioDir); err != nil || !fi.IsDir() {
+	if fi, err := os.Stat(ok.FilesDir); err != nil || !fi.IsDir() {
 		t.Fatalf("audio dir not created: %v", err)
 	}
 
 	for name, mut := range map[string]func(*telegram.HandlerConfig){
-		"audio dir":  func(c *telegram.HandlerConfig) { c.AudioDir = "" },
+		"audio dir":  func(c *telegram.HandlerConfig) { c.FilesDir = "" },
 		"replier":    func(c *telegram.HandlerConfig) { c.Replier = nil },
 		"downloader": func(c *telegram.HandlerConfig) { c.Downloader = nil },
 		"ingester":   func(c *telegram.HandlerConfig) { c.Ingester = nil },
@@ -263,7 +263,7 @@ func TestNewHandlerValidates(t *testing.T) {
 		t.Fatal(err)
 	}
 	bad := ok
-	bad.AudioDir = filepath.Join(file, "audio")
+	bad.FilesDir = filepath.Join(file, "audio")
 	if _, err := telegram.NewHandler(bad); err == nil {
 		t.Error("uncreatable audio dir: want error")
 	}
@@ -348,20 +348,24 @@ func TestVoiceDownloadsWritesCommitsThenAcks(t *testing.T) {
 
 	r.handle(t, voiceMsg(1000))
 
-	wantEvents(t, r, `download FAKE-FILE-ID`, `ingest transcribe`, `send "⏳"`, `reply 7=9001`, `wake`)
+	wantEvents(t, r, `download FAKE-FILE-ID`, `ingest extract`, `send "⏳"`, `reply 7=9001`, `wake`)
 	c := r.in.got[0]
-	if c.Kind != capture.KindAudio || c.FileID != "FAKE-FILE-ID" || c.MimeType != "audio/ogg" ||
-		c.FileSize != 1000 || c.SourceMessageID != 43 || c.Source != telegram.Source {
+	f := c.Files[0]
+	if c.Kind != capture.KindAudio || f.FileID != "FAKE-FILE-ID" || f.MimeType != "audio/ogg" ||
+		f.FileSize != 1000 || c.SourceMessageID != 43 || c.Source != telegram.Source {
 		t.Fatalf("capture = %+v", c)
 	}
 	if !r.in.fileAtInsert[0] {
 		t.Fatal("audio must be on disk before the row is inserted")
 	}
-	if filepath.Base(c.AudioPath) != c.AudioPath ||
-		!strings.HasPrefix(c.AudioPath, fmt.Sprintf("tg-%d-43-", chat)) || !strings.HasSuffix(c.AudioPath, ".ogg") {
-		t.Fatalf("audio path %q: want relative tg-<chat>-<msg>-*.ogg", c.AudioPath)
+	if filepath.Base(c.Files[0].LocalPath) != c.Files[0].LocalPath ||
+		!strings.HasPrefix(
+			c.Files[0].LocalPath,
+			fmt.Sprintf("tg-%d-43-", chat),
+		) || !strings.HasSuffix(c.Files[0].LocalPath, ".ogg") {
+		t.Fatalf("audio path %q: want relative tg-<chat>-<msg>-*.ogg", c.Files[0].LocalPath)
 	}
-	data, err := os.ReadFile(filepath.Join(r.dir, c.AudioPath))
+	data, err := os.ReadFile(filepath.Join(r.dir, c.Files[0].LocalPath))
 	if err != nil || !bytes.Equal(data, r.dl.data) {
 		t.Fatalf("audio file: %q, %v", data, err)
 	}
@@ -375,11 +379,11 @@ func TestAudioFileExtensionAndSize(t *testing.T) {
 	r.handle(t, m)
 
 	c := r.in.got[0]
-	if !strings.HasSuffix(c.AudioPath, ".mp3") {
-		t.Fatalf("audio/mpeg path %q: want .mp3", c.AudioPath)
+	if !strings.HasSuffix(c.Files[0].LocalPath, ".mp3") {
+		t.Fatalf("audio/mpeg path %q: want .mp3", c.Files[0].LocalPath)
 	}
-	if c.FileSize != int64(len(r.dl.data)) {
-		t.Fatalf("unknown size must fall back to the bytes read, got %d", c.FileSize)
+	if c.Files[0].FileSize != int64(len(r.dl.data)) {
+		t.Fatalf("unknown size must fall back to the bytes read, got %d", c.Files[0].FileSize)
 	}
 }
 
@@ -389,7 +393,7 @@ func TestVoiceDuplicateRemovesFile(t *testing.T) {
 
 	r.handle(t, voiceMsg(1000))
 
-	wantEvents(t, r, `download FAKE-FILE-ID`, `ingest transcribe`)
+	wantEvents(t, r, `download FAKE-FILE-ID`, `ingest extract`)
 	if files := r.audioFiles(t); len(files) != 0 {
 		t.Fatalf("duplicate left files %v", files)
 	}
@@ -401,7 +405,7 @@ func TestVoiceStoreErrorRemovesFileAndAsksToResend(t *testing.T) {
 
 	r.handle(t, voiceMsg(1000))
 
-	wantEvents(t, r, `download FAKE-FILE-ID`, `ingest transcribe`, notSaved)
+	wantEvents(t, r, `download FAKE-FILE-ID`, `ingest extract`, notSaved)
 	if files := r.audioFiles(t); len(files) != 0 {
 		t.Fatalf("failed insert left files %v", files)
 	}
@@ -418,7 +422,7 @@ func TestVoiceDownloadFailureCommitsDownloadStep(t *testing.T) {
 		t.Fatal("no ⏳ before the audio is on disk: the download step sends it")
 	}
 	c := r.in.got[0]
-	if c.FileID != "FAKE-FILE-ID" || c.AudioPath != "" || c.Step != capture.StepDownload {
+	if c.Files[0].FileID != "FAKE-FILE-ID" || c.Files[0].LocalPath != "" || c.Step != capture.StepDownload {
 		t.Fatalf("capture = %+v", c)
 	}
 }
@@ -437,7 +441,7 @@ func TestVoiceWriteFailureCommitsDownloadStep(t *testing.T) {
 	r.handle(t, voiceMsg(1000))
 
 	wantEvents(t, r, `download FAKE-FILE-ID`, `ingest download`, `wake`)
-	if c := r.in.got[0]; c.AudioPath != "" {
+	if c := r.in.got[0]; c.Files[0].LocalPath != "" {
 		t.Fatalf("capture = %+v", c)
 	}
 }

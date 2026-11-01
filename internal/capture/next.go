@@ -30,6 +30,8 @@ func (p Policy) Next(c Capture, o Outcome, now time.Time) Capture {
 	switch o.Class {
 	case ClassOK:
 		return advance(c, now)
+	case ClassProgress:
+		return progress(c, now)
 	case ClassPermanent:
 		return p.permanent(c, o, now)
 	case ClassMisconfig:
@@ -60,6 +62,19 @@ func advance(c Capture, now time.Time) Capture {
 	return c
 }
 
+// progress keeps the step and clears all retry state: more files remain.
+func progress(c Capture, now time.Time) Capture {
+	c.Status = StatusPending
+	c.Attempts = 0
+	c.WaitingOn = ""
+	c.Misconfig = false
+	c.LastError = ""
+	c.EnrichStartedAt = time.Time{}
+	c.NextAttemptAt = now
+
+	return c
+}
+
 func (p Policy) permanent(c Capture, o Outcome, now time.Time) Capture {
 	switch c.Step {
 	case StepEnrich:
@@ -68,7 +83,7 @@ func (p Policy) permanent(c Capture, o Outcome, now time.Time) Capture {
 		c.LLMSkipped = SkippedInvalidOutput
 
 		return c
-	case StepDownload, StepTranscribe:
+	case StepDownload, StepExtract:
 		// Placeholder note; the capture is kept.
 		c = advanceTo(c, StepWriteNote, now)
 		c.Failure = o.Reason
@@ -91,7 +106,7 @@ func (p Policy) permanent(c Capture, o Outcome, now time.Time) Capture {
 		c = advance(c, now)
 		c.SendNewReply = true
 		return c
-	case StepCleanup, StepDone:
+	case StepCollect, StepCleanup, StepDone:
 		// Nothing more can be done: do not hold the row open.
 		return advance(c, now)
 	}

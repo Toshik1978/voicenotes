@@ -1,8 +1,11 @@
-// Package pipeline runs captures through their steps. The Worker is the single
-// FIFO loop over the durable queue (FR-011): it runs one step of the head
-// capture, applies capture.Policy.Next and persists the result before
-// anything else happens (FR-008). All I/O sits behind Store, Clock and the
-// step handlers, so the loop is tested with fakes.
+// Package pipeline runs captures through their steps. A Worker is the loop
+// of one lane (capture.Lane) over the durable queue (FR-011, FR-114a): it
+// takes the lane's due capture with the lowest ID (due-first, so a capture
+// waiting for a retry never blocks later ones), runs one step, applies
+// capture.Policy.Next and persists the result before anything else happens
+// (FR-008). The main and documents lanes run as two independent workers, so
+// a slow extraction never holds up the rest. All I/O sits behind Store,
+// Clock and the step handlers, so the loop is tested with fakes.
 package pipeline
 
 import (
@@ -18,12 +21,11 @@ import (
 	"github.com/Toshik1978/voicenotes/internal/capture"
 )
 
-// Store is the slice of the capture queue the worker needs. NextDue must
-// follow the strict-FIFO contract of capture.Due: only the lowest-ID
-// unfinished capture is ever returned, and a head that is not due yet blocks
-// later ones.
+// Store is the slice of the capture queue the worker needs. NextDue returns
+// the lowest-ID due capture of the lane, else the lane's earliest wake time
+// (capture.Due).
 type Store interface {
-	NextDue(ctx context.Context, now time.Time) (capture.Due, error)
+	NextDue(ctx context.Context, now time.Time, lane capture.Lane) (capture.Due, error)
 	Update(ctx context.Context, c capture.Capture) error
 }
 
@@ -53,17 +55,32 @@ func (SystemClock) After(d time.Duration) <-chan time.Time { return time.After(d
 // forever marks a sleep that only Wake or cancellation ends.
 const forever time.Duration = -1
 
-// steps lists every step that needs a handler; done is terminal.
-func steps() []capture.Step {
+// steps lists the steps a lane runs, each needing a handler; done is
+// terminal. The documents lane runs extract only; the main lane runs the
+// full chain (extract included, for audio). The second result is false for
+// an unknown lane.
+func steps(lane capture.Lane) ([]capture.Step, bool) {
+	switch lane {
+	case capture.LaneDocuments:
+		return []capture.Step{capture.StepExtract}, true
+	case capture.LaneMain:
+		return mainSteps(), true
+	default:
+		return nil, false
+	}
+}
+
+func mainSteps() []capture.Step {
 	return []capture.Step{
-		capture.StepDownload, capture.StepTranscribe, capture.StepEnrich,
+		capture.StepDownload, capture.StepExtract, capture.StepEnrich,
 		capture.StepWriteNote, capture.StepFinalizeReply, capture.StepCleanup,
 	}
 }
 
-// Worker is the single pipeline loop. Run must be called at most once at a
+// Worker is the pipeline loop of one lane. Run must be called at most once at a
 // time; Wake, HoldAck and Alive are safe from any goroutine.
 type Worker struct {
+	lane     capture.Lane
 	store    Store
 	clock    Clock
 	policy   capture.Policy
@@ -87,13 +104,19 @@ type Worker struct {
 	failures int
 }
 
-// New validates the wiring and returns a Worker. Every step from download to
-// cleanup needs a non-nil handler (enrich gets a pass-through when the LLM is
-// not configured), so a missing handler fails at startup rather than at the
-// first capture. policy.MaxInterval must be positive: it also caps the
-// backoff after store errors. A nil log means no logging.
+// New validates the wiring and returns a Worker for lane. Every step the
+// lane runs needs a non-nil handler (main: download to cleanup, where enrich
+// gets a pass-through when the LLM is not configured; documents: extract), so
+// a missing handler fails at startup rather than at the first capture.
+// policy.MaxInterval must be positive: it also caps the backoff after store
+// errors. A nil log means no logging.
 func New(
-	store Store, clock Clock, policy capture.Policy, handlers map[capture.Step]Handler, log *zap.Logger,
+	lane capture.Lane,
+	store Store,
+	clock Clock,
+	policy capture.Policy,
+	handlers map[capture.Step]Handler,
+	log *zap.Logger,
 ) (*Worker, error) {
 	if store == nil {
 		return nil, errors.New("pipeline: nil store")
@@ -104,8 +127,12 @@ func New(
 	if policy.MaxInterval <= 0 {
 		return nil, errors.New("pipeline: policy MaxInterval must be positive")
 	}
+	laneSteps, ok := steps(lane)
+	if !ok {
+		return nil, fmt.Errorf("pipeline: unknown lane %q", lane)
+	}
 	hs := make(map[capture.Step]Handler, len(handlers))
-	for _, s := range steps() {
+	for _, s := range laneSteps {
 		h := handlers[s]
 		if h == nil {
 			return nil, fmt.Errorf("pipeline: no handler for step %q", s)
@@ -117,6 +144,7 @@ func New(
 	}
 
 	return &Worker{
+		lane:     lane,
 		store:    store,
 		clock:    clock,
 		policy:   policy,
@@ -216,7 +244,7 @@ func (w *Worker) iterate(ctx context.Context) time.Duration {
 	}
 
 	now := w.clock.Now()
-	due, err := w.store.NextDue(ctx, now)
+	due, err := w.store.NextDue(ctx, now, w.lane)
 	if err != nil {
 		return w.storeFailed(ctx, "next due", err)
 	}

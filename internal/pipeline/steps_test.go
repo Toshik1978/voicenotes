@@ -176,7 +176,7 @@ func newRigWith(t *testing.T, cfg pipeline.StepsConfig) *rig {
 		rep: &fakeReplier{nextID: 77}, tr: &fakeTranscriber{out: capture.OK()}, notes: &fakeNotes{},
 	}
 	h, err := pipeline.NewHandlers(pipeline.Deps{
-		Transcriber: r.tr, Notes: r.notes, Replier: r.rep, Downloader: r.dl, Audio: r.audio,
+		Transcriber: r.tr, Notes: r.notes, Replier: r.rep, Downloader: r.dl, Files: r.audio,
 	}, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -192,7 +192,8 @@ func (r *rig) run(step capture.Step, c capture.Capture) (capture.Capture, captur
 
 func base() capture.Capture {
 	return capture.Capture{
-		ID: 5, SourceChatID: 10, SourceMessageID: 20, FileID: "F", Kind: capture.KindAudio,
+		ID: 5, SourceChatID: 10, SourceMessageID: 20, Kind: capture.KindAudio,
+		Files:      []capture.File{{Kind: capture.FileAudio, State: capture.FilePending, FileID: "F"}},
 		ReceivedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
 	}
 }
@@ -203,7 +204,7 @@ func TestNewHandlersValidates(t *testing.T) {
 	}
 	r := newRig(t)
 	for _, s := range []capture.Step{
-		capture.StepDownload, capture.StepTranscribe, capture.StepEnrich,
+		capture.StepDownload, capture.StepExtract, capture.StepEnrich,
 		capture.StepWriteNote, capture.StepFinalizeReply, capture.StepCleanup,
 	} {
 		if r.h[s] == nil {
@@ -221,8 +222,8 @@ func TestDownload(t *testing.T) {
 		if out.Class != capture.ClassOK {
 			t.Fatalf("outcome %v", out)
 		}
-		if got.AudioPath != "5.ogg" || string(r.audio.files["5.ogg"]) != "OGG" {
-			t.Errorf("audio path %q files %v", got.AudioPath, r.audio.files)
+		if got.Files[0].LocalPath != "5.ogg" || string(r.audio.files["5.ogg"]) != "OGG" {
+			t.Errorf("audio path %q files %v", got.Files[0].LocalPath, r.audio.files)
 		}
 		if got.ReplyMessageID != 77 {
 			t.Errorf("reply id %d", got.ReplyMessageID)
@@ -238,10 +239,10 @@ func TestDownload(t *testing.T) {
 	t.Run("mime picks extension", func(t *testing.T) {
 		r := newRig(t)
 		c := base()
-		c.MimeType = "audio/mpeg"
+		c.Files[0].MimeType = "audio/mpeg"
 		got, _ := r.run(capture.StepDownload, c)
-		if got.AudioPath != "5.mp3" {
-			t.Errorf("path %q", got.AudioPath)
+		if got.Files[0].LocalPath != "5.mp3" {
+			t.Errorf("path %q", got.Files[0].LocalPath)
 		}
 	})
 	t.Run("existing reply is not resent", func(t *testing.T) {
@@ -257,7 +258,7 @@ func TestDownload(t *testing.T) {
 		r := newRig(t)
 		r.audio.files["5.ogg"] = []byte("OGG")
 		c := base()
-		c.AudioPath = "5.ogg"
+		c.Files[0].LocalPath = "5.ogg"
 		_, out := r.run(capture.StepDownload, c)
 		if out.Class != capture.ClassOK || r.dl.calls != 0 || len(r.rep.sends) != 1 {
 			t.Errorf("out %v calls %d sends %d", out, r.dl.calls, len(r.rep.sends))
@@ -297,22 +298,22 @@ func TestDownloadFailures(t *testing.T) {
 		r := newRig(t)
 		r.audio.writeErr = errNet
 		got, out := r.run(capture.StepDownload, base())
-		if out.Class != capture.ClassTemporary || len(r.rep.sends) != 0 || got.AudioPath != "" {
-			t.Errorf("out %+v sends %v path %q", out, r.rep.sends, got.AudioPath)
+		if out.Class != capture.ClassTemporary || len(r.rep.sends) != 0 || got.Files[0].LocalPath != "" {
+			t.Errorf("out %+v sends %v path %q", out, r.rep.sends, got.Files[0].LocalPath)
 		}
 	})
 	t.Run("failed hourglass does not fail the step", func(t *testing.T) {
 		r := newRig(t)
 		r.rep.sendErr = errNet
 		got, out := r.run(capture.StepDownload, base())
-		if out.Class != capture.ClassOK || got.AudioPath != "5.ogg" || got.ReplyMessageID != 0 {
+		if out.Class != capture.ClassOK || got.Files[0].LocalPath != "5.ogg" || got.ReplyMessageID != 0 {
 			t.Errorf("out %+v got %+v", out, got)
 		}
 	})
 }
 
 func TestTranscribe(t *testing.T) {
-	withAudio := func() capture.Capture { c := base(); c.AudioPath = "5.ogg"; return c }
+	withAudio := func() capture.Capture { c := base(); c.Files[0].LocalPath = "5.ogg"; return c }
 	tests := []struct {
 		name      string
 		langs     []string
@@ -400,7 +401,7 @@ func TestTranscribe(t *testing.T) {
 			r.audio.files = map[string][]byte{}
 			maps.Copy(r.audio.files, tt.files)
 			r.tr.res, r.tr.out = tt.res, tt.out
-			got, out := r.run(capture.StepTranscribe, withAudio())
+			got, out := r.run(capture.StepExtract, withAudio())
 			if out.Class != tt.wantClass {
 				t.Fatalf("class %v want %v", out.Class, tt.wantClass)
 			}
@@ -436,7 +437,8 @@ func TestEnrich(t *testing.T) {
 
 func TestWriteNote(t *testing.T) {
 	c := base()
-	c.AudioPath, c.Text = "5.ogg", "buy milk"
+	c.Files[0].LocalPath = "5.ogg"
+	c.Text = "buy milk"
 	t.Run("create then attach", func(t *testing.T) {
 		r := newRig(t)
 		r.audio.files["5.ogg"] = []byte("AUDIO")
@@ -518,7 +520,8 @@ func TestWriteNote(t *testing.T) {
 
 func TestWriteNoteEnriched(t *testing.T) {
 	c := base()
-	c.AudioPath, c.Text = "5.ogg", "buy milk"
+	c.Files[0].LocalPath = "5.ogg"
+	c.Text = "buy milk"
 	t.Run("enriched result renders the full layout", func(t *testing.T) {
 		r := newRig(t)
 		r.audio.files["5.ogg"] = []byte("A")
@@ -591,7 +594,7 @@ func TestWriteNoteMinimalDropsLLM(t *testing.T) {
 		cc := base()
 		cc.Text, cc.Language, cc.EnrichedJSON = "Привет, купить молоко", "ru", enriched
 		if audio {
-			cc.AudioPath = "5.ogg"
+			cc.Files[0].LocalPath = "5.ogg"
 			r.audio.files["5.ogg"] = []byte("A")
 		} else {
 			cc.Kind = capture.KindText
@@ -614,7 +617,8 @@ func TestWriteNoteMinimalDropsLLM(t *testing.T) {
 
 func TestWriteNoteFailures(t *testing.T) {
 	c := base()
-	c.AudioPath, c.Text = "5.ogg", "buy milk"
+	c.Files[0].LocalPath = "5.ogg"
+	c.Text = "buy milk"
 	t.Run("create failure passes through", func(t *testing.T) {
 		r := newRig(t)
 		r.notes.createOut = capture.Temporary("http 503").On(capture.WaitingMemos)
@@ -667,7 +671,7 @@ func TestFinalizeReply(t *testing.T) {
 		{"one task", func(c *capture.Capture) { c.TaskCount = 1 }, "✓ saved · 1 task · " + link},
 		{
 			"failure",
-			func(c *capture.Capture) { c.Failure, c.AudioPath = "http 415 <x>", "5.ogg" },
+			func(c *capture.Capture) { c.Failure = "http 415 <x>"; c.Files[0].LocalPath = "5.ogg" },
 			"⚠ saved audio only — http 415 &lt;x&gt; · " + link,
 		},
 		{
@@ -677,7 +681,7 @@ func TestFinalizeReply(t *testing.T) {
 		},
 		{
 			"failure with audio dropped by a minimal note",
-			func(c *capture.Capture) { c.Failure, c.AudioPath, c.MinimalNote = "http 415", "5.ogg", true },
+			func(c *capture.Capture) { c.Failure, c.MinimalNote = "http 415", true; c.Files[0].LocalPath = "5.ogg" },
 			"⚠ audio not kept — http 415 · please send it again · " + link,
 		},
 	}
@@ -748,7 +752,8 @@ func TestFinalizeReply(t *testing.T) {
 func TestCleanup(t *testing.T) {
 	full := func() capture.Capture {
 		c := base()
-		c.AudioPath, c.Text, c.Language, c.EnrichedJSON = "5.ogg", "t", "en", "{}"
+		c.Files[0].LocalPath = "5.ogg"
+		c.Text, c.Language, c.EnrichedJSON = "t", "en", "{}"
 		c.NoteName, c.NoteURL, c.ReplyMessageID = "memos/abc", "https://memos.example.org/x", 9
 		return c
 	}
@@ -759,7 +764,8 @@ func TestCleanup(t *testing.T) {
 		if out.Class != capture.ClassOK || len(r.audio.files) != 0 {
 			t.Fatalf("out %+v files %v", out, r.audio.files)
 		}
-		if got.Text != "" || got.Language != "" || got.EnrichedJSON != "" || got.AudioPath != "" || got.FileID != "" {
+		if got.Text != "" || got.Language != "" || got.EnrichedJSON != "" || got.Files[0].LocalPath != "" ||
+			got.Files[0].FileID != "" {
 			t.Errorf("not cleared: %+v", got)
 		}
 		if got.NoteName != "memos/abc" || got.ReplyMessageID != 9 {
@@ -824,7 +830,8 @@ func TestRejectedReplyIsDone(t *testing.T) {
 		r.audio.files["5.ogg"] = []byte("A")
 		r.rep.sendErr = rejected
 		c := base()
-		c.AudioPath, c.Text, c.SendNewReply = "5.ogg", "t", true
+		c.Files[0].LocalPath = "5.ogg"
+		c.Text, c.SendNewReply = "t", true
 		got, out := r.run(capture.StepCleanup, c)
 		if out.Class != capture.ClassOK || len(r.audio.files) != 0 || got.Text != "" || got.SendNewReply {
 			t.Errorf("out %+v got %+v files %v", out, got, r.audio.files)
@@ -834,7 +841,8 @@ func TestRejectedReplyIsDone(t *testing.T) {
 
 func TestAttachFailureKeepsTextAndSaysSo(t *testing.T) {
 	c := base()
-	c.AudioPath, c.Text = "5.ogg", "buy milk"
+	c.Files[0].LocalPath = "5.ogg"
+	c.Text = "buy milk"
 	t.Run("permanent attach records the reason", func(t *testing.T) {
 		r := newRig(t)
 		r.audio.files["5.ogg"] = []byte("A")
@@ -887,6 +895,7 @@ func TestQueuedText(t *testing.T) {
 		{capture.WaitingSTT, "⏳ queued — speech-to-text unavailable, will retry"},
 		{capture.WaitingMemos, "⏳ queued — notes unavailable, will retry"},
 		{capture.WaitingTelegram, "⏳ queued — Telegram unavailable, will retry"},
+		{capture.WaitingDocling, "⏳ queued — document reader unavailable, will retry"},
 		{"", "⏳ queued — will retry"},
 	}
 	for _, tt := range tests {
@@ -1015,8 +1024,8 @@ func TestTranscribeSendsTheStoredExtension(t *testing.T) {
 		r := newRig(t)
 		r.audio.files = map[string][]byte{tt.path: []byte("A")}
 		c := base()
-		c.AudioPath = tt.path
-		if _, out := r.run(capture.StepTranscribe, c); out.Class != capture.ClassOK || r.tr.req.Ext != tt.want {
+		c.Files[0].LocalPath = tt.path
+		if _, out := r.run(capture.StepExtract, c); out.Class != capture.ClassOK || r.tr.req.Ext != tt.want {
 			t.Errorf("%s: out %+v ext %q, want %q", tt.path, out, r.tr.req.Ext, tt.want)
 		}
 	}
@@ -1048,29 +1057,30 @@ func TestPlaceholderWithoutAudio(t *testing.T) {
 		r := newRig(t)
 		r.audio.files = map[string][]byte{}
 		c := base()
-		c.AudioPath = "5.ogg"
-		got, out := r.run(capture.StepTranscribe, c)
-		if out.Class != capture.ClassPermanent || got.AudioPath != "" {
-			t.Errorf("out %+v path %q", out, got.AudioPath)
+		c.Files[0].LocalPath = "5.ogg"
+		got, out := r.run(capture.StepExtract, c)
+		if out.Class != capture.ClassPermanent || got.Files[0].LocalPath != "" {
+			t.Errorf("out %+v path %q", out, got.Files[0].LocalPath)
 		}
 	})
 	t.Run("stale path with a permanent download forgets the path", func(t *testing.T) {
 		r := newRig(t)
 		r.dl.err = pipeline.ErrFileTooLarge
 		c := base()
-		c.AudioPath = "5.ogg"
+		c.Files[0].LocalPath = "5.ogg"
 		got, out := r.run(capture.StepDownload, c)
-		if out.Class != capture.ClassPermanent || got.AudioPath != "" {
-			t.Errorf("out %+v path %q", out, got.AudioPath)
+		if out.Class != capture.ClassPermanent || got.Files[0].LocalPath != "" {
+			t.Errorf("out %+v path %q", out, got.Files[0].LocalPath)
 		}
 	})
 	t.Run("audio file missing at attach forgets the path", func(t *testing.T) {
 		r := newRig(t)
 		c := base()
-		c.AudioPath, c.Failure = "5.ogg", "http 415"
+		c.Files[0].LocalPath = "5.ogg"
+		c.Failure = "http 415"
 		got, out := r.run(capture.StepWriteNote, c)
-		if out.Class != capture.ClassOK || got.AudioPath != "" || len(r.notes.attached) != 0 {
-			t.Errorf("out %+v path %q attached %d", out, got.AudioPath, len(r.notes.attached))
+		if out.Class != capture.ClassOK || got.Files[0].LocalPath != "" || len(r.notes.attached) != 0 {
+			t.Errorf("out %+v path %q attached %d", out, got.Files[0].LocalPath, len(r.notes.attached))
 		}
 	})
 }
@@ -1111,7 +1121,7 @@ func llmHandlers(t *testing.T, e pipeline.Enricher) map[capture.Step]pipeline.Ha
 	t.Helper()
 	h, err := pipeline.NewHandlers(pipeline.Deps{
 		Transcriber: &fakeTranscriber{}, Notes: &fakeNotes{}, Replier: &fakeReplier{},
-		Downloader: &fakeDownloader{}, Audio: newFakeAudio(), Enricher: e,
+		Downloader: &fakeDownloader{}, Files: newFakeAudio(), Enricher: e,
 	}, pipeline.StepsConfig{
 		InboxTag: "inbox", TodoTag: "todo", NoteLimit: 1000,
 		Enrich: enrich.Options{Translate: true, Tidy: true, Tasks: true, Target: "en", MaxTags: 3},
@@ -1184,7 +1194,7 @@ func TestEnrichLogsAnswerShape(t *testing.T) {
 	core, logs := observer.New(zap.DebugLevel)
 	h, err := pipeline.NewHandlers(pipeline.Deps{
 		Transcriber: &fakeTranscriber{}, Notes: &fakeNotes{}, Replier: &fakeReplier{},
-		Downloader: &fakeDownloader{}, Audio: newFakeAudio(), Enricher: &fakeEnricher{raw: raw, out: capture.OK()},
+		Downloader: &fakeDownloader{}, Files: newFakeAudio(), Enricher: &fakeEnricher{raw: raw, out: capture.OK()},
 		Log: zap.New(core),
 	}, pipeline.StepsConfig{
 		InboxTag: "inbox", TodoTag: "todo", NoteLimit: 1000,
@@ -1224,7 +1234,7 @@ func TestWriteNoteLogsLLMUse(t *testing.T) {
 	core, logs := observer.New(zap.DebugLevel)
 	h, err := pipeline.NewHandlers(pipeline.Deps{
 		Transcriber: &fakeTranscriber{}, Notes: &fakeNotes{}, Replier: &fakeReplier{},
-		Downloader: &fakeDownloader{}, Audio: newFakeAudio(), Log: zap.New(core),
+		Downloader: &fakeDownloader{}, Files: newFakeAudio(), Log: zap.New(core),
 	}, pipeline.StepsConfig{InboxTag: "inbox", TodoTag: "todo", NoteLimit: 1000})
 	if err != nil {
 		t.Fatal(err)
@@ -1268,7 +1278,7 @@ func TestEnrichRetriesAnUntranslatedAnswer(t *testing.T) {
 		notes, rep := &fakeNotes{}, &fakeReplier{}
 		h, err := pipeline.NewHandlers(pipeline.Deps{
 			Transcriber: &fakeTranscriber{}, Notes: notes, Replier: rep,
-			Downloader: &fakeDownloader{}, Audio: newFakeAudio(), Enricher: e,
+			Downloader: &fakeDownloader{}, Files: newFakeAudio(), Enricher: e,
 		}, pipeline.StepsConfig{
 			InboxTag: "inbox", TodoTag: "todo", NoteLimit: 1000,
 			Enrich: enrich.Options{Translate: true, Tidy: true, Tasks: true, Target: "en", MaxTags: 3},
@@ -1360,7 +1370,7 @@ func TestReplyNoAIOnlyWhenSkipped(t *testing.T) {
 }
 
 func TestTranscribeLanguageRules(t *testing.T) {
-	audio := func() capture.Capture { c := base(); c.AudioPath = "5.ogg"; return c }
+	audio := func() capture.Capture { c := base(); c.Files[0].LocalPath = "5.ogg"; return c }
 	res := func(text, lang string) *pipeline.TranscribeResult {
 		return &pipeline.TranscribeResult{Text: text, Language: lang}
 	}
@@ -1514,7 +1524,7 @@ func TestTranscribeLanguageRules(t *testing.T) {
 			r := newRig(t, tt.langs...)
 			r.audio.files = map[string][]byte{"5.ogg": []byte("A")}
 			r.tr.res, r.tr.later, r.tr.laterOut = tt.first, tt.later, tt.laterOut
-			got, out := r.run(capture.StepTranscribe, audio())
+			got, out := r.run(capture.StepExtract, audio())
 			if out.Class != tt.wantClass {
 				t.Fatalf("class %v want %v", out.Class, tt.wantClass)
 			}
@@ -1558,7 +1568,8 @@ func TestAttachNameIsDeterministicAndPrivate(t *testing.T) {
 			})
 			r.audio.files[tt.path] = []byte("A")
 			c := base()
-			c.ReceivedAt, c.AudioPath, c.Text = recv, tt.path, "t"
+			c.ReceivedAt, c.Text = recv, "t"
+			c.Files[0].LocalPath = tt.path
 			if _, out := r.run(capture.StepWriteNote, c); out.Class != capture.ClassOK {
 				t.Fatalf("out %+v", out)
 			}
