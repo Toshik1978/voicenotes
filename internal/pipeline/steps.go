@@ -95,8 +95,23 @@ type Enricher interface {
 	Complete(ctx context.Context, messages []enrich.Message) (string, capture.Outcome)
 }
 
-// Deps are the collaborators of the step handlers. All but Enricher and Log
-// are required.
+// ExtractResult mirrors the document reader's result: Markdown is meaningful
+// only with an OK outcome and may be empty. TimedOut reports that the reader
+// gave no final status in time; the outcome is then Temporary and extract
+// applies the per-file timeout policy.
+type ExtractResult struct {
+	Markdown string
+	TimedOut bool
+}
+
+// Extractor reads the text of one image or document. It is nil when the
+// document reader is not configured; the wiring adapts the docling client.
+type Extractor interface {
+	Convert(ctx context.Context, name, mime string, data []byte) (ExtractResult, capture.Outcome)
+}
+
+// Deps are the collaborators of the step handlers. All but Enricher,
+// Extractor and Log are required.
 type Deps struct {
 	Transcriber Transcriber
 	Notes       NotesWriter
@@ -104,6 +119,7 @@ type Deps struct {
 	Downloader  Downloader
 	Files       FileStore
 	Enricher    Enricher
+	Extractor   Extractor
 	Log         *zap.Logger
 }
 
@@ -274,19 +290,20 @@ func (s *stepRunner) downloadFile(ctx context.Context, c *capture.Capture, i int
 	return capture.OK()
 }
 
-// extract turns the pending audio files into text, one per attempt, and
-// returns Progress while any remain. A file already done is not sent again.
-// Photos, documents and videos are skipped: no reader is wired for them.
-// Once none remain, an audio capture takes its file's text and language, so
-// enrich and render see a voice note as before.
+// extract turns the pending files into text, one per attempt, and returns
+// Progress while any remain. A file already settled is not sent again. Audio
+// goes to speech-to-text; photos and documents go to the document reader when
+// one is wired and are skipped otherwise; videos are always skipped. Once none
+// remain, an audio capture takes its file's text and language, so enrich and
+// render see a voice note as before.
 func (s *stepRunner) extract(ctx context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
 	c.Files = slices.Clone(c.Files)
-	skipUnreadFiles(c.Files)
-	if i := slices.IndexFunc(c.Files, pendingAudio); i >= 0 {
-		if out := s.transcribeFile(ctx, &c, i); out.Class != capture.ClassOK {
+	skipUnreadFiles(c.Files, s.d.Extractor != nil)
+	if i := slices.IndexFunc(c.Files, pendingRead); i >= 0 {
+		if out := s.extractFile(ctx, &c, i); out.Class != capture.ClassOK {
 			return c, out
 		}
-		if slices.ContainsFunc(c.Files[i+1:], pendingAudio) {
+		if slices.ContainsFunc(c.Files[i+1:], pendingRead) {
 			return c, capture.Progress()
 		}
 	}
@@ -299,8 +316,17 @@ func (s *stepRunner) extract(ctx context.Context, c capture.Capture) (capture.Ca
 	return c, capture.OK()
 }
 
-func pendingAudio(f capture.File) bool {
-	return f.Kind == capture.FileAudio && f.State == capture.FilePending
+// pendingRead reports whether extract still has to read f. Files it cannot
+// read were skipped before this is asked.
+func pendingRead(f capture.File) bool { return f.State == capture.FilePending }
+
+// extractFile reads c.Files[i] with the reader for its kind.
+func (s *stepRunner) extractFile(ctx context.Context, c *capture.Capture, i int) capture.Outcome {
+	if c.Files[i].Kind == capture.FileAudio {
+		return s.transcribeFile(ctx, c, i)
+	}
+
+	return s.readDocument(ctx, c, i)
 }
 
 // transcribeFile sends c.Files[i] to speech-to-text. The language is forced
@@ -361,16 +387,23 @@ func (s *stepRunner) transcribeFile(ctx context.Context, c *capture.Capture, i i
 
 // enrich runs the optional LLM step. Without an Enricher it records
 // 'disabled'. A stored result (a re-run after a crash) or an empty transcript
-// needs no call. An answer that fails validation is Permanent, which the
-// policy turns into 'invalid_output'; the 3 attempt / 2 minute budget is the
-// policy's too. Prompts, transcripts and answers are never logged.
+// needs no call. A files capture asks for a hint instead (enrichFiles). An
+// answer that fails validation is Permanent, which the policy turns into
+// 'invalid_output'; the 3 attempt / 2 minute budget is the policy's too.
+// Prompts, transcripts and answers are never logged.
 func (s *stepRunner) enrich(ctx context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
 	if s.d.Enricher == nil {
 		c.LLMSkipped = capture.SkippedDisabled
 
 		return c, capture.OK()
 	}
-	if c.EnrichedJSON != "" || strings.TrimSpace(c.Text) == "" {
+	if c.EnrichedJSON != "" {
+		return c, capture.OK()
+	}
+	if c.Kind == capture.KindFiles {
+		return s.enrichFiles(ctx, c)
+	}
+	if strings.TrimSpace(c.Text) == "" {
 		return c, capture.OK()
 	}
 	raw, out := s.d.Enricher.Complete(ctx, enrich.BuildRequest(s.cfg.Enrich, c.Text, c.Language))
@@ -378,6 +411,23 @@ func (s *stepRunner) enrich(ctx context.Context, c capture.Capture) (capture.Cap
 		return c, out
 	}
 	res, err := enrich.Parse(raw, c.Text, c.Language, s.cfg.Enrich)
+	if c, out = s.storeResult(c, res, err); out.Class != capture.ClassOK {
+		return c, out
+	}
+	// Only the answer's shape: never the transcript or the answer itself.
+	s.d.Log.Debug("LLM answer accepted",
+		zap.Int64("capture", c.ID), zap.String("detected", c.Language),
+		zap.String("language", res.Language), zap.Bool("translated", res.Translated),
+		zap.Int("tasks", len(res.Tasks)), zap.Int("tags", len(res.Tags)),
+		zap.Int("input_runes", utf8.RuneCountInString(c.Text)),
+		zap.Int("text_runes", utf8.RuneCountInString(res.Text)))
+
+	return c, capture.OK()
+}
+
+// storeResult records a parsed LLM answer on the capture. An untranslated
+// answer is Temporary, any other parse error Permanent ('invalid_output').
+func (s *stepRunner) storeResult(c capture.Capture, res enrich.Result, err error) (capture.Capture, capture.Outcome) {
 	if errors.Is(err, enrich.ErrNotTranslated) {
 		// A sampled answer can keep the source text; ask again within the
 		// LLM budget, which then skips the step as unavailable.
@@ -397,13 +447,6 @@ func (s *stepRunner) enrich(ctx context.Context, c capture.Capture) (capture.Cap
 		return c, capture.Permanent("LLM output not storable")
 	}
 	c.EnrichedJSON, c.TaskCount = stored, len(res.Tasks)
-	// Only the answer's shape: never the transcript or the answer itself.
-	s.d.Log.Debug("LLM answer accepted",
-		zap.Int64("capture", c.ID), zap.String("detected", c.Language),
-		zap.String("language", res.Language), zap.Bool("translated", res.Translated),
-		zap.Int("tasks", len(res.Tasks)), zap.Int("tags", len(res.Tags)),
-		zap.Int("input_runes", utf8.RuneCountInString(c.Text)),
-		zap.Int("text_runes", utf8.RuneCountInString(res.Text)))
 
 	return c, capture.OK()
 }

@@ -77,7 +77,29 @@ func (w *e2eWorld) snapshot() (notes []pipeline.NoteInput, attachments, replies 
 	return append(notes, w.notes...), append(attachments, w.attachments...), append(replies, w.replies...)
 }
 
-func TestPhotoFlowsFromHandlerToSavedNote(t *testing.T) {
+// e2e is a running pipeline behind the Telegram handler, wired by
+// newPipeline against the fake world.
+type e2e struct {
+	world   *e2eWorld
+	db      *sqlite.DB
+	p       *pipelineParts
+	handler *telegram.Handler
+}
+
+// e2eConfig is the minimal configuration the pipeline needs; tests add the
+// optional features they exercise.
+func e2eConfig() config.Config {
+	return config.Config{
+		InboxTag: "inbox", TodoTag: "todo", MemosContentLimit: 10000,
+		BatchQuietPeriod: 50 * time.Millisecond, RetryMaxInterval: time.Second, Location: time.UTC,
+		DoclingTimeout: time.Minute, DoclingMaxPages: 20, HintExcerptRunes: 4000,
+	}
+}
+
+// startE2E wires the pipeline with cfg and runs both lane workers until the
+// test ends.
+func startE2E(t *testing.T, cfg config.Config, transcriber pipeline.Transcriber) *e2e {
+	t.Helper()
 	dir := t.TempDir()
 	db, err := sqlite.Open(dir)
 	if err != nil {
@@ -87,12 +109,8 @@ func TestPhotoFlowsFromHandlerToSavedNote(t *testing.T) {
 
 	world := &e2eWorld{}
 	filesDir := dir + "/files"
-	cfg := config.Config{
-		InboxTag: "inbox", TodoTag: "todo", MemosContentLimit: 10000,
-		BatchQuietPeriod: 50 * time.Millisecond, RetryMaxInterval: time.Second, Location: time.UTC,
-	}
 	deps := pipeline.Deps{
-		Transcriber: e2eTranscriber{}, Notes: world, Replier: world, Downloader: world,
+		Transcriber: transcriber, Notes: world, Replier: world, Downloader: world,
 		Files: pipeline.NewDirFiles(filesDir), Log: zap.NewNop(),
 	}
 	p, err := newPipeline(cfg, zap.NewNop(), db, deps)
@@ -107,29 +125,42 @@ func TestPhotoFlowsFromHandlerToSavedNote(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	// t.Context is cancelled before the cleanups run, so the workers stop
+	// before the store closes.
 	var wg sync.WaitGroup
-	t.Cleanup(func() { cancel(); wg.Wait() })
+	t.Cleanup(wg.Wait)
 	for _, w := range []*pipeline.Worker{p.mainWorker, p.docsWorker} {
-		wg.Go(func() { w.Run(ctx) })
+		wg.Go(func() { w.Run(t.Context()) })
 	}
 
-	handler.Handle(ctx, telegram.Message{
+	return &e2e{world: world, db: db, p: p, handler: handler}
+}
+
+// waitFor polls cond until it holds, failing the test after 10s.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestPhotoFlowsFromHandlerToSavedNote(t *testing.T) {
+	e := startE2E(t, e2eConfig(), e2eTranscriber{})
+	world := e.world
+
+	e.handler.Handle(t.Context(), telegram.Message{
 		ChatID: 7, ID: 42, SenderID: 111, Date: time.Now(),
 		Files: &telegram.FileItem{FileID: "photo-1", MIME: "image/jpeg", Kind: capture.FileImage, Size: 10},
 	})
 
-	deadline := time.Now().Add(10 * time.Second)
-	for {
+	waitFor(t, "the saved reply", func() bool {
 		_, _, replies := world.snapshot()
-		if len(replies) > 0 && strings.HasPrefix(replies[len(replies)-1], "✓ saved") {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("no saved reply, replies = %q", replies)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+		return len(replies) > 0 && strings.HasPrefix(replies[len(replies)-1], "✓ saved")
+	})
 
 	notes, attachments, replies := world.snapshot()
 	if len(notes) != 1 || !strings.Contains(notes[0].Content, "📷 photo") {

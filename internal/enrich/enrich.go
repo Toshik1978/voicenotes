@@ -38,6 +38,11 @@ var ErrNotTranslated = errors.New("LLM answer not translated")
 
 var tagPattern = regexp.MustCompile(`^[a-z0-9_-]{1,32}$`)
 
+const (
+	roleSystem = "system"
+	roleUser   = "user"
+)
+
 // Message is one chat message; Role is "system" or "user".
 type Message struct {
 	Role    string
@@ -56,12 +61,16 @@ type Options struct {
 	// InboxTag and TodoTag are dropped from suggested tags.
 	InboxTag string
 	TodoTag  string
+	// ExcerptRunes bounds the document excerpts of a files request in total
+	// (HINT_EXCERPT_RUNES); only BuildFilesRequest reads it.
+	ExcerptRunes int
 }
 
 // Result is the validated per-capture LLM output. It is stored as
 // enriched_json and consumed by the renderer.
 type Result struct {
 	Language   string   `json:"language,omitempty"`
+	Hint       string   `json:"hint,omitempty"`
 	Text       string   `json:"text"`
 	Translated bool     `json:"translated,omitempty"`
 	Tasks      []string `json:"tasks,omitempty"`
@@ -141,7 +150,7 @@ func BuildRequest(o Options, text, detectedLang string) []Message {
 	user := fmt.Sprintf("Detected language: %s\nTarget language: %s\n%sText:\n%s",
 		detectedLang, o.Target, translateLine(o, detectedLang), text)
 
-	return []Message{{Role: "system", Content: sys.String()}, {Role: "user", Content: user}}
+	return []Message{{Role: roleSystem, Content: sys.String()}, {Role: roleUser, Content: user}}
 }
 
 // textKey describes the "text" key, naming the target language when the
@@ -187,6 +196,7 @@ func translateLine(o Options, detected string) string {
 
 type rawResult struct {
 	Language   *string         `json:"language"`
+	Hint       *string         `json:"hint"`
 	Text       *string         `json:"text"`
 	Translated *bool           `json:"translated"`
 	Tasks      []string        `json:"tasks"`
@@ -206,23 +216,44 @@ func Parse(raw, input, detected string, o Options) (Result, error) {
 	if err := decodeFirstObject(raw, &r); err != nil {
 		return Result{}, err
 	}
-	if r.Text == nil {
-		return Result{}, invalid("text missing")
-	}
-	text := strings.TrimSpace(*r.Text)
-	if text == "" {
-		return Result{}, invalid("text empty")
-	}
-	if utf8.RuneCountInString(text) > maxTextFactor*utf8.RuneCountInString(input) {
-		return Result{}, invalid("text too long")
+	text, err := checkText(r.Text, input)
+	if err != nil {
+		return Result{}, err
 	}
 
 	res, err := finish(r, text, o)
-	if err == nil && o.Translate && detected != "" && detected != o.Target && !res.Translated {
-		return Result{}, ErrNotTranslated
+	if err != nil {
+		return Result{}, err
 	}
 
-	return res, err
+	return res, checkTranslated(res, detected, o)
+}
+
+// checkText validates the processed text against the input it came from:
+// present, non-empty after trimming and at most maxTextFactor times as long.
+func checkText(raw *string, input string) (string, error) {
+	if raw == nil {
+		return "", invalid("text missing")
+	}
+	text := strings.TrimSpace(*raw)
+	if text == "" {
+		return "", invalid("text empty")
+	}
+	if utf8.RuneCountInString(text) > maxTextFactor*utf8.RuneCountInString(input) {
+		return "", invalid("text too long")
+	}
+
+	return text, nil
+}
+
+// checkTranslated reports ErrNotTranslated for a known language other than
+// the target that came back unmarked while translation is enabled.
+func checkTranslated(res Result, detected string, o Options) error {
+	if o.Translate && detected != "" && detected != o.Target && !res.Translated {
+		return ErrNotTranslated
+	}
+
+	return nil
 }
 
 // finish applies the optional keys of the enabled functions.

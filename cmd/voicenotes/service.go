@@ -18,6 +18,7 @@ import (
 	"github.com/Toshik1978/voicenotes/internal/capture"
 	"github.com/Toshik1978/voicenotes/internal/config"
 	"github.com/Toshik1978/voicenotes/internal/digest"
+	"github.com/Toshik1978/voicenotes/internal/docling"
 	"github.com/Toshik1978/voicenotes/internal/enrich"
 	"github.com/Toshik1978/voicenotes/internal/health"
 	"github.com/Toshik1978/voicenotes/internal/memos"
@@ -204,9 +205,9 @@ type pipelineParts struct {
 }
 
 // newPipeline builds the step handlers, the main and documents lane workers
-// and the ingester, with file ingest enabled. The LLM is wired only when
-// configured. Until docling lands the documents lane runs the same handlers;
-// it needs only extract.
+// and the ingester, with file ingest enabled. The LLM and the document reader
+// are wired only when configured. Both lanes get the same handlers; each
+// worker keeps only its lane's steps, so the documents lane runs extract.
 func newPipeline(cfg config.Config, log *zap.Logger, db *sqlite.DB, deps pipeline.Deps) (*pipelineParts, error) {
 	handlers, err := newHandlers(cfg, deps)
 	if err != nil {
@@ -297,10 +298,27 @@ func newChat(cfg config.Config) *openai.Chat {
 	}, &http.Client{Timeout: cfg.LLMTimeout})
 }
 
-// newHandlers builds the step handlers; the LLM is wired only when configured.
+// newDocling builds the document reader client. Its default http.Client
+// bounds each request; DOCLING_TIMEOUT bounds the whole conversion.
+func newDocling(cfg config.Config) *docling.Client {
+	return docling.NewClient(docling.Config{
+		BaseURL:  cfg.DoclingURL,
+		APIKey:   cfg.DoclingAPIKey,
+		MaxPages: cfg.DoclingMaxPages,
+		Timeout:  cfg.DoclingTimeout,
+		Version:  Version,
+	}, nil)
+}
+
+// newHandlers builds the step handlers. The LLM is wired only when
+// configured, and the document reader only when DOCLING_URL is set; without
+// it extract marks images and documents skipped, so nothing waits on docling.
 func newHandlers(cfg config.Config, deps pipeline.Deps) (map[capture.Step]pipeline.Handler, error) {
 	if cfg.LLMEnabled {
 		deps.Enricher = llmShim{c: newChat(cfg)}
+	}
+	if cfg.DoclingURL != "" {
+		deps.Extractor = doclingShim{c: newDocling(cfg)}
 	}
 
 	handlers, err := pipeline.NewHandlers(deps, pipeline.StepsConfig{
@@ -312,7 +330,7 @@ func newHandlers(cfg config.Config, deps pipeline.Deps) (map[capture.Step]pipeli
 		Enrich: enrich.Options{
 			Translate: cfg.LLMTranslate, Tidy: cfg.LLMTidy, Tasks: cfg.LLMTasks,
 			Target: cfg.TargetLanguage, MaxTags: cfg.LLMMaxTags,
-			InboxTag: cfg.InboxTag, TodoTag: cfg.TodoTag,
+			InboxTag: cfg.InboxTag, TodoTag: cfg.TodoTag, ExcerptRunes: cfg.HintExcerptRunes,
 		},
 	})
 	if err != nil {

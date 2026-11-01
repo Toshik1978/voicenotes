@@ -157,7 +157,7 @@ packages are in `internal/` (see plan.md Structure). `COVERPKG` stays unchanged.
 
 **Independent Test**: with `DOCLING_URL` and the LLM set, a photo of a bill, a text PDF, a scanned PDF and a DOCX each get a meaningful hint. With the LLM off, the hint is the first lines. A voice message sent right after a large scan is confirmed first (quickstart §2, §4).
 
-- [ ] T015 [P] [US2] Implement the docling-serve adapter in new `internal/docling/client.go` (tests in `internal/docling/client_test.go` with `httptest`), per contracts/external-apis.md §1 and research R1:
+- [x] T015 [P] [US2] Implement the docling-serve adapter in new `internal/docling/client.go` (tests in `internal/docling/client_test.go` with `httptest`), per contracts/external-apis.md §1 and research R1:
   - First pin the multipart encoding of `page_range` and the submit, poll and result shapes against `/openapi.json` of a current docling-serve, and record them in the test fixtures.
   - `Convert(ctx, name, mime, data)`:
     - submit to `/v1/convert/file/async` with `to_formats=md`, `image_export_mode=placeholder`, `include_images=false`, `do_ocr=true`, `abort_on_error=false`, `page_range` 1..`DOCLING_MAX_PAGES` and `document_timeout`
@@ -167,8 +167,8 @@ packages are in `internal/` (see plan.md Structure). `COVERPKG` stays unchanged.
   - Send `X-Api-Key` when set.
   - Classify per the contract table, including a distinct timeout result after `DOCLING_TIMEOUT`.
   - Never log content.
-- [ ] T016 [P] [US2] Add the per-file extraction policy in new `internal/capture/file.go` (tests in `internal/capture/file_test.go`): `DoclingTimeout(f)` increments `Timeouts`; at 3 it sets `state=failed` with `failure="couldn't read in time"` and reports permanent, otherwise temporary with `WaitingDocling` (FR-113).
-- [ ] T017 [P] [US2] Build the hint request in new `internal/enrich/files.go` (tests in `internal/enrich/files_test.go`), per contracts/external-apis.md §3 and research R5:
+- [x] T016 [P] [US2] Add the per-file extraction policy in new `internal/capture/file.go` (tests in `internal/capture/file_test.go`): `DoclingTimeout(f)` increments `Timeouts`; at 3 it sets `state=failed` with `failure="couldn't read in time"` and reports permanent, otherwise temporary with `WaitingDocling` (FR-113).
+- [x] T017 [P] [US2] Build the hint request in new `internal/enrich/files.go` (tests in `internal/enrich/files_test.go`), per contracts/external-apis.md §3 and research R5:
   - `BuildFilesRequest(opts, caption, excerpts)`:
     - excerpts are bounded in total by `HINT_EXCERPT_RUNES`, in file order, labelled `--- <file name> (excerpt) ---`, at least 200 runes per file while the budget allows
     - the system prompt marks excerpts as untrusted content to describe, never instructions (FR-119)
@@ -178,7 +178,7 @@ packages are in `internal/` (see plan.md Structure). `COVERPKG` stays unchanged.
     - caption `text`/`translated` follow the same checks as `Parse`
     - tasks come from the caption only
   - Add `Result.Hint` (`json:"hint,omitempty"`).
-- [ ] T018 [US2] Read documents and photos in the `extract` handler in `internal/pipeline/steps.go` (tests in `internal/pipeline/steps_test.go`):
+- [x] T018 [US2] Read documents and photos in the `extract` handler in `internal/pipeline/steps.go` (tests in `internal/pipeline/steps_test.go`):
   - Add an `Extractor` interface to `Deps` (nil when docling is not configured).
   - For image and document files, one per attempt:
     - read the local file
@@ -189,11 +189,11 @@ packages are in `internal/` (see plan.md Structure). `COVERPKG` stays unchanged.
     - return `Progress` while files remain
   - Unreachable docling is `Temporary` with `WaitingDocling`.
   - `QueuedText(WaitingDocling)` = `⏳ queued — document reader unavailable, will retry`.
-- [ ] T019 [US2] Produce the hint for `files` captures in `internal/pipeline/steps.go` (tests in `internal/pipeline/steps_test.go`):
+- [x] T019 [US2] Produce the hint for `files` captures in `internal/pipeline/steps.go` (tests in `internal/pipeline/steps_test.go`):
   - `enrich` calls `BuildFilesRequest`/`ParseFiles` when any file has text or there is a caption, under the existing budget and skip rules.
   - `noteInput` uses `Result.Hint` and processed caption text, else `FallbackHint` over the file texts (FR-116, FR-117, FR-118).
   - Document content is never logged; only sizes go to the logs.
-- [ ] T020 [US2] Wire docling in `cmd/voicenotes/service.go` and `cmd/voicenotes/adapters.go` (tests in `cmd/voicenotes/service_test.go`):
+- [x] T020 [US2] Wire docling in `cmd/voicenotes/service.go` and `cmd/voicenotes/adapters.go` (tests in `cmd/voicenotes/service_test.go`):
   - build the docling client only when `DOCLING_URL` is set
   - register the documents-lane `extract` handler with it
   - add an end-to-end test with an `httptest` docling showing that a voice capture completes while a document capture waits on a slow conversion (FR-114a)

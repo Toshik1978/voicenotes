@@ -8,6 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
+
 	"github.com/Toshik1978/voicenotes/internal/capture"
 	"github.com/Toshik1978/voicenotes/internal/enrich"
 	"github.com/Toshik1978/voicenotes/internal/pipeline"
@@ -90,31 +93,158 @@ func TestExtractSkipsUnreadFiles(t *testing.T) {
 	}
 }
 
-func TestEnrichFilesCaption(t *testing.T) {
-	opts := enrich.Options{Translate: true, Tidy: true, Tasks: true, Target: "en", MaxTags: 3}
-	t.Run("caption only runs the existing request on the caption", func(t *testing.T) {
-		e := &fakeEnricher{raw: `{"language":"en","text":"Pay the bill.","tasks":["Pay the bill"]}`, out: capture.OK()}
-		c := filesCapture(capture.File{Kind: capture.FileImage, State: capture.FileSkipped, LocalPath: "5.jpg"})
-		c.Text = "pay the bill"
-		got, out := llmHandlers(t, e)[capture.StepEnrich](context.Background(), c)
-		if out.Class != capture.ClassOK || e.calls != 1 {
-			t.Fatalf("out %+v calls %d", out, e.calls)
-		}
-		if want := enrich.BuildRequest(opts, "pay the bill", ""); !reflect.DeepEqual(e.got, want) {
-			t.Errorf("request %+v, want %+v", e.got, want)
-		}
-		if got.EnrichedJSON == "" || got.TaskCount != 1 {
-			t.Errorf("stored %q tasks %d", got.EnrichedJSON, got.TaskCount)
-		}
+// filesOpts are the LLM options of filesLLMHandlers, with a files excerpt
+// budget.
+func filesOpts() enrich.Options {
+	return enrich.Options{Translate: true, Tidy: true, Tasks: true, Target: "en", MaxTags: 3, ExcerptRunes: 500}
+}
+
+// filesLLMHandlers builds handlers with an enricher and filesOpts, logging to
+// the returned observer.
+func filesLLMHandlers(t *testing.T, e pipeline.Enricher) (map[capture.Step]pipeline.Handler, *observer.ObservedLogs) {
+	t.Helper()
+	core, logs := observer.New(zap.DebugLevel)
+	h, err := pipeline.NewHandlers(pipeline.Deps{
+		Transcriber: &fakeTranscriber{}, Notes: &fakeNotes{}, Replier: &fakeReplier{},
+		Downloader: &fakeDownloader{}, Files: newFakeAudio(), Enricher: e, Log: zap.New(core),
+	}, pipeline.StepsConfig{InboxTag: "inbox", TodoTag: "todo", NoteLimit: 1000, Enrich: filesOpts()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return h, logs
+}
+
+// readDoc is a document docling read to text.
+func readDoc(name, local, text string) capture.File {
+	return capture.File{
+		Kind: capture.FileDocument, State: capture.FileDone, FileName: name, LocalPath: local,
+		Text: text, TextSource: capture.TextDocling,
+	}
+}
+
+func TestEnrichFilesCaptionOnly(t *testing.T) {
+	e := &fakeEnricher{
+		raw: `{"language":"en","hint":"A bill.","text":"Pay the bill.","tasks":["Pay the bill"]}`,
+		out: capture.OK(),
+	}
+	c := filesCapture(capture.File{Kind: capture.FileImage, State: capture.FileSkipped, LocalPath: "5.jpg"})
+	c.Text = "pay the bill"
+	h, _ := filesLLMHandlers(t, e)
+	got, out := h[capture.StepEnrich](context.Background(), c)
+	if out.Class != capture.ClassOK || e.calls != 1 {
+		t.Fatalf("out %+v calls %d", out, e.calls)
+	}
+	want := enrich.BuildFilesRequest(filesOpts(), "pay the bill", []enrich.Excerpt{})
+	if !reflect.DeepEqual(e.got, want) {
+		t.Errorf("request %+v, want %+v", e.got, want)
+	}
+	res, err := enrich.Unmarshal(got.EnrichedJSON)
+	if err != nil || res.Hint != "A bill." || res.Text != "Pay the bill." || got.TaskCount != 1 {
+		t.Errorf("stored %q (%v) tasks %d", got.EnrichedJSON, err, got.TaskCount)
+	}
+}
+
+// File texts become excerpts labelled with the attachment names; tasks never
+// come from documents and their content is never logged.
+func TestEnrichFilesExcerpts(t *testing.T) {
+	const secret = "CONFIDENTIAL invoice body"
+	e := &fakeEnricher{raw: `{"language":"de","hint":"An invoice and a receipt.","tasks":["x"]}`, out: capture.OK()}
+	c := filesCapture(
+		readDoc("invoice.pdf", "5.pdf", secret),
+		capture.File{Kind: capture.FileVideo, State: capture.FileSkipped, LocalPath: "5-1.mp4"},
+		capture.File{
+			Kind: capture.FileImage, State: capture.FileDone, LocalPath: "5-2.jpg",
+			Text: "receipt total 12", TextSource: capture.TextDocling,
+		},
+		capture.File{Kind: capture.FileDocument, State: capture.FileFailed, Failure: "couldn't read in time"},
+	)
+	h, logs := filesLLMHandlers(t, e)
+	got, out := h[capture.StepEnrich](context.Background(), c)
+	if out.Class != capture.ClassOK || e.calls != 1 {
+		t.Fatalf("out %+v calls %d", out, e.calls)
+	}
+	want := enrich.BuildFilesRequest(filesOpts(), "", []enrich.Excerpt{
+		{Name: "invoice.pdf", Text: secret},
+		{Name: "photo-2026-01-02-3.jpg", Text: "receipt total 12"},
 	})
-	t.Run("no caption records no call", func(t *testing.T) {
-		e := &fakeEnricher{raw: `{"text":"x"}`, out: capture.OK()}
-		c := filesCapture(capture.File{Kind: capture.FileImage, State: capture.FileSkipped, LocalPath: "5.jpg"})
-		got, out := llmHandlers(t, e)[capture.StepEnrich](context.Background(), c)
-		if out.Class != capture.ClassOK || e.calls != 0 || got.EnrichedJSON != "" || got.LLMSkipped != "" {
-			t.Errorf("out %+v calls %d stored %q skipped %q", out, e.calls, got.EnrichedJSON, got.LLMSkipped)
+	if !reflect.DeepEqual(e.got, want) {
+		t.Errorf("request %+v, want %+v", e.got, want)
+	}
+	res, err := enrich.Unmarshal(got.EnrichedJSON)
+	if err != nil || res.Hint != "An invoice and a receipt." || len(res.Tasks) != 0 || got.TaskCount != 0 {
+		t.Errorf("stored %q (%v) tasks %d", got.EnrichedJSON, err, got.TaskCount)
+	}
+	if logs.Len() == 0 {
+		t.Error("no log of the answer's shape")
+	}
+	for _, l := range logs.All() {
+		if logged := fmt.Sprint(l.Message, l.ContextMap()); strings.Contains(logged, "CONFIDENTIAL") ||
+			strings.Contains(logged, "invoice") {
+			t.Errorf("document content logged: %s", logged)
 		}
-	})
+	}
+}
+
+func TestEnrichFilesOutcomes(t *testing.T) {
+	doc := []capture.File{readDoc("a.pdf", "5.pdf", "text")}
+	nothing := []capture.File{
+		{Kind: capture.FileImage, State: capture.FileSkipped, LocalPath: "5.jpg"},
+		{Kind: capture.FileDocument, State: capture.FileEmpty, LocalPath: "5-1.pdf"},
+	}
+	tests := []struct {
+		name          string
+		files         []capture.File
+		caption, lang string
+		stored        string
+		e             *fakeEnricher
+		wantClass     capture.Class
+		wantCalls     int
+	}{
+		{
+			name: "nothing to describe records no call", files: nothing,
+			e: &fakeEnricher{raw: `{"hint":"x"}`, out: capture.OK()}, wantClass: capture.ClassOK,
+		},
+		{
+			name: "a stored result needs no call", files: doc, stored: `{"hint":"kept","text":""}`,
+			e: &fakeEnricher{raw: `{"hint":"x"}`, out: capture.OK()}, wantClass: capture.ClassOK,
+		},
+		{
+			name: "an answer without a hint is invalid", files: doc,
+			e:         &fakeEnricher{raw: `{"language":"en","hint":"  "}`, out: capture.OK()},
+			wantClass: capture.ClassPermanent, wantCalls: 1,
+		},
+		{
+			name:    "an untranslated caption is retried",
+			files:   doc,
+			caption: "оплатить счёт",
+			lang:    "ru",
+			e: &fakeEnricher{
+				raw: `{"language":"ru","hint":"A bill.","text":"оплатить счёт"}`,
+				out: capture.OK(),
+			},
+			wantClass: capture.ClassTemporary,
+			wantCalls: 1,
+		},
+		{
+			name: "the endpoint's outcome is returned", files: doc,
+			e: &fakeEnricher{out: capture.Temporary("http 503")}, wantClass: capture.ClassTemporary, wantCalls: 1,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := filesCapture(tc.files...)
+			c.Text, c.Language, c.EnrichedJSON = tc.caption, tc.lang, tc.stored
+			h, _ := filesLLMHandlers(t, tc.e)
+			got, out := h[capture.StepEnrich](context.Background(), c)
+			if out.Class != tc.wantClass || tc.e.calls != tc.wantCalls {
+				t.Errorf("out %+v calls %d", out, tc.e.calls)
+			}
+			if got.EnrichedJSON != tc.stored || got.LLMSkipped != "" {
+				t.Errorf("stored %q skipped %q", got.EnrichedJSON, got.LLMSkipped)
+			}
+		})
+	}
 }
 
 // writeAll runs write_note until it stops returning progress.
@@ -241,6 +371,84 @@ func TestWriteFilesNoteUsesTheEnrichedCaption(t *testing.T) {
 	}
 	if got.TaskCount != 1 {
 		t.Errorf("tasks %d", got.TaskCount)
+	}
+}
+
+func TestWriteFilesNoteHintSources(t *testing.T) {
+	doc := func(text string) capture.File {
+		return capture.File{
+			Kind: capture.FileDocument, State: capture.FileDone, FileName: "invoice.pdf", LocalPath: "5.pdf",
+			Text: text, TextSource: capture.TextDocling,
+		}
+	}
+	tests := []struct {
+		name     string
+		files    []capture.File
+		caption  string
+		enriched string
+		minimal  bool
+		want     string
+	}{
+		{
+			name:     "the stored hint and processed caption",
+			files:    []capture.File{doc("Invoice 42\nACME Ltd\nTotal 10")},
+			caption:  "оплатить",
+			enriched: `{"language":"ru","hint":"An ACME invoice.","text":"Pay it","translated":true}`,
+			want:     "Pay it\n\nAn ACME invoice.\n\n*Original (ru):*\n> оплатить\n\n#inbox",
+		},
+		{
+			name:     "a hint without a caption",
+			files:    []capture.File{doc("Invoice 42")},
+			enriched: `{"language":"en","hint":"An ACME invoice.","text":""}`,
+			want:     "An ACME invoice.\n\n#inbox",
+		},
+		{
+			name:  "no result falls back to the file text",
+			files: []capture.File{doc("Invoice 42\nACME Ltd\nTotal 10")},
+			want:  "Invoice 42\nACME Ltd\n\n#inbox",
+		},
+		{
+			name:     "a stored result without a hint falls back",
+			files:    []capture.File{doc("Invoice 42")},
+			caption:  "march",
+			enriched: `{"text":"March"}`,
+			want:     "March\n\nInvoice 42\n\n#inbox",
+		},
+		{
+			name:     "a minimal note ignores the stored hint",
+			files:    []capture.File{doc("Invoice 42")},
+			enriched: `{"hint":"An ACME invoice.","text":""}`,
+			minimal:  true,
+			want:     "Invoice 42\n\n#inbox",
+		},
+		{
+			name: "every file failed names the docling reason",
+			files: []capture.File{
+				{
+					Kind: capture.FileDocument, State: capture.FileFailed, FileName: "a.pdf", LocalPath: "5.pdf",
+					Failure: "couldn't read in time",
+				},
+				{
+					Kind: capture.FileDocument, State: capture.FileFailed, FileName: "b.pdf", LocalPath: "5-1.pdf",
+					Failure: "docling: unsupported format",
+				},
+			},
+			want: "📎 2 files — couldn't read in time\n\n#inbox",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRig(t)
+			r.audio.files["5.pdf"], r.audio.files["5-1.pdf"] = []byte("A"), []byte("B")
+			c := filesCapture(tc.files...)
+			c.Text, c.EnrichedJSON, c.MinimalNote = tc.caption, tc.enriched, tc.minimal
+			if _, out := writeAll(t, r, c); out.Class != capture.ClassOK {
+				t.Fatalf("out %+v", out)
+			}
+			if got := r.notes.created[0].Content; got != tc.want {
+				t.Errorf("content %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

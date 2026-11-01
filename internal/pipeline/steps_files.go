@@ -3,9 +3,17 @@ package pipeline
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"html"
+	"io/fs"
+	"path"
 	"slices"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"go.uber.org/zap"
 
 	"github.com/Toshik1978/voicenotes/internal/capture"
 	"github.com/Toshik1978/voicenotes/internal/enrich"
@@ -21,16 +29,116 @@ func (s *stepRunner) collect(_ context.Context, c capture.Capture) (capture.Capt
 	return c, capture.OK()
 }
 
-// skipUnreadFiles marks every pending photo, document and video skipped: no
-// document reader is wired yet, and a video is never read. Audio and files
-// already settled (failed downloads among them) are left alone.
-func skipUnreadFiles(files []capture.File) {
+// skipUnreadFiles marks every pending video skipped, since a video is never
+// read, and every pending photo and document too when no document reader is
+// wired. Audio and files already settled (failed downloads among them) are
+// left alone.
+func skipUnreadFiles(files []capture.File, reader bool) {
 	for i := range files {
 		f := &files[i]
-		if f.Kind != capture.FileAudio && f.State == capture.FilePending {
+		if f.State != capture.FilePending {
+			continue
+		}
+		if f.Kind == capture.FileVideo || (!reader && f.Kind != capture.FileAudio) {
 			f.State = capture.FileSkipped
 		}
 	}
+}
+
+// readDocument sends the photo or document c.Files[i] to the document reader
+// and records its text. A permanent failure, or the timeout that ends the
+// file's budget, fails the file and the batch goes on (OK). Any other failure
+// keeps the file pending and waits on the reader. A missing local copy fails
+// the file: it cannot be recovered. Content is never logged.
+func (s *stepRunner) readDocument(ctx context.Context, c *capture.Capture, i int) capture.Outcome {
+	f := &c.Files[i]
+	data, err := s.d.Files.Read(f.LocalPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		s.log(*c, "file missing, not read", err)
+		// Nothing is held: the placeholder must say so.
+		f.LocalPath, f.State, f.Failure = "", capture.FileFailed, "file missing"
+
+		return capture.OK()
+	}
+	if err != nil {
+		s.log(*c, "file read failed", err)
+
+		return capture.Temporary("file store: " + err.Error())
+	}
+	name := cmp.Or(SanitizeFileName(f.FileName), path.Base(f.LocalPath))
+	start := time.Now()
+	res, out := s.d.Extractor.Convert(ctx, name, f.MimeType, data)
+	s.d.Log.Debug("document read",
+		zap.Int64("capture", c.ID), zap.Int("position", f.Position), zap.String("kind", f.Kind.String()),
+		zap.Int("bytes", len(data)), zap.Duration("took", time.Since(start)),
+		zap.Stringer("class", out.Class), zap.Bool("timed_out", res.TimedOut),
+		zap.Int("text_bytes", len(res.Markdown)))
+	if res.TimedOut {
+		out = capture.DoclingTimeout(f)
+	}
+	if out.Class == capture.ClassPermanent {
+		f.State, f.Failure = capture.FileFailed, out.Reason
+
+		return capture.OK()
+	}
+	if out.Class != capture.ClassOK {
+		return out.On(capture.WaitingDocling)
+	}
+	f.Text, f.TextSource, f.State = res.Markdown, capture.TextDocling, capture.FileDone
+	if strings.TrimSpace(res.Markdown) == "" {
+		f.Text, f.State = "", capture.FileEmpty
+	}
+
+	return capture.OK()
+}
+
+// enrichFiles asks the LLM for one hint over a files capture: its caption,
+// if any, and an excerpt of every file with text, bounded in total by
+// Options.ExcerptRunes. With neither there is nothing to describe and no
+// call; the renderer's fallback hint applies. Skip, budget and invalid-output
+// rules are enrich's. Only sizes are logged, never the caption, the document
+// text or the answer.
+func (s *stepRunner) enrichFiles(ctx context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
+	excerpts := s.fileExcerpts(c)
+	if len(excerpts) == 0 && strings.TrimSpace(c.Text) == "" {
+		return c, capture.OK()
+	}
+	raw, out := s.d.Enricher.Complete(ctx, enrich.BuildFilesRequest(s.cfg.Enrich, c.Text, excerpts))
+	if out.Class != capture.ClassOK {
+		return c, out
+	}
+	res, err := enrich.ParseFiles(raw, c.Text, c.Language, s.cfg.Enrich)
+	if c, out = s.storeResult(c, res, err); out.Class != capture.ClassOK {
+		return c, out
+	}
+	excerptRunes := 0
+	for _, e := range excerpts {
+		excerptRunes += utf8.RuneCountInString(e.Text)
+	}
+	s.d.Log.Debug("LLM hint accepted",
+		zap.Int64("capture", c.ID), zap.String("detected", c.Language),
+		zap.String("language", res.Language), zap.Bool("translated", res.Translated),
+		zap.Int("tasks", len(res.Tasks)), zap.Int("tags", len(res.Tags)),
+		zap.Int("files_with_text", len(excerpts)), zap.Int("excerpt_runes", excerptRunes),
+		zap.Int("caption_runes", utf8.RuneCountInString(c.Text)),
+		zap.Int("hint_runes", utf8.RuneCountInString(res.Hint)))
+
+	return c, capture.OK()
+}
+
+// fileExcerpts lists, in file order, the text of every file that has some,
+// labelled with the file's attachment name (a photo has no name of its own).
+// BuildFilesRequest cuts them to the budget.
+func (s *stepRunner) fileExcerpts(c capture.Capture) []enrich.Excerpt {
+	names := AttachmentNames(c.ReceivedAt, s.cfg.Location, c.Files)
+	out := []enrich.Excerpt{}
+	for i := range c.Files {
+		if text := strings.TrimSpace(c.Files[i].Text); text != "" {
+			out = append(out, enrich.Excerpt{Name: names[i], Text: text})
+		}
+	}
+
+	return out
 }
 
 // writeFilesNote creates the note of a files capture once and then attaches
@@ -59,9 +167,10 @@ func (s *stepRunner) writeFilesNote(ctx context.Context, c capture.Capture) (cap
 	return c, capture.OK()
 }
 
-// filesNoteInput maps a files capture to the renderer input: the caption
-// (processed by the LLM step when a result is stored), the fallback hint over
-// every file, and the checklist, quote and tags of the stored result.
+// filesNoteInput maps a files capture to the renderer input. A stored LLM
+// result supplies the processed caption, the hint, the checklist, quote and
+// tags; without one (or without a hint in it) the hint falls back to
+// render.FallbackHint over every file, whose failure reasons it names.
 func (s *stepRunner) filesNoteInput(c capture.Capture) render.Input {
 	files := fileSummaries(c.Files)
 	in := render.Input{
@@ -78,6 +187,9 @@ func (s *stepRunner) filesNoteInput(c capture.Capture) render.Input {
 		return in
 	}
 	in.Caption, in.Actions, in.SuggestedTags = res.Text, res.Tasks, res.Tags
+	if res.Hint != "" {
+		in.Hint = res.Hint
+	}
 	if res.Translated {
 		in.Original, in.OriginalLang = c.Text, c.Language
 		if in.OriginalLang == "" {

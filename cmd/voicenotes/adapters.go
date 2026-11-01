@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/Toshik1978/voicenotes/internal/capture"
+	"github.com/Toshik1978/voicenotes/internal/docling"
 	"github.com/Toshik1978/voicenotes/internal/enrich"
 	"github.com/Toshik1978/voicenotes/internal/health"
 	"github.com/Toshik1978/voicenotes/internal/memos"
@@ -26,6 +27,20 @@ func (s sttShim) Transcribe(
 	res, out := s.t.Transcribe(ctx, openai.Request{ID: r.ID, Ext: r.Ext, Audio: r.Audio, Language: r.Language})
 
 	return pipeline.TranscribeResult{Text: res.Text, Language: res.Language}, out
+}
+
+// doclingShim adapts the docling client to pipeline.Extractor, whose result
+// type keeps pipeline free of the adapter.
+type doclingShim struct{ c *docling.Client }
+
+var _ pipeline.Extractor = doclingShim{}
+
+func (d doclingShim) Convert(
+	ctx context.Context, name, mime string, data []byte,
+) (pipeline.ExtractResult, capture.Outcome) {
+	res, out := d.c.Convert(ctx, name, mime, data)
+
+	return pipeline.ExtractResult{Markdown: res.Markdown, TimedOut: res.TimedOut}, out
 }
 
 // notesShim adapts the Memos client to pipeline.NotesWriter.

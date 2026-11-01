@@ -75,3 +75,26 @@ type File struct {
 	Attached      bool
 	AttachFailure string
 }
+
+// maxDoclingTimeouts is how many docling timeouts one file may take before
+// extraction gives up on it (FR-113).
+const maxDoclingTimeouts = 3
+
+// failureTimeout is the placeholder reason for a file that timed out too often.
+const failureTimeout = "couldn't read in time"
+
+// DoclingTimeout records one docling timeout on f and returns its outcome. The
+// third timeout on the same file fails the file for good with the
+// "couldn't read in time" reason (Permanent). Earlier timeouts are Temporary
+// and wait on docling. An unreachable docling service is not a timeout and is
+// classified by the HTTP client instead.
+func DoclingTimeout(f *File) Outcome {
+	f.Timeouts++
+	if f.Timeouts >= maxDoclingTimeouts {
+		f.State = FileFailed
+		f.Failure = failureTimeout
+		return Permanent(failureTimeout)
+	}
+
+	return Temporary("docling timeout").On(WaitingDocling)
+}
