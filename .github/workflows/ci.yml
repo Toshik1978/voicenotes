@@ -7,6 +7,14 @@ on:
     branches:
       - main
   pull_request:
+  # Weekly, against main with no commit: CI installs the newest Go patch
+  # (check-latest) and runs golangci-lint `latest`, so main can go red without
+  # a change here.
+  # A Go patch or a linter release adds a finding, and without this run the
+  # first job to notice is whichever PR happens to come next (usually a
+  # Dependabot one), which then fails for a reason that is not its own.
+  schedule:
+    - cron: '57 4 * * 1'
   # Lets release.yml gate publishing on the same lint, test and build, so a
   # v* tag push is checked there rather than by a second run of this file.
   workflow_call:
