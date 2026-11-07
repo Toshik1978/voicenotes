@@ -49,6 +49,10 @@ jobs:
         with:
           version: latest
 
+      # Reachability-aware: fails only on advisories in code this module actually calls.
+      - name: Check for known vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
   test:
     name: test
     runs-on: ubuntu-latest
