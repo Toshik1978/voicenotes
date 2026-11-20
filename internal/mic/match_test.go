@@ -133,3 +133,17 @@ func TestMatchReceiver(t *testing.T) {
 		})
 	}
 }
+
+func TestMatchReceiverLeavesCaptureDeviceEmpty(t *testing.T) {
+	const usb = "/sys/devices/pci0000:00/usb1/1-1"
+
+	got, ok := MatchReceiver(Snapshot{
+		Cards: []SoundCard{{Number: 1, HasCapture: true, USBParent: usb}},
+		Inputs: []InputDevice{
+			{Path: "/dev/input/event3", KeyBitmap: readFixture(t, "key_consumer_control.txt"), USBParent: usb},
+		},
+	})
+	if !ok || got.CaptureDevice != "" {
+		t.Fatalf("got %+v, %v; want a match with no explicit capture device", got, ok)
+	}
+}

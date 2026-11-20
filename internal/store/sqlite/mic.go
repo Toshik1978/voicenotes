@@ -198,3 +198,28 @@ func (s *DB) SetRecorderAlert(ctx context.Context, name, alert string) error {
 
 	return nil
 }
+
+// HasStartReply reports whether a start reply is stored for the recording.
+func (s *DB) HasStartReply(ctx context.Context, recordingID int64) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM mic_replies WHERE recording_id = ?`, recordingID).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("sqlite: look up start reply of recording %d: %w", recordingID, err)
+	}
+
+	return n > 0, nil
+}
+
+// HasRecording reports whether a microphone capture with the recording ID
+// is stored for the notify chat.
+func (s *DB) HasRecording(ctx context.Context, chatID, recordingID int64) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM captures
+WHERE source = ? AND source_chat_id = ? AND source_message_id = ?`,
+		capture.SourceMic, chatID, recordingID).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("sqlite: look up recording %d: %w", recordingID, err)
+	}
+
+	return n > 0, nil
+}

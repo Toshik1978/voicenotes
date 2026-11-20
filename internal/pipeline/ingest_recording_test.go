@@ -148,3 +148,28 @@ func TestIngestRecordingToNote(t *testing.T) {
 		t.Errorf("reply %d", c.ReplyMessageID)
 	}
 }
+
+// TestIngestRecordingDueAtServiceClock: a recorder clock ahead of the service
+// keeps the note time but must not delay processing (vn-c82.8).
+func TestIngestRecordingDueAtServiceClock(t *testing.T) {
+	now := time.Date(2026, 3, 4, 5, 0, 0, 0, time.UTC)
+	rec := &fakeRecordings{}
+	in, err := pipeline.NewIngester(&fakeInserter{}, &fakeWaker{},
+		pipeline.WithRecordings(rec, micChat), pipeline.WithClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	started := now.Add(10 * time.Minute)
+	meta := pipeline.RecordingMeta{ID: 1, StartedAt: started}
+	if _, err := in.IngestRecording(context.Background(), meta, "a.wav"); err != nil {
+		t.Fatal(err)
+	}
+	c := rec.rows[0]
+	if !c.ReceivedAt.Equal(started) {
+		t.Errorf("note time = %v, want %v", c.ReceivedAt, started)
+	}
+	if c.NextAttemptAt.After(now) || !c.UpdatedAt.Equal(now) {
+		t.Errorf("next attempt %v, updated %v, want due at service now %v", c.NextAttemptAt, c.UpdatedAt, now)
+	}
+}

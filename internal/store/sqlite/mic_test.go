@@ -196,3 +196,43 @@ func TestNoSpeechPersists(t *testing.T) {
 		t.Error("NoSpeech lost on update")
 	}
 }
+
+func TestHasStartReply(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+
+	if ok, err := s.HasStartReply(ctx, 5); err != nil || ok {
+		t.Fatalf("before put: %v %v", ok, err)
+	}
+	if err := s.PutStartReply(ctx, 5, micChat, 50); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.HasStartReply(ctx, 5); err != nil || !ok {
+		t.Fatalf("after put: %v %v", ok, err)
+	}
+	if _, _, _, err := s.TakeStartReply(ctx, 5); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.HasStartReply(ctx, 5); err != nil || ok {
+		t.Fatalf("after take: %v %v", ok, err)
+	}
+}
+
+func TestHasRecording(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+
+	if ok, err := s.HasRecording(ctx, micChat, 43); err != nil || ok {
+		t.Fatalf("before insert: %v %v", ok, err)
+	}
+	c := newRecording(t, 43)
+	if err := s.InsertRecording(ctx, &c); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.HasRecording(ctx, micChat, 43); err != nil || !ok {
+		t.Fatalf("after insert: %v %v", ok, err)
+	}
+	if ok, err := s.HasRecording(ctx, micChat+1, 43); err != nil || ok {
+		t.Fatalf("other chat: %v %v", ok, err)
+	}
+}

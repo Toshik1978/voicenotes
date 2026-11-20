@@ -3,8 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/Toshik1978/voicenotes/internal/capture"
+	"github.com/Toshik1978/voicenotes/internal/config"
 	"github.com/Toshik1978/voicenotes/internal/docling"
 	"github.com/Toshik1978/voicenotes/internal/enrich"
 	"github.com/Toshik1978/voicenotes/internal/health"
@@ -107,4 +111,51 @@ func (q healthQueue) LastDigestDate(ctx context.Context) (string, error) {
 	}
 
 	return date, nil
+}
+
+// startReplies adapts the sqlite start-reply store to
+// pipeline.StartReplyStore, which uses its own StartReply type.
+type startReplies struct{ db *sqlite.DB }
+
+func (s startReplies) StaleStartReplies(ctx context.Context, olderThan time.Time) ([]pipeline.StartReply, error) {
+	rows, err := s.db.StaleStartReplies(ctx, olderThan)
+	if err != nil {
+		return nil, fmt.Errorf("stale start replies: %w", err)
+	}
+	out := make([]pipeline.StartReply, len(rows))
+	for i, r := range rows {
+		out[i] = pipeline.StartReply{RecordingID: r.RecordingID, ChatID: r.ChatID, MessageID: r.MessageID}
+	}
+
+	return out, nil
+}
+
+//nolint:revive // the four results are the specified signature
+func (s startReplies) TakeStartReply(
+	ctx context.Context,
+	recordingID int64,
+) (chatID, messageID int64, ok bool, err error) {
+	return s.db.TakeStartReply(ctx, recordingID) //nolint:wrapcheck // pass-through adapter
+}
+
+// replyPurger purges done captures through the store and stale start replies
+// through the janitor.
+type replyPurger struct {
+	*sqlite.DB
+	pipeline.StartReplyJanitor
+}
+
+// purgerFor returns the purge target of PurgeLoop: the store alone, or, with
+// the microphone enabled, one that also marks stale start messages.
+//
+//nolint:ireturn // the result is either implementation
+func purgerFor(
+	cfg config.Config, db *sqlite.DB, replier pipeline.Replier, log *zap.Logger,
+) pipeline.Purger {
+	if cfg.MicUploadToken == "" {
+		return db
+	}
+	janitor := pipeline.StartReplyJanitor{Store: startReplies{db: db}, Replier: replier, Log: log}
+
+	return replyPurger{db, janitor}
 }

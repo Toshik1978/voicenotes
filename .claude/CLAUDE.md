@@ -16,6 +16,7 @@ Before any commit, all of these must hold:
 | `golangci-lint fmt --diff` | no output |
 | `task test:coverage` | tests pass with `-race`, total coverage at or above 80% |
 | `task build` | `bin/voicenotes` builds with `CGO_ENABLED=0` |
+| `task build:mic` | `bin/voicenotes-mic` builds with cgo (`CGO_ENABLED=1`) |
 
 Other tasks: `task setup` (download modules), `task format` (apply formatters
 and autofixes), `task test` (plain verbose run), `task run` (builds, loads
@@ -45,10 +46,11 @@ command wires all three stages:
 | `pre-commit` | `golangci-lint fmt --diff` |
 | `pre-push` | `task lint` |
 
-CI (`ci.yml`) runs lint, the tests with the 80% coverage gate, and a
-`CGO_ENABLED=0` build; it never publishes. On pushes to `main` it updates the
-Tests and Coverage README badges in a public gist (repository secrets
-`GIST_ID` and `GIST_SECRET_TOKEN`, a token with the `gist` scope); on pull
+CI (`ci.yml`) runs lint, the tests with the 80% coverage gate, a
+`CGO_ENABLED=0` build, and a `build-mic` job that builds the cgo recorder
+natively on `ubuntu-24.04` and `ubuntu-24.04-arm`; it never publishes. On
+pushes to `main` it updates the Tests and Coverage README badges in a public
+gist (repository secrets `GIST_ID` and `GIST_SECRET_TOKEN`, a token with the `gist` scope); on pull
 requests it posts a sticky coverage comment. `release.yml` runs only on `v*` tags:
 it builds the release body from `CHANGELOG.md` via
 `.github/scripts/extract-changelog.sh`, pushes the multi-arch image as

@@ -85,6 +85,8 @@ type Ingester struct {
 	fetch Downloader
 	held  FileStore
 	log   *zap.Logger
+	// now is the service clock (default time.Now).
+	now func() time.Time
 }
 
 // IngesterOption configures optional ingest features.
@@ -95,6 +97,16 @@ type IngesterOption func(*Ingester)
 // fetched with fetch and written to held before its ack (Constitution VI).
 func WithFiles(files FileAppender, quiet time.Duration, fetch Downloader, held FileStore) IngesterOption {
 	return func(i *Ingester) { i.files, i.quiet, i.fetch, i.held = files, quiet, fetch, held }
+}
+
+// WithClock sets the service clock that makes a recording due (default
+// time.Now).
+func WithClock(now func() time.Time) IngesterOption {
+	return func(i *Ingester) {
+		if now != nil {
+			i.now = now
+		}
+	}
 }
 
 // WithLog sets the logger for ingest problems that cannot fail an ingest
@@ -116,7 +128,7 @@ func NewIngester(store Inserter, waker Waker, opts ...IngesterOption) (*Ingester
 		return nil, errors.New("pipeline: nil waker")
 	}
 
-	i := &Ingester{store: store, waker: waker, log: zap.NewNop()}
+	i := &Ingester{store: store, waker: waker, log: zap.NewNop(), now: time.Now}
 	for _, opt := range opts {
 		opt(i)
 	}

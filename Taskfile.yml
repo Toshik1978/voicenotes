@@ -5,6 +5,7 @@ dotenv: ['.env']
 
 vars:
   BINARY: bin/voicenotes
+  MIC_BINARY: bin/voicenotes-mic
   # Coverage gate scope: the pure decision logic (config, pipeline steps,
   # language selection, enrichment, note rendering, digest composition, health).
   # The I/O adapters run against real external services and are excluded, though
@@ -62,6 +63,19 @@ tasks:
     generates:
       - "{{.BINARY}}"
 
+  build:mic:
+    desc: Compile the voicenotes-mic recorder binary (cgo, for the malgo audio capture)
+    env:
+      CGO_ENABLED: "1"
+    cmds:
+      - rm -f {{.MIC_BINARY}}
+      - >-
+        go build -v
+        -ldflags "-X main.Buildstamp={{.BUILDSTAMP}} -X main.Commit={{.COMMIT}}"
+        -o {{.MIC_BINARY}} ./cmd/voicenotes-mic
+    generates:
+      - "{{.MIC_BINARY}}"
+
   run:
     desc: Build and run the service (loads .env)
     deps: [build]
@@ -71,7 +85,7 @@ tasks:
     desc: Remove build artifacts and test cache
     cmds:
       - go clean -testcache
-      - rm -f {{.BINARY}} coverage.txt
+      - rm -f {{.BINARY}} {{.MIC_BINARY}} coverage.txt
 
   changelog:
     desc: Prepend the generated commit list for the next release to CHANGELOG.md (TAG=vX.Y.Z)

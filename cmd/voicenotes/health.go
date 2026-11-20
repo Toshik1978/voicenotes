@@ -128,9 +128,24 @@ func listenHealth(addr string) (net.Listener, error) {
 	return ln, nil
 }
 
+// uploadReadTimeout bounds reading a whole request, a recording upload included.
+const uploadReadTimeout = 2 * time.Minute
+
+// newHTTPServer returns the service's HTTP server. Go starts WriteTimeout when
+// the request headers are read, not when the body is done, so it must outlast
+// ReadTimeout: ReadTimeout + 30s leaves 30s to answer after the slowest upload.
+func newHTTPServer(h http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: healthCheckTimeout,
+		ReadTimeout:       uploadReadTimeout,
+		WriteTimeout:      uploadReadTimeout + 30*time.Second,
+	}
+}
+
 // serveHTTP serves h on ln until ctx is cancelled, then shuts down gracefully.
 func serveHTTP(ctx context.Context, ln net.Listener, h http.Handler, log *zap.Logger) {
-	srv := &http.Server{Handler: h, ReadHeaderTimeout: healthCheckTimeout}
+	srv := newHTTPServer(h)
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
 

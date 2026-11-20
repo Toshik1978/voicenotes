@@ -54,8 +54,9 @@ var ErrNoRecordings = errors.New("pipeline: recordings not enabled")
 
 // IngestRecording queues the WAV at localPath (relative to the files
 // directory, already fsynced) as an audio capture starting at extract, timed
-// at meta.StartedAt. It inserts through InsertRecording, which attaches the
-// start reply, with no ack, then wakes the worker.
+// at meta.StartedAt but due at the service clock. It inserts through
+// InsertRecording, which attaches the start reply, with no ack, then wakes
+// the worker.
 func (i *Ingester) IngestRecording(
 	ctx context.Context, meta RecordingMeta, localPath string,
 ) (RecordingResult, error) {
@@ -66,6 +67,9 @@ func (i *Ingester) IngestRecording(
 	if err != nil {
 		return 0, fmt.Errorf("pipeline: recording capture: %w", err)
 	}
+	// The recorder's clock may run ahead: the note keeps StartedAt, but the
+	// capture is due now on the service clock.
+	c.NextAttemptAt, c.UpdatedAt = i.now(), i.now()
 	c.Source, c.SourceChatID, c.SourceMessageID = capture.SourceMic, i.notifyChatID, meta.ID
 	c.Files = []capture.File{{
 		Source: c.Source, SourceChatID: c.SourceChatID, SourceMessageID: c.SourceMessageID,
