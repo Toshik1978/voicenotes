@@ -45,12 +45,20 @@ speech-to-text, LLM or Memos instances present.
 Rationale: every dependency is code shipped in a service that handles the owner's private
 thoughts. It must earn its place.
 
-### IV. Static, CGO-Free Builds
+### IV. Static, CGO-Free Service
 
-- Builds MUST succeed with `CGO_ENABLED=0`, and no dependency may require cgo.
-- The Docker image is distroless and static. Nothing may assume a libc or a shell inside it.
+- The service binary `voicenotes` and every package it imports MUST build with
+  `CGO_ENABLED=0`, and no dependency of the service may require cgo.
+- The service image is distroless and static. Nothing may assume a libc or a shell inside it.
+- Exception: the recorder binary `voicenotes-mic` (`cmd/voicenotes-mic`), which runs natively on
+  the host that has the microphone receiver, MAY use cgo for audio capture through an approved
+  dependency. Code that requires cgo MUST live only in packages imported solely by that binary.
+  A lint rule and a test MUST fail if the service's import graph reaches them.
+- The recorder ships as per-architecture binaries (`linux/amd64`, `linux/arm64`) built in CI.
 
-Rationale: a single static binary deploys anywhere and keeps the image minimal.
+Rationale: a single static binary deploys anywhere and keeps the image minimal. Capturing audio
+from arbitrary USB receivers without cgo means re-implementing ALSA by hand; confining cgo to a
+separate, host-native recorder keeps the service static while using a mature audio library.
 
 ### V. Fail Fast on Configuration, Degrade on Dependencies
 
@@ -72,8 +80,13 @@ must never take capture down with it.
 - Every pipeline step MUST be idempotent, and its result MUST be recorded, so that a step is never
   repeated after a later failure or restart and a capture yields at most one note.
 - A permanent failure MUST degrade to a note containing whatever is available (at minimum the
-  audio and a placeholder naming the failure), never to silent loss.
-- Local audio MUST be deleted only after the note carrying it has been saved.
+  audio and a placeholder naming the failure), never to silent loss. A successful transcription
+  that found no speech is not a failure and produces no placeholder note.
+- Local audio MUST be deleted only after the note carrying it has been saved, with one
+  exception: when speech-to-text succeeded and found no speech, no note is created, and the audio
+  MAY be deleted only if the source still holds the original (for example a Telegram message) or
+  after it has been held locally for a configured period (for example a microphone recording,
+  which has no other copy).
 
 Rationale: the whole point of VoiceNotes is that a thought spoken half-asleep is still there in
 the morning.
@@ -136,7 +149,7 @@ maintainer's other repositories.
   - pre-commit hooks are installed
   - `task lint` reports 0 issues
   - `task test:coverage` passes with the race detector on and the 80% floor met
-  - `CGO_ENABLED=0` builds succeed
+  - `CGO_ENABLED=0` builds of the service succeed, and the recorder builds with cgo
 - Each change is reviewed for spec compliance and code quality before it lands on `main`.
 
 ## Governance
@@ -152,4 +165,4 @@ maintainer's other repositories.
 - Plan Constitution Checks, task reviews and `/speckit-converge` treat MUST statements here as
   binding. A MUST violation is a critical finding.
 
-**Version**: 1.0.0 | **Ratified**: 2026-10-30 | **Last Amended**: 2026-10-30
+**Version**: 2.0.0 | **Ratified**: 2026-10-30 | **Last Amended**: 2026-11-20

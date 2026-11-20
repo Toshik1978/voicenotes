@@ -77,20 +77,26 @@ explicitly asks.** Scan unpushed changes for private data before pushing.
   pass.
 - Decision logic is pure (no I/O) and lives in packages inside the coverage
   scope; I/O sits in thin adapters behind small interfaces.
-- Builds are static and CGO-free; the Docker image is distroless.
+- The service (`voicenotes`) is static and CGO-free; its Docker image is
+  distroless. Only the recorder binary (`voicenotes-mic`) may use cgo, and only
+  in packages the service never imports (constitution IV).
 - Validate configuration at startup and name the offending setting, never its
   value. Secrets come only from the environment.
 - Never lose a capture: persist durably before acknowledging, keep every
   pipeline step idempotent, degrade to a placeholder note rather than drop.
+  The one exception: a successful transcript with no speech creates no note;
+  its audio is deleted only when the source keeps the original (Telegram) or
+  after a configured hold (microphone recordings).
 
 ## Dependencies
 
-The approved direct dependencies are exactly four:
+The approved direct dependencies are exactly five:
 
 - `gopkg.in/telebot.v4` (Telegram, long polling)
 - `go.uber.org/zap` (logging)
 - `github.com/caarlos0/env/v11` (environment parsing)
 - `modernc.org/sqlite` (CGO-free local state)
+- `github.com/gen2brain/malgo` (audio capture; cgo; used only by `voicenotes-mic`)
 
 Adding any other, or promoting an indirect one, needs the maintainer's explicit approval:
 state the package, what it solves and why the standard library is
