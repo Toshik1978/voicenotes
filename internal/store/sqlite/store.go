@@ -214,7 +214,7 @@ album_id, text, language, enriched_json,
 llm_skipped, failure, note_name, note_url, task_count, reply_message_id,
 step, status, waiting_on, attempts, next_attempt_at, updated_at,
 misconfig, last_error, queue_reply_edit, minimal_note, send_new_reply,
-enrich_started_at`
+enrich_started_at, no_speech`
 
 const fileColumns = `id, capture_id, position, source, source_chat_id, source_message_id,
 kind, file_id, mime_type, file_name, file_size, local_path, state, text,
@@ -233,7 +233,7 @@ kind=?, received_at=?, album_id=?, text=?,
 language=?, enriched_json=?, llm_skipped=?, failure=?, note_name=?, note_url=?,
 task_count=?, reply_message_id=COALESCE(?, reply_message_id), step=?, status=?, waiting_on=?, attempts=?,
 next_attempt_at=?, updated_at=?, misconfig=?, last_error=?, queue_reply_edit=?,
-minimal_note=?, send_new_reply=?, enrich_started_at=?
+minimal_note=?, send_new_reply=?, enrich_started_at=?, no_speech=?
 WHERE id=?`
 
 // advanceCollect is updateCapture guarded for AdvanceCollect: the row is
@@ -457,8 +457,8 @@ album_id, text, language, enriched_json,
 llm_skipped, failure, note_name, note_url, task_count, reply_message_id,
 step, status, waiting_on, attempts, next_attempt_at, updated_at,
 misconfig, last_error, queue_reply_edit, minimal_note, send_new_reply,
-enrich_started_at)
-VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?, ?)`,
+enrich_started_at, no_speech)
+VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?, ?,?)`,
 		c.Source, c.SourceChatID, c.SourceMessageID, string(c.Kind), ts(c.ReceivedAt),
 		nullStr(c.AlbumID), nullStr(c.Text), nullStr(c.Language), nullStr(c.EnrichedJSON),
 		nullStr(c.LLMSkipped), nullStr(c.Failure), nullStr(c.NoteName), nullStr(c.NoteURL),
@@ -466,7 +466,7 @@ VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?, ?)`,
 		string(c.Step), string(c.Status), nullStr(string(c.WaitingOn)), c.Attempts,
 		ts(c.NextAttemptAt), ts(c.UpdatedAt),
 		c.Misconfig, nullStr(c.LastError), c.QueueReplyEdit, c.MinimalNote, c.SendNewReply,
-		nullTS(c.EnrichStartedAt))
+		nullTS(c.EnrichStartedAt), c.NoSpeech)
 	if err != nil {
 		if isUnique(err) {
 			return ErrDuplicate
@@ -741,7 +741,7 @@ func (s *DB) update(ctx context.Context, c capture.Capture, read *capture.Captur
 		c.TaskCount, nullInt(c.ReplyMessageID), string(c.Step), string(c.Status),
 		nullStr(string(c.WaitingOn)), c.Attempts,
 		ts(c.NextAttemptAt), ts(c.UpdatedAt), c.Misconfig, nullStr(c.LastError),
-		c.QueueReplyEdit, c.MinimalNote, c.SendNewReply, nullTS(c.EnrichStartedAt),
+		c.QueueReplyEdit, c.MinimalNote, c.SendNewReply, nullTS(c.EnrichStartedAt), c.NoSpeech,
 		c.ID,
 	}
 	if read != nil {
@@ -806,7 +806,7 @@ func scanCapture(row *sql.Row) (capture.Capture, bool, error) {
 		&skipped, &failure, &noteName, &noteURL, &c.TaskCount, &replyID,
 		&step, &status, &waiting, &c.Attempts, &next, &updated,
 		&c.Misconfig, &lastErr, &c.QueueReplyEdit, &c.MinimalNote, &c.SendNewReply,
-		&enrichStarted,
+		&enrichStarted, &c.NoSpeech,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return capture.Capture{}, false, nil

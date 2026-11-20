@@ -264,6 +264,44 @@ func TestEdit(t *testing.T) {
 	}
 }
 
+func TestDelete(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		resp         func(map[string]any) (int, string)
+		wantErr      bool
+		wantRejected bool
+	}{
+		{"deleted", func(map[string]any) (int, string) { return http.StatusOK, `{"ok":true,"result":true}` }, false, false},
+		{"already deleted", apiError(http.StatusBadRequest, "Bad Request: message to delete not found"), true, true},
+		{"forbidden", apiError(http.StatusForbidden, "Forbidden: bot was blocked by the user"), true, true},
+		{"server error", apiError(http.StatusInternalServerError, "Internal Server Error"), true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeAPI(t)
+			f.on("deleteMessage", tc.resp)
+			a := newAPI(t, f)
+
+			err := a.Delete(context.Background(), chat, 77)
+			if (err != nil) != tc.wantErr || errors.Is(err, pipeline.ErrRejected) != tc.wantRejected {
+				t.Fatalf("Delete = %v, want err %v rejected %v", err, tc.wantErr, tc.wantRejected)
+			}
+			if err != nil && strings.Contains(err.Error(), "FAKE-TOKEN") {
+				t.Fatalf("error leaks the token: %v", err)
+			}
+			p := f.call(t, "deleteMessage")
+			if p["message_id"] != "77" || p["chat_id"] != strconv.FormatInt(chat, 10) {
+				t.Fatalf("delete params %v", p)
+			}
+		})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := newAPI(t, newFakeAPI(t)).Delete(ctx, chat, 77); err == nil {
+		t.Fatal("cancelled ctx: want error")
+	}
+}
+
 // Minor 7: file downloads use their own client, whose bound is far longer
 // than a Bot API call's, so a 20 MB file on a slow link can finish.
 func TestDownloadHasItsOwnLongerTimeout(t *testing.T) {

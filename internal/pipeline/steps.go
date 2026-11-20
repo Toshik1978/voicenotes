@@ -70,11 +70,13 @@ type NotesWriter interface {
 	Attach(ctx context.Context, name, filename, mime string, data []byte) capture.Outcome
 }
 
-// Replier sends and edits silent capture replies; Edit falls back to a new
-// reply when the message cannot be edited and returns the holding ID.
+// Replier sends, edits and deletes silent capture replies; Edit falls back to
+// a new reply when the message cannot be edited and returns the holding ID.
+// Delete is best-effort: ErrRejected means the message is gone or undeletable.
 type Replier interface {
 	Send(ctx context.Context, chatID, replyTo int64, text string) (int64, error)
 	Edit(ctx context.Context, chatID, msgID int64, text string) (int64, error)
+	Delete(ctx context.Context, chatID, msgID int64) error
 }
 
 // Downloader fetches a file's bytes by its source file ID.
@@ -830,6 +832,8 @@ const (
 	extWAV  = ".wav"
 	extFLAC = ".flac"
 	extWebM = ".webm"
+
+	mimeWAV = "audio/wav"
 )
 
 // localName is "<id>.<ext>" for the first file and "<id>-<position>.<ext>"
@@ -853,7 +857,7 @@ func audioExt(mime string) string {
 		return extMP3
 	case "audio/mp4", "audio/m4a", "audio/x-m4a", "audio/aac":
 		return extM4A
-	case "audio/wav", "audio/x-wav", "audio/wave":
+	case mimeWAV, "audio/x-wav", "audio/wave":
 		return extWAV
 	case "audio/flac", "audio/x-flac":
 		return extFLAC
@@ -885,7 +889,7 @@ func audioMime(name string) string {
 	case extM4A:
 		return "audio/mp4"
 	case extWAV:
-		return "audio/wav"
+		return mimeWAV
 	case extFLAC:
 		return "audio/flac"
 	case extWebM:

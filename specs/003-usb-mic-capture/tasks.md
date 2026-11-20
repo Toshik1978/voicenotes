@@ -88,7 +88,7 @@ packages, and constitution IV's fence exists before any cgo code does.
 **Checkpoint**: all existing tests pass. A WAV file passed to `IngestRecording` becomes a note
 through the unchanged pipeline, and the recorder loop runs against fakes.
 
-- [ ] T004 [P] Implement the tap state machine `mic.Toggle` in `internal/mic/toggle.go`. Tests go in `internal/mic/toggle_test.go`.
+- [x] T004 [P] Implement the tap state machine `mic.Toggle` in `internal/mic/toggle.go`. Tests go in `internal/mic/toggle_test.go`.
   - States: `idle`, and `recording{id, started_at, last_toggle_at}`.
   - Events: `Tap(t)`, `Tick(t)`, `DeviceLost(t)`.
   - Actions: `Start(id, t)`, `Stop(id, reason)`, `Discard(id)`, `Refuse(reason)`.
@@ -100,17 +100,17 @@ through the unchanged pipeline, and the recorder loop runs against fakes.
     - `last_toggle_at` is updated on every Start, Stop and Discard.
   - End reasons are exactly `tap`, `max_length`, `receiver_lost`, `interrupted`.
   - IDs come from an injected generator. The production generator in `internal/mic/id.go` draws a "random positive int63 from `crypto/rand`" (research R7).
-- [ ] T005 [P] Implement WAV handling in `internal/mic/wav.go`. Tests go in `internal/mic/wav_test.go`.
+- [x] T005 [P] Implement WAV handling in `internal/mic/wav.go`. Tests go in `internal/mic/wav_test.go`.
   - `Header(dataBytes)` returns a 44-byte PCM header for 16 kHz, mono, 16-bit.
   - `Parse(r)` accepts only PCM, 16-bit, mono, 16 kHz. Anything else returns a typed error, which the service later maps to 415.
   - `Repair(fileLen)` computes the RIFF and `data` sizes from the file length, truncated to whole 2-byte frames (research R6).
   - Table cases: an empty data chunk, an odd length, a placeholder header, a non-PCM file.
-- [ ] T006 [P] Implement the evdev and discovery logic as pure code in `internal/mic/evdev.go` and `internal/mic/match.go`. Tests go in `internal/mic/evdev_test.go` and `internal/mic/match_test.go`, using fixtures in `internal/mic/testdata/`.
+- [x] T006 [P] Implement the evdev and discovery logic as pure code in `internal/mic/evdev.go` and `internal/mic/match.go`. Tests go in `internal/mic/evdev_test.go` and `internal/mic/match_test.go`, using fixtures in `internal/mic/testdata/`.
   - `DecodeEvent(b [24]byte)` decodes the 64-bit `input_event` layout (research R2).
   - `IsTap(ev)` is true only for `EV_KEY`, code 115, value 1.
   - `HasKey(capabilitiesKeyHex, 115)` parses the sysfs bitmap: space-separated 64-bit hex words, most significant first.
   - `MatchReceiver(snapshot)` takes a snapshot of sound cards (card number, has capture PCM, USB parent path) and input devices (event path, key bitmap, USB parent path). It returns the first USB parent, by path, that has both a capture PCM and an input with bit 115, as `{Card, InputPath}`, or "none" (research R4).
-- [ ] T007 Add the microphone source and its store support.
+- [x] T007 Add the microphone source and its store support.
   - Add `capture.SourceMic = "mic"` in `internal/capture/capture.go`.
   - Add migration `internal/store/sqlite/migrations/004_mic.sql`, exactly as in data-model.md: `captures.no_speech`, `mic_replies`, and `mic_recorders` with `alert TEXT NOT NULL DEFAULT 'ok'`.
   - In `internal/store/sqlite/store.go` and a new `internal/store/sqlite/mic.go`:
@@ -119,7 +119,7 @@ through the unchanged pipeline, and the recorder loop runs against fakes.
     - `UpsertRecorder`, `Recorders`, `SetRecorderAlert`.
     - Persist `NoSpeech`.
   - Tests go in `internal/store/sqlite/mic_test.go` and `restart_test.go`. Cover a duplicate recording ID (`ErrDuplicate`) and migrating a 003 database.
-- [ ] T008 Implement `pipeline.Ingester.IngestRecording(ctx, RecordingMeta{ID, StartedAt, EndReason, Recorder}, localPath string) (RecordingResult, error)` in `internal/pipeline/ingest_recording.go`, per research R8 and data-model.md "Capture changes".
+- [x] T008 Implement `pipeline.Ingester.IngestRecording(ctx, RecordingMeta{ID, StartedAt, EndReason, Recorder}, localPath string) (RecordingResult, error)` in `internal/pipeline/ingest_recording.go`, per research R8 and data-model.md "Capture changes".
   - The caller has already fsynced `localPath` into `files/`.
   - Build the capture:
     - `Kind=audio`, first step `extract`, `ReceivedAt=StartedAt`.
@@ -130,10 +130,10 @@ through the unchanged pipeline, and the recorder loop runs against fakes.
   - Tests go in `internal/pipeline/ingest_recording_test.go`, using fakes:
     - stored, duplicate, and an insert failure
     - an end-to-end run through the existing handlers to a note with the WAV attached and note time = `StartedAt`
-- [ ] T009 [P] Add message deletion.
+- [x] T009 [P] Add message deletion.
   - Add `Delete(ctx, chatID, msgID int64) error` to `pipeline.Replier` in `internal/pipeline/steps.go`, and update every fake.
   - Add `telegram.API.Delete` in `internal/telegram/api.go`, using `bot.Delete` with errors wrapped like `wrapAPI` (400/403 become `pipeline.ErrRejected`). Tests go in `internal/telegram/api_test.go`.
-- [ ] T010 Implement `recorder.DirSpool` in `internal/recorder/spool.go`, per research R6 and the data-model.md "Spool layout". Tests go in `internal/recorder/spool_test.go` and run on `t.TempDir()`.
+- [x] T010 Implement `recorder.DirSpool` in `internal/recorder/spool.go`, per research R6 and the data-model.md "Spool layout". Tests go in `internal/recorder/spool_test.go` and run on `t.TempDir()`.
   - `Begin(meta)`: write the `<id>.json` sidecar and fsync it and the directory **before** returning a writer.
   - The writer appends to `<id>.part.wav` (placeholder header) and fsyncs at most every 2 s.
   - `Finish(id, endedAt, reason)`: patch the sizes with `mic.Repair`, fsync, rename to `<id>.wav`, fsync the directory, update the sidecar.
@@ -142,7 +142,7 @@ through the unchanged pipeline, and the recorder loop runs against fakes.
   - `Open(id)` and `Remove(id)`.
   - `Recover()`: repair every `.part.wav` and finish it with reason `interrupted`. Move orphan halves to `broken/`; they are "never silently deleted".
   - `FreeBytes()` via `syscall.Statfs`.
-- [ ] T011 Implement `recorder.Recorder` in `internal/recorder/recorder.go`. Tests go in `internal/recorder/recorder_test.go`, with a hand-written fake for every interface and an injected clock; nothing sleeps for real.
+- [x] T011 Implement `recorder.Recorder` in `internal/recorder/recorder.go`. Tests go in `internal/recorder/recorder_test.go`, with a hand-written fake for every interface and an injected clock; nothing sleeps for real.
   - Interfaces (plan.md "Recorder"): `KeySource`, `AudioSource`, `Discovery`, `Spool`, `Handoff` (results `Stored`, `Duplicate`, `Retry`, `Misconfigured`, `Rejected`), `Notifier`, `CheckIn`.
   - **Startup**: run `Recover()` first, then rediscover every 5 s while no receiver is found.
   - **Events**: taps, 1 s ticks and device-lost events go through `mic.Toggle`.

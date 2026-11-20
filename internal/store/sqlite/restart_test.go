@@ -237,8 +237,8 @@ VALUES (?, 'telegram', -1001234567890, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	}
 
 	s := open(t, dir)
-	if v := s.UserVersion(); v != 3 {
-		t.Fatalf("user_version = %d, want 3", v)
+	if v := s.UserVersion(); v != 4 {
+		t.Fatalf("user_version = %d, want 4", v)
 	}
 	file := func(id int64, fileID, mime, local string, size int64, state capture.FileState) []capture.File {
 		return []capture.File{{
@@ -392,5 +392,45 @@ func TestRestartPostponesAHalfReceivedAlbum(t *testing.T) {
 	rest := appendItem(t, s, fileItemAt(2, "two", "alb2", now.Add(time.Second)), 3*time.Second)
 	if rest.created || rest.c.ID != first.c.ID || len(rest.c.Files) != 2 {
 		t.Fatalf("redelivered part = %+v created=%v, want it in the first batch", rest.c, rest.created)
+	}
+}
+
+// TestUpgradeFrom003AddsMic builds a version 3 database holding a capture,
+// opens it with the current store and checks migration 004.
+func TestUpgradeFrom003AddsMic(t *testing.T) {
+	dir := t.TempDir()
+	legacy, err := sqlite.OpenAtVersion(dir, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-time.Minute).UTC().UnixNano()
+	_, err = legacy.ExecContext(context.Background(), `INSERT INTO captures (
+id, source, source_chat_id, source_message_id, kind, received_at, text, step, status, next_attempt_at, updated_at)
+VALUES (1, 'telegram', -1001234567890, 1, 'text', ?, 'hello', 'enrich', 'pending', ?, ?)`, past, past, past)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s := open(t, dir)
+	if v := s.UserVersion(); v != 4 {
+		t.Fatalf("user_version = %d, want 4", v)
+	}
+	for _, tbl := range []string{"mic_replies", "mic_recorders"} {
+		if !s.HasTable(tbl) {
+			t.Errorf("table %s missing", tbl)
+		}
+	}
+	c, ok, err := s.Get(1)
+	if err != nil || !ok {
+		t.Fatalf("Get: ok=%v err=%v", ok, err)
+	}
+	if c.NoSpeech || c.Text != "hello" {
+		t.Errorf("migrated capture = %+v", c)
+	}
+	if err = s.PutStartReply(context.Background(), 9, -1001234567890, 5); err != nil {
+		t.Fatal(err)
 	}
 }
