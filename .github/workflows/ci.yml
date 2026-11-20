@@ -85,7 +85,7 @@ jobs:
         run: |
           set +e
           go test -race -v \
-            -coverpkg=./internal/config,./internal/capture,./internal/pipeline,./internal/language,./internal/enrich,./internal/render,./internal/digest,./internal/health \
+            -coverpkg=./internal/config,./internal/capture,./internal/pipeline,./internal/language,./internal/enrich,./internal/render,./internal/digest,./internal/health,./internal/mic,./internal/recorder,./internal/micapi \
             -covermode=atomic -coverprofile=coverage.txt \
             ./... > test_status.log 2>&1
           echo "TEST_EXIT=$?" >> "$GITHUB_ENV"
