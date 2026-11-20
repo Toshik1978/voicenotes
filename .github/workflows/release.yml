@@ -128,3 +128,72 @@ jobs:
           tag_name: ${{ github.ref_name }}
           body_path: release-body.md
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  # The recorder links malgo (cgo), so each tarball is built natively on its own
+  # architecture. Building on 24.04 (glibc 2.39) runs on Ubuntu 26.04.
+  build-mic:
+    name: build-mic (${{ matrix.arch }})
+    needs: ci
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Golang
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          check-latest: true
+
+      - name: Build tarball
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          name="voicenotes-mic_${version}_linux_${ARCH}"
+          mkdir -p "dist/${name}"
+          CGO_ENABLED=1 go build \
+            -ldflags "-X main.Version=${version} -X main.Commit=${GITHUB_SHA::7} -X main.Buildstamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -o "dist/${name}/voicenotes-mic" ./cmd/voicenotes-mic
+          cp LICENSE deploy/voicenotes-mic.service deploy/voicenotes-mic.env.example "dist/${name}/"
+          tar -C dist -czf "${name}.tar.gz" "${name}"
+          tar -tzf "${name}.tar.gz"
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: voicenotes-mic-${{ matrix.arch }}
+          path: voicenotes-mic_*.tar.gz
+          if-no-files-found: error
+
+  # Attaches the tarballs to the release the release job created. The body is
+  # not passed, so the existing release notes are left alone.
+  attach-mic:
+    needs: [release, build-mic]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download tarballs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: voicenotes-mic-*
+          merge-multiple: true
+
+      - name: Attach tarballs to the GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: voicenotes-mic_*.tar.gz
+          token: ${{ secrets.GITHUB_TOKEN }}

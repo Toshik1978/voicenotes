@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/Toshik1978/voicenotes/internal/health"
 	"github.com/Toshik1978/voicenotes/internal/mic"
 	"github.com/Toshik1978/voicenotes/internal/pipeline"
 	micrec "github.com/Toshik1978/voicenotes/internal/recorder"
@@ -296,6 +298,76 @@ func (u *micUploads) all() []micUpload {
 	return slices.Clone(u.list)
 }
 
+// micFault is what the fake network does to one request.
+type micFault int
+
+const (
+	faultNone      micFault = iota
+	faultDown               // the request never reaches the service
+	faultLoseReply          // the service handles it, but the answer is lost
+	faultNotWAV             // the request arrives labelled as something else than audio/wav
+)
+
+// micNet is the controllable network between recorder and service: a
+// RoundTripper whose rule decides, per request, how it fails.
+type micNet struct {
+	next http.RoundTripper
+
+	mu   sync.Mutex
+	rule func(*http.Request) micFault
+	lost int
+}
+
+func (n *micNet) setRule(rule func(*http.Request) micFault) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.rule = rule
+}
+
+func (n *micNet) lostReplies() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	return n.lost
+}
+
+func (n *micNet) RoundTrip(r *http.Request) (*http.Response, error) {
+	n.mu.Lock()
+	rule := n.rule
+	n.mu.Unlock()
+
+	fault := faultNone
+	if rule != nil {
+		fault = rule(r)
+	}
+
+	switch fault {
+	case faultDown:
+		if r.Body != nil {
+			_ = r.Body.Close()
+		}
+
+		return nil, errors.New("network is down")
+	case faultLoseReply:
+		resp, err := n.next.RoundTrip(r)
+		if err != nil {
+			return nil, err
+		}
+		_ = resp.Body.Close()
+		n.mu.Lock()
+		n.lost++
+		n.mu.Unlock()
+
+		return nil, errors.New("connection reset before the reply")
+	case faultNotWAV:
+		r = r.Clone(r.Context())
+		r.Header.Set("Content-Type", "audio/mpeg")
+	case faultNone:
+	}
+
+	return n.next.RoundTrip(r)
+}
+
 // newMicLLM is an LLM that turns every transcript into the same text with
 // exactly one task.
 func newMicLLM(t *testing.T) *httptest.Server {
@@ -330,11 +402,25 @@ type micE2E struct {
 	rec      *micrec.Recorder
 	spool    *micrec.DirSpool
 	spoolDir string
+	srv      *httptest.Server
+	net      *micNet
+}
+
+// micSetup varies how the recorder is set up.
+type micSetup struct {
+	token string // the recorder's upload token; empty: the service's
 }
 
 // startMicE2E wires the service (pipeline and microphone API, as wire does)
 // behind httptest and runs a real recorder against it until the test ends.
 func startMicE2E(t *testing.T) *micE2E {
+	t.Helper()
+
+	return startMicE2EWith(t, micSetup{})
+}
+
+// startMicE2EWith is startMicE2E with the recorder set up as given.
+func startMicE2EWith(t *testing.T, setup micSetup) *micE2E {
 	t.Helper()
 	llm := newMicLLM(t)
 	cfg := e2eConfig()
@@ -376,18 +462,20 @@ func startMicE2E(t *testing.T) *micE2E {
 	srv := httptest.NewServer(m.uploads.wrap(mux))
 	t.Cleanup(srv.Close)
 
-	m.startRecorder(t, srv)
+	m.srv = srv
+	m.net = &micNet{next: srv.Client().Transport}
+	m.startRecorder(t, srv, cmp.Or(setup.token, micTestToken))
 
 	return m
 }
 
-func (m *micE2E) startRecorder(t *testing.T, srv *httptest.Server) {
+func (m *micE2E) startRecorder(t *testing.T, srv *httptest.Server, token string) {
 	t.Helper()
 	spool, err := micrec.NewDirSpool(m.spoolDir, m.clock.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	client, err := micrec.NewClient(srv.URL, micTestToken, micRecorderName, srv.Client())
+	client, err := micrec.NewClient(srv.URL, token, micRecorderName, &http.Client{Transport: m.net})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -430,21 +518,29 @@ func (m *micE2E) tapAt(t *testing.T, at time.Time) {
 	}
 }
 
-// startRecording taps at `at` and waits until the recording runs and its
-// "🎙 recording…" message is stored, so the outcome edits it. It returns
-// the start message.
-func (m *micE2E) startRecording(t *testing.T, at time.Time, id int64) tgEvent {
+// beginRecording taps at `at` and waits until the recording runs.
+func (m *micE2E) beginRecording(t *testing.T, at time.Time) {
 	t.Helper()
 	m.tapAt(t, at)
 	waitFor(t, "the recording to start", func() bool { return m.rec.Status().Recording })
+}
+
+// startRecording taps at `at` and waits until the recording runs and its
+// "🎙 recording…" message is stored under id, so the outcome edits it. It
+// returns that message: the one sent after the tap.
+func (m *micE2E) startRecording(t *testing.T, at time.Time, id int64) tgEvent {
+	t.Helper()
+	before := len(m.tg.log())
+	m.beginRecording(t, at)
 	waitFor(t, "the stored start notice", func() bool {
 		ok, err := m.db.HasStartReply(t.Context(), id)
 		return err == nil && ok
 	})
 	var start tgEvent
-	for _, e := range m.tg.log() {
+	for _, e := range m.tg.log()[before:] {
 		if e.op == "send" && e.text == "🎙 recording…" {
 			start = e
+			break
 		}
 	}
 	if start.chat != micNotifyChat {
@@ -452,6 +548,16 @@ func (m *micE2E) startRecording(t *testing.T, at time.Time, id int64) tgEvent {
 	}
 
 	return start
+}
+
+// advanceUntil moves the recorder's clock on, firing its backoff waits,
+// until cond holds; no real backoff is slept.
+func (m *micE2E) advanceUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	waitFor(t, what, func() bool {
+		m.clock.set(m.clock.Now().Add(time.Minute))
+		return cond()
+	})
 }
 
 // waitForSaved waits until the start message was edited and the queue is
@@ -615,5 +721,243 @@ func checkSpoolEmpty(t *testing.T, m *micE2E) {
 	})
 	if recs, err := m.spool.Finished(); err != nil || len(recs) != 0 {
 		t.Errorf("spool still holds %v (%v)", recs, err)
+	}
+}
+
+// ---------------------------------------------------------------- proxy mode
+
+// Scenarios 2.1, 2.2, 2.4, 2.6: with the service unreachable the recorder
+// still records at once, sends no start notice and keeps every recording;
+// once the service is back they arrive oldest first, one note each, and the
+// outcomes arrive as new messages.
+func TestMicProxyDeliversOldestFirstAfterAnOutage(t *testing.T) {
+	m := startMicE2E(t)
+	m.net.setRule(func(*http.Request) micFault { return faultDown })
+
+	taps := []time.Time{micFirstTap(), micFirstTap().Add(time.Hour), micFirstTap().Add(2 * time.Hour)}
+	for i, at := range taps {
+		m.beginRecording(t, at)
+		m.tapAt(t, at.Add(5*time.Second))
+		waitFor(t, "the recording to be kept", func() bool {
+			recs, err := m.spool.Finished()
+			return err == nil && len(recs) == i+1
+		})
+	}
+	if ups := m.uploads.all(); len(ups) != 0 {
+		t.Fatalf("uploads = %+v, want none reached the service", ups)
+	}
+	if evs := m.tg.log(); len(evs) != 0 {
+		t.Fatalf("Telegram calls = %+v, want no start notice while the service is down", evs)
+	}
+
+	m.net.setRule(nil)
+	m.advanceUntil(t, "every recording handed over", func() bool {
+		recs, err := m.spool.Finished()
+		n, cerr := m.db.CountUnfinished(t.Context())
+		notes, _, _ := m.world.snapshot()
+		return err == nil && cerr == nil && len(recs) == 0 && n == 0 && len(notes) == len(taps)
+	})
+
+	wantPaths := []string{"/mic/v1/recordings/4101", "/mic/v1/recordings/4102", "/mic/v1/recordings/4103"}
+	uploads := m.uploads.all()
+	gotPaths := make([]string, 0, len(uploads))
+	for _, u := range uploads {
+		gotPaths = append(gotPaths, u.path)
+	}
+	if !slices.Equal(gotPaths, wantPaths) {
+		t.Errorf("upload order = %q, want oldest first %q", gotPaths, wantPaths)
+	}
+	notes, _, _ := m.world.snapshot()
+	attached := m.world.attachedData()
+	if len(attached) != len(taps) {
+		t.Fatalf("%d attachments, want one per recording", len(attached))
+	}
+	for i, at := range taps {
+		if !notes[i].ReceivedAt.Equal(at) {
+			t.Errorf("note %d time = %v, want its first tap %v", i, notes[i].ReceivedAt, at)
+		}
+	}
+	sends := 0
+	for _, e := range m.tg.log() {
+		if e.op != "send" || !strings.HasPrefix(e.text, "✓ saved · 1 task · ") || e.chat != micNotifyChat {
+			t.Errorf("unexpected Telegram call %+v, want only the outcomes as new messages", e)
+			continue
+		}
+		sends++
+	}
+	if sends != len(taps) {
+		t.Errorf("%d outcome messages, want %d", sends, len(taps))
+	}
+}
+
+// Scenarios 2.3, 2.4: the service stored a recording but its confirmation
+// never arrived. The recorder keeps its copy, sends it again, gets a
+// duplicate confirmation and only then deletes it; there is one note.
+func TestMicProxyLostConfirmationYieldsOneNote(t *testing.T) {
+	m := startMicE2E(t)
+	m.net.setRule(func(r *http.Request) micFault {
+		if r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/mic/v1/recordings/") {
+			return faultLoseReply
+		}
+
+		return faultNone
+	})
+
+	start := m.startRecording(t, micFirstTap(), 4101)
+	m.tapAt(t, micFirstTap().Add(5*time.Second))
+	waitFor(t, "the lost confirmation", func() bool { return m.net.lostReplies() == 1 })
+	edit := m.waitForSaved(t, start)
+
+	// The service has the recording, yet the recorder has no confirmation:
+	// its copy must still be there.
+	if recs, err := m.spool.Finished(); err != nil || len(recs) != 1 {
+		t.Fatalf("spool holds %v (%v), want the recording kept until a confirmation arrives", recs, err)
+	}
+
+	m.net.setRule(nil)
+	m.advanceUntil(t, "the resend to be confirmed", func() bool {
+		recs, err := m.spool.Finished()
+		return err == nil && len(recs) == 0
+	})
+
+	if ups := m.uploads.all(); len(ups) != 2 || ups[0].path != ups[1].path {
+		t.Errorf("uploads = %+v, want the same recording sent twice", ups)
+	}
+	notes, _, _ := m.world.snapshot()
+	attached := m.world.attachedData()
+	if len(notes) != 1 || len(attached) != 1 {
+		t.Fatalf("%d notes, %d attachments; want exactly one of each", len(notes), len(attached))
+	}
+	checkSaved(t, edit, notes[0], attached[0])
+	if n, err := m.db.CountUnfinished(t.Context()); err != nil || n != 0 {
+		t.Errorf("unfinished captures = %d (%v), want none", n, err)
+	}
+}
+
+// Scenario 2.5: a wrong token is refused with 401 and stores nothing; the
+// recorder keeps the recording and reports itself misconfigured.
+func TestMicProxyWrongTokenStoresNothing(t *testing.T) {
+	m := startMicE2EWith(t, micSetup{token: "FAKE-wrong-token-0123456789abcdef"})
+
+	m.beginRecording(t, micFirstTap())
+	m.tapAt(t, micFirstTap().Add(5*time.Second))
+	waitFor(t, "the recorder to report misconfigured", func() bool { return m.rec.Status().Misconfigured })
+
+	if ups := m.uploads.all(); len(ups) == 0 {
+		t.Fatal("the recorder never tried to upload")
+	}
+	if recs, err := m.spool.Finished(); err != nil || len(recs) != 1 {
+		t.Errorf("spool holds %v (%v), want the recording kept", recs, err)
+	}
+	if has, err := m.db.HasRecording(t.Context(), micNotifyChat, 4101); err != nil || has {
+		t.Errorf("recording stored = %v (%v), want nothing stored", has, err)
+	}
+	if notes, _, _ := m.world.snapshot(); len(notes) != 0 {
+		t.Errorf("notes = %+v, want none", notes)
+	}
+	if evs := m.tg.log(); len(evs) != 0 {
+		t.Errorf("Telegram calls = %+v, want none", evs)
+	}
+	rep := micrec.ComputeHealth(m.rec.Status(), m.clock.Now(), time.Hour)
+	if !rep.Misconfigured || rep.Status != health.StatusDegraded {
+		t.Errorf("health = %+v, want degraded and misconfigured", rep)
+	}
+
+	// The endpoint refuses a bare request the same way.
+	req, err := http.NewRequestWithContext(
+		t.Context(),
+		http.MethodGet,
+		m.srv.URL+"/mic/v1/recorders/"+micRecorderName,
+		http.NoBody,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := m.srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("request without a credential: status %d, want 401", resp.StatusCode)
+	}
+}
+
+// Scenario 2.6 (unreachable at the start): the start notice fails but
+// recording and upload go on, and the outcome arrives as a new message.
+func TestMicProxyFailedStartNoticeSendsOutcomeAsNewMessage(t *testing.T) {
+	m := startMicE2E(t)
+	m.net.setRule(func(r *http.Request) micFault {
+		if strings.HasSuffix(r.URL.Path, "/started") {
+			return faultDown
+		}
+
+		return faultNone
+	})
+
+	m.beginRecording(t, micFirstTap())
+	m.tapAt(t, micFirstTap().Add(5*time.Second))
+	waitFor(t, "the outcome message", func() bool {
+		for _, e := range m.tg.log() {
+			if e.op == "send" && strings.HasPrefix(e.text, "✓ saved · 1 task · ") {
+				return true
+			}
+		}
+
+		return false
+	})
+
+	notes, _, _ := m.world.snapshot()
+	if len(notes) != 1 {
+		t.Fatalf("%d notes, want one", len(notes))
+	}
+	for _, e := range m.tg.log() {
+		if e.op != "send" || e.chat != micNotifyChat {
+			t.Errorf("unexpected Telegram call %+v, want one new outcome message", e)
+		}
+	}
+	checkSpoolEmpty(t, m)
+}
+
+// The 415 policy: a recording the service refuses for good is kept, skipped
+// and reported, and the next recording still goes through.
+func TestMicProxyRejectedRecordingIsKeptSkippedAndReported(t *testing.T) {
+	m := startMicE2E(t)
+	m.net.setRule(func(r *http.Request) micFault {
+		if r.Method == http.MethodPut && r.URL.Path == "/mic/v1/recordings/4101" {
+			return faultNotWAV
+		}
+
+		return faultNone
+	})
+
+	start1 := m.startRecording(t, micFirstTap(), 4101)
+	m.tapAt(t, micFirstTap().Add(5*time.Second))
+	waitFor(t, "the recording to be rejected", func() bool { return m.rec.Status().Rejected == 1 })
+
+	second := micFirstTap().Add(time.Hour)
+	start2 := m.startRecording(t, second, 4102)
+	m.tapAt(t, second.Add(5*time.Second))
+	edit2 := m.waitForSaved(t, start2)
+
+	if !strings.HasPrefix(edit2.text, "✓ saved · 1 task · ") {
+		t.Errorf("second outcome = %+v, want it saved", edit2)
+	}
+	recs, err := m.spool.Finished()
+	if err != nil || len(recs) != 1 || recs[0].ID != 4101 {
+		t.Fatalf("spool holds %v (%v), want only the rejected recording kept", recs, err)
+	}
+	if has, err := m.db.HasRecording(t.Context(), micNotifyChat, 4101); err != nil || has {
+		t.Errorf("rejected recording stored = %v (%v), want nothing", has, err)
+	}
+	if notes, _, _ := m.world.snapshot(); len(notes) != 1 {
+		t.Errorf("%d notes, want one (the second recording)", len(notes))
+	}
+	if _, edited := m.tg.find("edit", start1.msg); edited {
+		t.Error("the rejected recording's start message was edited")
+	}
+	rep := micrec.ComputeHealth(m.rec.Status(), m.clock.Now(), time.Hour)
+	if rep.Rejected != 1 || rep.Status != health.StatusDegraded {
+		t.Errorf("health = %+v, want degraded with one rejected recording", rep)
 	}
 }
