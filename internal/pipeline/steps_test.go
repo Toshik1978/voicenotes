@@ -70,6 +70,8 @@ type sendCall struct {
 
 type fakeReplier struct {
 	sends, edits []sendCall
+	deletes      []sendCall
+	deleteErr    error
 	sendErr      error
 	editErr      error
 	nextID       int64
@@ -99,6 +101,12 @@ func (f *fakeReplier) Edit(_ context.Context, chat, msg int64, text string) (int
 	}
 
 	return msg, nil
+}
+
+func (f *fakeReplier) Delete(_ context.Context, chat, msg int64) error {
+	f.deletes = append(f.deletes, sendCall{chat: chat, msg: msg})
+
+	return f.deleteErr
 }
 
 type fakeTranscriber struct {

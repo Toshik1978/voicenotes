@@ -325,8 +325,8 @@ func TestMigrationsIdempotentAndVersioned(t *testing.T) {
 	if _, ok, _ := s2.OldestUnfinished(context.Background()); !ok {
 		t.Fatal("row lost after reopen")
 	}
-	if v := s2.UserVersion(); v != 3 {
-		t.Fatalf("user_version=%d, want 3", v)
+	if v := s2.UserVersion(); v != 4 {
+		t.Fatalf("user_version=%d, want 4", v)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "voicenotes.db")); err != nil {
 		t.Fatal(err)

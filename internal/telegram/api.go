@@ -278,6 +278,22 @@ func (a *API) Edit(ctx context.Context, chatID, msgID int64, text string) (int64
 	return 0, wrapAPI("edit", err)
 }
 
+// Delete removes msgID. A message that is already gone, or that Telegram
+// refuses to delete, yields pipeline.ErrRejected, so callers can treat the
+// delete as best-effort. Transport errors, flood limits and server errors
+// are returned as-is.
+func (a *API) Delete(ctx context.Context, chatID, msgID int64) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("telegram: delete: %w", err)
+	}
+	sig := tele.StoredMessage{MessageID: strconv.FormatInt(msgID, 10), ChatID: chatID}
+	if err := a.bot.Delete(sig); err != nil {
+		return wrapAPI("delete", err)
+	}
+
+	return nil
+}
+
 // Download fetches a file's bytes: getFile is a Bot API call, and the
 // contents come through the download client, bounded by its own longer
 // timeout and by ctx. A file over MaxFileSize, whether Telegram refuses it

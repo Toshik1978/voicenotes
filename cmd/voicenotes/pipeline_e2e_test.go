@@ -90,6 +90,8 @@ func (w *e2eWorld) Edit(_ context.Context, _, msgID int64, text string) (int64, 
 	return msgID, nil
 }
 
+func (w *e2eWorld) Delete(_ context.Context, _, _ int64) error { return nil }
+
 func (w *e2eWorld) Download(_ context.Context, fileID string) ([]byte, error) {
 	time.Sleep(w.downloadDelay)
 
