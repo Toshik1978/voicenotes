@@ -21,6 +21,7 @@ linters:
     - copyloopvar
     - cyclop
     - decorder
+    - depguard
     - dogsled
     - dupl
     - durationcheck
@@ -110,6 +111,20 @@ linters:
     - wsl_v5
     - zerologlint
   settings:
+    depguard:
+      rules:
+        # Constitution IV: the service stays CGO-free. Only the recorder
+        # (cmd/voicenotes-mic) and internal/micaudio may reach malgo.
+        cgo-fence:
+          files:
+            - $all
+            - "!**/internal/micaudio/**"
+            - "!**/cmd/voicenotes-mic/**"
+          deny:
+            - pkg: github.com/gen2brain/malgo
+              desc: only internal/micaudio and cmd/voicenotes-mic may use cgo audio capture
+            - pkg: github.com/Toshik1978/voicenotes/internal/micaudio
+              desc: only cmd/voicenotes-mic may import internal/micaudio
     dupl:
       threshold: 100
     goconst:

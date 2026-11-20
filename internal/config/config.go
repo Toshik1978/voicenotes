@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/caarlos0/env/v11"
 )
@@ -96,6 +97,15 @@ type Config struct {
 	// It drives the digest schedule and the local dates in attachment names.
 	TZ       string         `env:"TZ"`
 	Location *time.Location `env:"-"`
+
+	// Wireless microphone captures. MicUploadToken, when set, enables the
+	// microphone endpoints and alert loop. MicNotifyChatID is resolved: it
+	// defaults to DigestChatID.
+	MicUploadToken    string        `env:"MIC_UPLOAD_TOKEN"`
+	MicUploadMaxBytes int64         `env:"MIC_UPLOAD_MAX_BYTES" envDefault:"31457280"`
+	MicNotifyChatID   int64         `env:"MIC_NOTIFY_CHAT_ID"`
+	MicNoSpeechHold   time.Duration `env:"MIC_NOSPEECH_HOLD"    envDefault:"168h"`
+	MicSilenceAlert   time.Duration `env:"MIC_SILENCE_ALERT"    envDefault:"5m"`
 
 	// Runtime.
 	DataDir                string        `env:"DATA_DIR"                 envDefault:"/data"`
@@ -198,6 +208,7 @@ func (v *validator) validate(environ map[string]string) {
 	v.validateDocuments()
 	v.validateMemos()
 	v.validateDigest()
+	v.validateMic(environ)
 	v.validateRuntime()
 }
 
@@ -319,6 +330,35 @@ func (v *validator) validateDigest() {
 	v.positive("DIGEST_MAX_NOTES", c.DigestMaxNotes > 0)
 }
 
+func (v *validator) validateMic(environ map[string]string) {
+	c := v.c
+	if c.MicUploadToken != "" && utf8.RuneCountInString(c.MicUploadToken) < 32 {
+		v.fail("MIC_UPLOAD_TOKEN", "must be at least 32 characters")
+	}
+	v.inRange("MIC_UPLOAD_MAX_BYTES",
+		c.MicUploadMaxBytes >= 1<<20 && c.MicUploadMaxBytes <= 1<<30, "1 MiB and 1 GiB")
+	v.inRange(
+		"MIC_NOSPEECH_HOLD",
+		c.MicNoSpeechHold >= time.Hour && c.MicNoSpeechHold <= 2160*time.Hour,
+		"1h and 2160h",
+	)
+	v.inRange("MIC_SILENCE_ALERT", c.MicSilenceAlert >= time.Minute && c.MicSilenceAlert <= 24*time.Hour, "1m and 24h")
+
+	v.validateMicNotify(environ)
+}
+
+func (v *validator) validateMicNotify(environ map[string]string) {
+	c := v.c
+	// An explicit zero is not "unset": with uploads enabled it names no chat.
+	explicitZero := c.MicNotifyChatID == 0 && strings.TrimSpace(environ["MIC_NOTIFY_CHAT_ID"]) != ""
+	if c.MicNotifyChatID == 0 {
+		c.MicNotifyChatID = c.DigestChatID
+	}
+	if c.MicUploadToken != "" && (explicitZero || c.MicNotifyChatID == 0) {
+		v.fail("MIC_NOTIFY_CHAT_ID", "must be non-zero when MIC_UPLOAD_TOKEN is set")
+	}
+}
+
 func (v *validator) validateRuntime() {
 	c := v.c
 	// Like Go's time.Local, accept an optional leading colon; unlike it,
@@ -330,9 +370,7 @@ func (v *validator) validateRuntime() {
 	}
 	v.positive("HEALTH_PENDING_THRESHOLD", c.HealthPendingThreshold > 0)
 	v.positive("RETRY_MAX_INTERVAL", c.RetryMaxInterval > 0)
-	switch c.LogLevel {
-	case "debug", "info", "warn", "error":
-	default:
+	if !validLogLevel(c.LogLevel) {
 		v.fail("LOG_LEVEL", "must be debug, info, warn or error")
 	}
 }

@@ -27,7 +27,7 @@ Do not bypass hooks with `--no-verify`.
 ### The coverage scope
 
 `COVERPKG` in `Taskfile.yml` and `-coverpkg` in `.github/workflows/ci.yml` must
-stay identical: `internal/{config,capture,pipeline,language,enrich,render,digest,health}`.
+stay identical: `internal/{config,capture,pipeline,language,enrich,render,digest,health,mic,recorder,micapi}`.
 They hold the pure decision logic. I/O adapters that only run against real
 external services are outside the scope, though their tests still run. Packages
 named there may not exist yet; Go only warns for a pattern that matches

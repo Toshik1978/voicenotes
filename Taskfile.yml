@@ -15,7 +15,7 @@ vars:
   # for a -coverpkg pattern that matches nothing, so the list is passed
   # verbatim. With no statements to measure the profile is empty and the floor
   # check passes with a notice; it enforces 80% as soon as code exists.
-  COVERPKG: ./internal/config,./internal/capture,./internal/pipeline,./internal/language,./internal/enrich,./internal/render,./internal/digest,./internal/health
+  COVERPKG: ./internal/config,./internal/capture,./internal/pipeline,./internal/language,./internal/enrich,./internal/render,./internal/digest,./internal/health,./internal/mic,./internal/recorder,./internal/micapi
   BUILDSTAMP:
     sh: date +%Y/%m/%d_%H:%M:%S
   COMMIT:
