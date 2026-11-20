@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -22,6 +23,7 @@ import (
 	"github.com/Toshik1978/voicenotes/internal/enrich"
 	"github.com/Toshik1978/voicenotes/internal/health"
 	"github.com/Toshik1978/voicenotes/internal/memos"
+	"github.com/Toshik1978/voicenotes/internal/micapi"
 	"github.com/Toshik1978/voicenotes/internal/openai"
 	"github.com/Toshik1978/voicenotes/internal/pipeline"
 	"github.com/Toshik1978/voicenotes/internal/store/sqlite"
@@ -194,16 +196,47 @@ func wire(
 	})
 	mux := http.NewServeMux()
 	mux.Handle("/healthz", health.Handler(collector))
+	micHandler := mountMic(mux, cfg, log, db, ingester, tg, filesDir)
+	purger := purgerFor(cfg, db, tg, log)
 
 	goroutines := append([]func(context.Context){
 		func(ctx context.Context) { tg.Run(ctx, handler) },
 		mainWorker.Run,
 		docsWorker.Run,
-		func(ctx context.Context) { serveHTTP(ctx, ln, mux, log) },
-		func(ctx context.Context) { pipeline.PurgeLoop(ctx, db, pipeline.PurgeInterval, time.Now, log) },
+		func(ctx context.Context) { serveAndDrain(ctx, ln, mux, micHandler, log) },
+		func(ctx context.Context) { pipeline.PurgeLoop(ctx, purger, pipeline.PurgeInterval, time.Now, log) },
 	}, digestRun...)
 
 	return &service{goroutines: goroutines}, nil
+}
+
+// serveAndDrain serves HTTP until ctx is cancelled, then lets the microphone
+// handler's in-flight start notices finish before the store closes.
+func serveAndDrain(ctx context.Context, ln net.Listener, mux http.Handler, mic *micapi.Handler, log *zap.Logger) {
+	serveHTTP(ctx, ln, mux, log)
+	if mic != nil {
+		mic.Wait()
+	}
+}
+
+// mountMic mounts the microphone API under /mic/v1/ when MIC_UPLOAD_TOKEN is
+// set and returns its handler; without a token nothing is mounted, so the
+// path answers 404, and it returns nil. No middleware wraps the mux, so the
+// Authorization header is never logged.
+func mountMic(
+	mux *http.ServeMux, cfg config.Config, log *zap.Logger, db *sqlite.DB,
+	ingest micapi.RecordingIngester, replier pipeline.Replier, filesDir string,
+) *micapi.Handler {
+	if cfg.MicUploadToken == "" {
+		return nil
+	}
+	h := micapi.NewHandler(
+		micapi.Config{Token: cfg.MicUploadToken, MaxBytes: cfg.MicUploadMaxBytes, FilesDir: filesDir},
+		ingest, micapi.NewStarts(db, replier, cfg.MicNotifyChatID), db, micapi.WithLogger(log),
+	)
+	mux.Handle("/mic/v1/", h)
+
+	return h
 }
 
 // pipelineParts is the queue side of the service: the two lane workers and
@@ -237,8 +270,13 @@ func newPipeline(cfg config.Config, log *zap.Logger, db *sqlite.DB, deps pipelin
 	mainWorker.SetQueueNotifier(notifier)
 	docsWorker.SetQueueNotifier(notifier)
 
-	ingester, err := pipeline.NewIngester(db, wakeAll{mainWorker, docsWorker},
-		pipeline.WithFiles(db, cfg.BatchQuietPeriod, deps.Downloader, deps.Files), pipeline.WithLog(log))
+	opts := []pipeline.IngesterOption{
+		pipeline.WithFiles(db, cfg.BatchQuietPeriod, deps.Downloader, deps.Files), pipeline.WithLog(log),
+	}
+	if cfg.MicUploadToken != "" {
+		opts = append(opts, pipeline.WithRecordings(db, cfg.MicNotifyChatID))
+	}
+	ingester, err := pipeline.NewIngester(db, wakeAll{mainWorker, docsWorker}, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("ingester: %w", err)
 	}

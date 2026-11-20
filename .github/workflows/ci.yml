@@ -230,3 +230,37 @@ jobs:
       # task build sets CGO_ENABLED=0.
       - name: Run build
         run: task build
+
+  # The recorder links malgo (cgo), so it builds natively on each target
+  # architecture with no cross-compiler. gcc is preinstalled on the runners;
+  # miniaudio loads libasound at runtime, so no ALSA -dev package is needed.
+  build-mic:
+    name: build-mic (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    needs: [lint, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Golang
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          check-latest: true
+
+      - name: Install Task
+        uses: go-task/setup-task@v2
+
+      - name: Setup project
+        run: task setup
+
+      # task build:mic sets CGO_ENABLED=1.
+      - name: Run build
+        run: task build:mic

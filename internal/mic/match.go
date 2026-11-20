@@ -26,6 +26,9 @@ type Snapshot struct {
 type Receiver struct {
 	Card      int
 	InputPath string
+	// CaptureDevice is an explicitly configured capture device name
+	// (MIC_CAPTURE_DEVICE). Discovery leaves it empty and Card applies.
+	CaptureDevice string
 }
 
 // MatchReceiver returns the receiver on the lexicographically smallest USB

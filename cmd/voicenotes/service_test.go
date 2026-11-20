@@ -573,3 +573,137 @@ func TestVisionFailureKeepsTheNormalReply(t *testing.T) {
 		t.Errorf("replies = %q, want the normal confirmation last", replies)
 	}
 }
+
+const micTestToken = "FAKE-0123456789abcdef0123456789abcdef"
+
+type nopReplier struct{}
+
+func (nopReplier) Send(context.Context, int64, int64, string) (int64, error) { return 1, nil }
+func (nopReplier) Edit(context.Context, int64, int64, string) (int64, error) { return 1, nil }
+func (nopReplier) Delete(context.Context, int64, int64) error                { return nil }
+
+func micMuxFor(t *testing.T, token string) *http.ServeMux {
+	t.Helper()
+	dir := t.TempDir()
+	db, err := sqlite.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	cfg := buildConfig(t, dir)
+	cfg.MicUploadToken = token
+	cfg.MicNotifyChatID = -1001234567890
+	mux := http.NewServeMux()
+	// A nil ingester is fine: the check-in route never reaches it.
+	mountMic(mux, cfg, zap.NewNop(), db, nil, nopReplier{}, filepath.Join(dir, "files"))
+
+	return mux
+}
+
+func micRequest(mux http.Handler, bearer string) int {
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPut, "/mic/v1/recorders/x",
+		strings.NewReader(`{"receiver_present":true,"storage_full":false}`))
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	return rec.Code
+}
+
+func TestMicAPIMountedOnlyWithToken(t *testing.T) {
+	with := micMuxFor(t, micTestToken)
+	if got := micRequest(with, micTestToken); got != http.StatusNoContent {
+		t.Errorf("correct bearer = %d, want 204", got)
+	}
+	if got := micRequest(with, "FAKE-wrong"); got != http.StatusUnauthorized {
+		t.Errorf("wrong bearer = %d, want 401", got)
+	}
+	without := micMuxFor(t, "")
+	if got := micRequest(without, micTestToken); got != http.StatusNotFound {
+		t.Errorf("no token configured = %d, want 404", got)
+	}
+}
+
+func TestHTTPServerTimeouts(t *testing.T) {
+	srv := newHTTPServer(http.NewServeMux())
+	if srv.ReadTimeout != 2*time.Minute || srv.WriteTimeout != 2*time.Minute+30*time.Second {
+		t.Fatalf("timeouts = %v/%v, want 2m/2m30s", srv.ReadTimeout, srv.WriteTimeout)
+	}
+	if srv.ReadHeaderTimeout != healthCheckTimeout {
+		t.Fatalf("ReadHeaderTimeout = %v", srv.ReadHeaderTimeout)
+	}
+}
+
+func TestPurgerFor(t *testing.T) {
+	db, err := sqlite.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, ok := purgerFor(config.Config{}, db, nopReplier{}, zap.NewNop()).(pipeline.ReplyPurger); ok {
+		t.Error("purger without a token must not purge start replies")
+	}
+	cfg := config.Config{MicUploadToken: micTestToken}
+	rp, ok := purgerFor(cfg, db, nopReplier{}, zap.NewNop()).(pipeline.ReplyPurger)
+	if !ok {
+		t.Fatal("purger with a token must purge start replies")
+	}
+	if _, err = rp.PurgeStartReplies(t.Context(), time.Now()); err != nil {
+		t.Fatalf("PurgeStartReplies: %v", err)
+	}
+}
+
+func TestBuildWithMicTokenMountsAndPurges(t *testing.T) {
+	dir := t.TempDir()
+	cfg := buildConfig(t, dir)
+	cfg.MicUploadToken = micTestToken
+	cfg.MicNotifyChatID = -1001234567890
+	svc, err := build(cfg, zap.NewNop(), time.Now())
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if err = svc.closeStore(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestNewPipelineEnablesRecordingsOnlyWithToken fails if WithRecordings is
+// dropped from the ingester options, or enabled without a token.
+func TestNewPipelineEnablesRecordingsOnlyWithToken(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		token string
+		want  error
+	}{
+		{"with token", micTestToken, nil},
+		{"without token", "", pipeline.ErrNoRecordings},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			db, err := sqlite.Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			cfg := buildConfig(t, dir)
+			cfg.MicUploadToken = tc.token
+			cfg.MicNotifyChatID = -1001234567890
+			world := &e2eWorld{}
+			p, err := newPipeline(cfg, zap.NewNop(), db, pipeline.Deps{
+				Transcriber: voiceTranscriber{}, Notes: world, Replier: world, Downloader: world,
+				Files: pipeline.NewDirFiles(filepath.Join(dir, "files")), Log: zap.NewNop(),
+			})
+			if err != nil {
+				t.Fatalf("newPipeline: %v", err)
+			}
+			meta := pipeline.RecordingMeta{ID: 7, StartedAt: time.Now(), Recorder: "x"}
+			_, err = p.ingester.IngestRecording(t.Context(), meta, "mic-7.wav")
+			if !errors.Is(err, tc.want) || (tc.want == nil && err != nil) {
+				t.Fatalf("IngestRecording err = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}

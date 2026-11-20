@@ -170,14 +170,14 @@ through the unchanged pipeline, and the recorder loop runs against fakes.
 
 **Independent Test**: quickstart.md §2 and §3 on one host. Use the laptop microphone and keyboard (explicit device settings) until the kit arrives.
 
-- [ ] T012 [US1] Implement `micapi.Starts` in `internal/micapi/starts.go`. Tests go in `internal/micapi/starts_test.go`.
+- [x] T012 [US1] Implement `micapi.Starts` in `internal/micapi/starts.go`. Tests go in `internal/micapi/starts_test.go`.
   - `Started(ctx, id, startedAt)`:
     - Send a silent `🎙 recording…` with `Replier.Send(notifyChat, 0, …)` under a 10 s timeout, then `PutStartReply`.
     - A repeat for the same ID is a no-op.
   - `Discarded(ctx, id)`: `TakeStartReply` plus `Replier.Delete`. A missing row is a no-op.
   - Extend `pipeline.PurgeLoop` in `internal/pipeline/purge.go`: `mic_replies` rows "older than 1 day" are edited to `⚠ recording not received` (best-effort), then deleted.
   - Use exactly the texts in contracts/telegram-ux.md.
-- [ ] T013 [US1] Implement `micapi.Handler` in `internal/micapi/handler.go`, with pure request validation in `internal/micapi/headers.go`. Tests go in `internal/micapi/handler_test.go` and `headers_test.go`, using `httptest` and fakes. Follow contracts/mic-http-api.md exactly.
+- [x] T013 [US1] Implement `micapi.Handler` in `internal/micapi/handler.go`, with pure request validation in `internal/micapi/headers.go`. Tests go in `internal/micapi/handler_test.go` and `headers_test.go`, using `httptest` and fakes. Follow contracts/mic-http-api.md exactly.
   - **Auth**: Bearer token, compared with `crypto/subtle`. On 401, nothing is stored and nothing is logged beyond the path and status.
   - **`{id}`**: decimal int64 > 0, else 400.
   - **`PUT /mic/v1/recordings/{id}`**:
@@ -191,10 +191,10 @@ through the unchanged pipeline, and the recorder loop runs against fakes.
     - `DELETE …/started`: 204.
     - `PUT /mic/v1/recorders/{name}`: upserts `mic_recorders` with server `last_seen` and returns 204; a bad name gives 400.
   - Response bodies are `{"status","reason"}` and never contain a secret.
-- [ ] T014 [US1] Wire the API into the service in `cmd/voicenotes/service.go`. Tests go in `cmd/voicenotes/service_test.go`.
+- [x] T014 [US1] Wire the API into the service in `cmd/voicenotes/service.go`. Tests go in `cmd/voicenotes/service_test.go`.
   - Mount `micapi.Handler` under `/mic/v1/` only when `cfg.MicUploadToken != ""`, as a plain conditional. Otherwise `/mic/v1/…` returns 404.
   - Set `serveHTTP`'s `ReadTimeout: 2m` and `WriteTimeout: 30s`.
-- [ ] T015 [US1] Implement the recorder's HTTP side in `internal/recorder/client.go`. Tests go in `internal/recorder/client_test.go`, against `httptest`.
+- [x] T015 [US1] Implement the recorder's HTTP side in `internal/recorder/client.go`. Tests go in `internal/recorder/client_test.go`, against `httptest`.
   - `HTTPHandoff` streams the spool file with the contract headers and its SHA-256, and maps responses per the contract's "Client retry policy" table:
     - 201 → `Stored`; 200 → `Duplicate`.
     - 400 `corrupt`, 5xx and network errors → `Retry`.
@@ -202,13 +202,13 @@ through the unchanged pipeline, and the recorder loop runs against fakes.
     - 413, 415 and other 400s → `Rejected`.
   - `HTTPNotifier`: `POST` and `DELETE …/started`, with a 5 s timeout and no retries.
   - `HTTPCheckIn`: `PUT /mic/v1/recorders/{name}` with `{receiver_present, storage_full, pending, oldest_pending_at}`. The recorder calls it every `MIC_CHECKIN_INTERVAL`.
-- [ ] T016 [P] [US1] Implement the stdlib device adapter in `internal/micdev/keys.go` and `internal/micdev/discover.go`.
+- [x] T016 [P] [US1] Implement the stdlib device adapter in `internal/micdev/keys.go` and `internal/micdev/discover.go`.
   - `Keys` opens the input device, calls `ioctl(fd, EVIOCGRAB=0x40044590, 1)` via `syscall.Syscall`, and reads 24-byte records into `mic.DecodeEvent`.
     - It emits `Tap` for `mic.IsTap`.
     - `ENODEV`, EOF or a read error emits `DeviceLost` and closes.
   - `Discover` walks `/sys/class/sound/card*` and `/sys/class/input/event*` through an injected `fs.FS`, resolves USB parents, and calls `mic.MatchReceiver`.
   - Tests go in `internal/micdev/keys_test.go` (a decode loop over a pipe fed with fixture bytes) and `discover_test.go` (a fake sysfs tree in `internal/micdev/testdata/sys/`). The real grab and read are tested only with `VN_MICDEV=1`.
-- [ ] T017 [P] [US1] Add `github.com/gen2brain/malgo` to `go.mod` (`build(deps)`), and implement `internal/micaudio/capture.go` (cgo) per research R3.
+- [x] T017 [P] [US1] Add `github.com/gen2brain/malgo` to `go.mod` (`build(deps)`), and implement `internal/micaudio/capture.go` (cgo) per research R3.
   - Initialise an ALSA-only context.
   - `Devices(Capture)` selects the device whose ALSA ID names the discovered card, or whose name contains `MIC_CAPTURE_DEVICE`.
   - `InitDevice`: Capture, `FormatS16`, `Channels=1`, `SampleRate=16000`.
@@ -216,7 +216,7 @@ through the unchanged pipeline, and the recorder loop runs against fakes.
   - It implements `recorder.AudioSource`.
   - Tests go in `internal/micaudio/capture_test.go`: a test that it compiles and has the right config always runs; a 1 s recording from the configured device runs with `VN_MICDEV=1`.
   - The depguard rule from T003 must allow only this package and `cmd/voicenotes-mic`.
-- [ ] T018 [US1] Add the recorder binary `cmd/voicenotes-mic/main.go` and `cmd/voicenotes-mic/run.go`. Tests go in `cmd/voicenotes-mic/main_test.go`.
+- [x] T018 [US1] Add the recorder binary `cmd/voicenotes-mic/main.go` and `cmd/voicenotes-mic/run.go`. Tests go in `cmd/voicenotes-mic/main_test.go`.
   - **Commands**:
     - `run` (the default) wires `config.ParseRecorder`, `micdev`, `micaudio`, `recorder.DirSpool`, `recorder.Recorder` and the HTTP clients.
     - `health` GETs `http://<MIC_HTTP_ADDR>/healthz`.
@@ -228,7 +228,7 @@ through the unchanged pipeline, and the recorder loop runs against fakes.
     - Add the `build:mic` task to `Taskfile.yml`: `CGO_ENABLED=1 go build -o bin/voicenotes-mic ./cmd/voicenotes-mic`, with the same ldflags.
     - Add a `build-mic` job to `.github/workflows/ci.yml`, a matrix over `ubuntu-24.04` and `ubuntu-24.04-arm`.
     - In `.claude/CLAUDE.md`, add `task build:mic` to the gate table and update the CI description.
-- [ ] T019 [US1] Add an end-to-end direct-mode test in `cmd/voicenotes/mic_e2e_test.go`.
+- [x] T019 [US1] Add an end-to-end direct-mode test in `cmd/voicenotes/mic_e2e_test.go`.
   - Setup: a real `recorder.Recorder` with fake keys and audio, `HTTPHandoff` against the real service mux in `httptest`, and a fake STT, Memos and Telegram.
   - Cover acceptance scenarios 1.1–1.6:
     - one capture per tap pair
