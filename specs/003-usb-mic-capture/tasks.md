@@ -246,7 +246,7 @@ through the unchanged pipeline, and the recorder loop runs against fakes.
 
 **Independent Test**: quickstart.md §3 on the Pi: service down, re-upload, wrong token, then install from the tarball.
 
-- [ ] T020 [US2] Add an end-to-end remote-resilience test in `cmd/voicenotes/mic_e2e_test.go`, covering acceptance scenarios 2.1–2.6:
+- [x] T020 [US2] Add an end-to-end remote-resilience test in `cmd/voicenotes/mic_e2e_test.go`, covering acceptance scenarios 2.1–2.6:
   - one note per recording
   - three recordings made while the service is down are delivered oldest first once it is back
   - a repeated upload yields one note
@@ -254,7 +254,7 @@ through the unchanged pipeline, and the recorder loop runs against fakes.
   - a wrong token gives 401 and stores nothing; the recorder reports misconfigured
   - when the start notice failed, the outcome is sent as a new message
   - a 415-rejected recording is kept, skipped and reported
-- [ ] T021 [US2] Ship the recorder.
+- [x] T021 [US2] Ship the recorder.
   - Add `deploy/voicenotes-mic.service`: `User=voicenotes-mic`, `SupplementaryGroups=audio input`, `StateDirectory=voicenotes-mic`, `EnvironmentFile=/etc/voicenotes-mic.env`, `ExecStart=/usr/local/bin/voicenotes-mic`, `Restart=always`.
   - Add `deploy/voicenotes-mic.env.example` with anonymised values only.
   - Add a matrix job to `.github/workflows/release.yml` on `ubuntu-24.04` and `ubuntu-24.04-arm`. It builds `voicenotes-mic_<version>_linux_{amd64,arm64}.tar.gz` (binary, `LICENSE`, both deploy files) and attaches them to the GitHub release created by the existing job. Leave the images unchanged.

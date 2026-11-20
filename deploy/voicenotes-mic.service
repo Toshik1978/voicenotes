@@ -1,0 +1,22 @@
+# Example systemd unit for the voicenotes-mic recorder. Install the binary to
+# /usr/local/bin, copy voicenotes-mic.env.example to /usr/local/etc/voicenotes-mic.env
+# (mode 0600) and fill it in, create the user, then enable the unit:
+#
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin voicenotes-mic
+#   sudo systemctl enable --now voicenotes-mic
+[Unit]
+Description=VoiceNotes microphone recorder
+Wants=network-online.target sound.target
+After=network-online.target sound.target
+
+[Service]
+User=voicenotes-mic
+SupplementaryGroups=audio input
+StateDirectory=voicenotes-mic
+EnvironmentFile=/usr/local/etc/voicenotes-mic.env
+ExecStart=/usr/local/bin/voicenotes-mic
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
