@@ -20,8 +20,9 @@ Before any commit, all of these must hold:
 
 Other tasks: `task setup` (download modules), `task format` (apply formatters
 and autofixes), `task test` (plain verbose run), `task run` (builds, loads
-`.env` if present and runs the binary), `task clean`, and `task changelog
-TAG=vX.Y.Z` (prepend the generated section to `CHANGELOG.md`).
+`.env` if present and runs the binary), `task clean`, `task changelog
+TAG=vX.Y.Z` (prepend the generated section to `CHANGELOG.md`), and `task release:snapshot`
+(build the recorder release archives into `dist/` with GoReleaser, publishing nothing).
 
 Do not bypass hooks with `--no-verify`.
 
@@ -48,13 +49,16 @@ command wires all three stages:
 
 CI (`ci.yml`) runs lint, the tests with the 80% coverage gate, a
 `CGO_ENABLED=0` build, and a `build-mic` job that builds the cgo recorder
-natively on `ubuntu-24.04` and `ubuntu-24.04-arm`; it never publishes. On
+natively on `ubuntu-24.04` and `ubuntu-24.04-arm`, and a `release-snapshot` job that builds the
+recorder release archives with GoReleaser; it never publishes. On
 pushes to `main` it updates the Tests and Coverage README badges in a public
 gist (repository secrets `GIST_ID` and `GIST_SECRET_TOKEN`, a token with the `gist` scope); on pull
 requests it posts a sticky coverage comment. `release.yml` runs only on `v*` tags:
 it builds the release body from `CHANGELOG.md` via
 `.github/scripts/extract-changelog.sh`, pushes the multi-arch image as
-`<version>` and `latest`, and creates the GitHub release. `commit-lint.yml` re-runs the commit-msg hook over the
+`<version>` and `latest`, and creates the GitHub release with GoReleaser (`.goreleaser.yaml`), which
+attaches the `voicenotes-mic` archives for linux/amd64 and linux/arm64 (arm64 cross-compiled with
+`gcc-aarch64-linux-gnu`) and their checksums. `commit-lint.yml` re-runs the commit-msg hook over the
 pushed or PR range and must never gain a path filter.
 
 ## Commits

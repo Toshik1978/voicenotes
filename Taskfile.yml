@@ -76,6 +76,10 @@ tasks:
     generates:
       - "{{.MIC_BINARY}}"
 
+  release:snapshot:
+    desc: Build the recorder release archives into dist/ as release.yml does, publishing nothing (needs goreleaser and gcc-aarch64-linux-gnu)
+    cmd: goreleaser release --snapshot --clean --skip=publish
+
   run:
     desc: Build and run the service (loads .env)
     deps: [build]
@@ -85,7 +89,7 @@ tasks:
     desc: Remove build artifacts and test cache
     cmds:
       - go clean -testcache
-      - rm -f {{.BINARY}} {{.MIC_BINARY}} coverage.txt
+      - rm -rf {{.BINARY}} {{.MIC_BINARY}} coverage.txt dist
 
   changelog:
     desc: Prepend the generated commit list for the next release to CHANGELOG.md (TAG=vX.Y.Z)

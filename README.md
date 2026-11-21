@@ -127,8 +127,8 @@ further.
 ### Install the recorder
 
 Each release attaches `voicenotes-mic_<version>_linux_amd64.tar.gz` and
-`voicenotes-mic_<version>_linux_arm64.tar.gz` (built on Ubuntu 24.04, so they run on 26.04). Each
-holds the binary, `LICENSE`, `voicenotes-mic.service` and `voicenotes-mic.env.example`; the last two
+`voicenotes-mic_<version>_linux_arm64.tar.gz` (built on Ubuntu 24.04, so they run on 26.04), and
+`voicenotes-mic_<version>_checksums.txt` lists their SHA-256 sums. Each holds the binary, `LICENSE`, `voicenotes-mic.service` and `voicenotes-mic.env.example`; the last two
 are also in [`deploy/`](deploy). Download the tarball for the host's architecture from the
 [releases page](https://github.com/Toshik1978/voicenotes/releases), unpack it and run, from the
 unpacked directory:
