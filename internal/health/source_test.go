@@ -3,6 +3,7 @@ package health_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -131,7 +132,7 @@ func TestCollectorSnapshot(t *testing.T) {
 				Started:   started,
 				Threshold: 30 * time.Minute,
 			})
-			if got := c.Snapshot(context.Background()); got != tt.want {
+			if got := c.Snapshot(context.Background()); !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("snapshot = %+v\nwant       %+v", got, tt.want)
 			}
 		})
@@ -148,5 +149,51 @@ func TestFreshProcessIsNotDegraded(t *testing.T) {
 	})
 	if got := health.Compute(c.Snapshot(context.Background())).Status; got != health.StatusOK {
 		t.Errorf("status = %s, want ok", got)
+	}
+}
+
+type fakeRecorders struct {
+	rows []health.RecorderAlert
+	err  error
+}
+
+func (f fakeRecorders) RecorderAlerts(context.Context) ([]health.RecorderAlert, error) {
+	return f.rows, f.err
+}
+
+func TestCollectorSnapshotRecorders(t *testing.T) {
+	started := time.Date(2026, 10, 30, 9, 0, 0, 0, time.UTC)
+	now := started.Add(time.Hour)
+	seen := now.Add(-time.Minute)
+	rows := []health.RecorderAlert{{Name: "bed", Alert: "silent", LastSeen: seen}}
+
+	tests := []struct {
+		name    string
+		src     health.Recorders
+		wantRec []health.RecorderAlert
+		wantOK  bool
+	}{
+		{"recorders are reported", fakeRecorders{rows: rows}, rows, true},
+		{"lookup failure marks the store down", fakeRecorders{err: errDown}, nil, false},
+		{"no source leaves them out", nil, nil, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := health.NewCollector(health.CollectorConfig{
+				Queue: fakeQueue{}, Worker: fakeWorker{alive: true, storeOK: true}, Recorders: tt.src,
+				LastPoll: func() time.Time { return now }, Clock: func() time.Time { return now },
+				Started: started, Threshold: 30 * time.Minute,
+			})
+			got := c.Snapshot(context.Background())
+			if !reflect.DeepEqual(got.RecorderAlerts, tt.wantRec) || got.StoreOK != tt.wantOK {
+				t.Errorf(
+					"recorders = %+v storeOK = %v, want %+v %v",
+					got.RecorderAlerts,
+					got.StoreOK,
+					tt.wantRec,
+					tt.wantOK,
+				)
+			}
+		})
 	}
 }

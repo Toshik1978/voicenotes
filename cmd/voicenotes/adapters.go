@@ -13,6 +13,8 @@ import (
 	"github.com/Toshik1978/voicenotes/internal/enrich"
 	"github.com/Toshik1978/voicenotes/internal/health"
 	"github.com/Toshik1978/voicenotes/internal/memos"
+	"github.com/Toshik1978/voicenotes/internal/mic"
+	"github.com/Toshik1978/voicenotes/internal/micapi"
 	"github.com/Toshik1978/voicenotes/internal/openai"
 	"github.com/Toshik1978/voicenotes/internal/pipeline"
 	"github.com/Toshik1978/voicenotes/internal/store/sqlite"
@@ -113,6 +115,24 @@ func (q healthQueue) LastDigestDate(ctx context.Context) (string, error) {
 	return date, nil
 }
 
+// healthRecorders adapts the SQLite store to health.Recorders.
+type healthRecorders struct{ db *sqlite.DB }
+
+var _ health.Recorders = healthRecorders{}
+
+func (r healthRecorders) RecorderAlerts(ctx context.Context) ([]health.RecorderAlert, error) {
+	rows, err := r.db.Recorders(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("health: %w", err)
+	}
+	out := make([]health.RecorderAlert, len(rows))
+	for i, rec := range rows {
+		out[i] = health.RecorderAlert{Name: rec.Name, Alert: rec.Alert, LastSeen: rec.LastSeen}
+	}
+
+	return out, nil
+}
+
 // startReplies adapts the sqlite start-reply store to
 // pipeline.StartReplyStore, which uses its own StartReply type.
 type startReplies struct{ db *sqlite.DB }
@@ -158,4 +178,34 @@ func purgerFor(
 	janitor := pipeline.StartReplyJanitor{Store: startReplies{db: db}, Replier: replier, Log: log}
 
 	return replyPurger{db, janitor}
+}
+
+// alertStore adapts the SQLite store to micapi.AlertStore, which speaks mic
+// types so that micapi imports no adapter.
+type alertStore struct{ db *sqlite.DB }
+
+var _ micapi.AlertStore = alertStore{}
+
+func (a alertStore) RecorderStatuses(ctx context.Context) ([]mic.RecorderStatus, error) {
+	rows, err := a.db.Recorders(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("recorders: %w", err)
+	}
+	out := make([]mic.RecorderStatus, len(rows))
+	for i, r := range rows {
+		out[i] = mic.RecorderStatus{
+			Name: r.Name, LastSeen: r.LastSeen, ReceiverPresent: r.ReceiverPresent,
+			StorageFull: r.StorageFull, Alert: mic.Alert(r.Alert),
+		}
+	}
+
+	return out, nil
+}
+
+func (a alertStore) SetRecorderAlert(ctx context.Context, name string, alert mic.Alert) error {
+	if err := a.db.SetRecorderAlert(ctx, name, string(alert)); err != nil {
+		return fmt.Errorf("set recorder alert: %w", err)
+	}
+
+	return nil
 }
