@@ -52,8 +52,6 @@ type CollectorConfig struct {
 // Collector is the Source built from the live components.
 type Collector struct{ cfg CollectorConfig }
 
-var _ Source = (*Collector)(nil)
-
 // NewCollector returns a Collector. Started is passed on so that, until the
 // first successful poll, Compute measures poll staleness from process start
 // and a just-started process is not reported degraded.

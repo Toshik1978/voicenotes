@@ -103,8 +103,6 @@ type Spool interface {
 	FreeBytes() (int64, error)
 }
 
-var _ Spool = (*DirSpool)(nil)
-
 // Result is the outcome of one hand-off attempt (contract "Client retry
 // policy").
 type Result int

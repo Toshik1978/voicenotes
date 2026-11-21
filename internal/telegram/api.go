@@ -75,11 +75,6 @@ type API struct {
 	log   *zap.Logger
 }
 
-var (
-	_ Replier    = (*API)(nil)
-	_ Downloader = (*API)(nil)
-)
-
 // NewAPI builds the telebot client. It makes no network call (no getMe), so
 // the service starts even while Telegram is unreachable.
 func NewAPI(cfg APIConfig) (*API, error) {

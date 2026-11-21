@@ -72,8 +72,6 @@ type StartReplyJanitor struct {
 	Log     *zap.Logger
 }
 
-var _ ReplyPurger = StartReplyJanitor{}
-
 // PurgeStartReplies handles the replies created before olderThan and
 // returns how many rows it removed. Each row is taken before its message is
 // edited, and only a row this pass took is edited, so an upload that took it
@@ -139,8 +137,6 @@ type HeldAudio struct {
 	Dir  string
 	Hold time.Duration
 }
-
-var _ HeldPurger = HeldAudio{}
 
 // PurgeHeld deletes the expired files (see ExpiredHeld) and returns how many
 // it removed. A missing directory holds nothing. A file that cannot be

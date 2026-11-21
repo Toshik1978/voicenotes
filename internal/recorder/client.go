@@ -41,12 +41,6 @@ type Client struct {
 	recorder string
 }
 
-var (
-	_ Handoff  = (*Client)(nil)
-	_ Notifier = (*Client)(nil)
-	_ CheckIn  = (*Client)(nil)
-)
-
 // NewHTTPClient returns an *http.Client without an overall timeout (an
 // upload of tens of megabytes may be slow; callers bound it with a context)
 // but with transport-level timeouts for connecting and for the response.

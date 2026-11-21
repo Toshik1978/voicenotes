@@ -13,7 +13,6 @@ import (
 	"strings"
 
 	"github.com/Toshik1978/voicenotes/internal/mic"
-	"github.com/Toshik1978/voicenotes/internal/recorder"
 )
 
 // Sysfs is a view of /sys with symlink resolution.
@@ -55,8 +54,6 @@ func hostSysfs(root string) Sysfs {
 type Discover struct {
 	Sys Sysfs
 }
-
-var _ recorder.Discovery = Discover{}
 
 // Discover reports the receiver, or false when none is connected.
 func (d Discover) Discover() (mic.Receiver, bool, error) {
@@ -217,8 +214,6 @@ type Fixed struct {
 	CaptureDevice string
 	InputPath     string
 }
-
-var _ recorder.Discovery = Fixed{}
 
 // Discover returns the configured pair.
 func (f Fixed) Discover() (mic.Receiver, bool, error) {
