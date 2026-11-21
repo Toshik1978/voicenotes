@@ -22,11 +22,15 @@ var errNet = errors.New("network down")
 
 type fakeAudio struct {
 	files    map[string][]byte
+	held     map[string][]byte
 	writeErr error
+	holdErr  error
 	events   *[]string
 }
 
-func newFakeAudio() *fakeAudio { return &fakeAudio{files: map[string][]byte{}} }
+func newFakeAudio() *fakeAudio {
+	return &fakeAudio{files: map[string][]byte{}, held: map[string][]byte{}}
+}
 
 func (f *fakeAudio) Write(name string, data []byte) error {
 	if f.writeErr != nil {
@@ -51,6 +55,20 @@ func (f *fakeAudio) Read(name string) ([]byte, error) {
 func (f *fakeAudio) Exists(name string) (bool, error) { _, ok := f.files[name]; return ok, nil }
 
 func (f *fakeAudio) Remove(name string) error { delete(f.files, name); return nil }
+
+// Hold moves name into the held area as heldName; a missing name is not an
+// error, like Remove.
+func (f *fakeAudio) Hold(name, heldName string) error {
+	if f.holdErr != nil {
+		return f.holdErr
+	}
+	if d, ok := f.files[name]; ok {
+		f.held[heldName] = d
+		delete(f.files, name)
+	}
+
+	return nil
+}
 
 type fakeDownloader struct {
 	data  []byte
@@ -468,14 +486,16 @@ func TestWriteNote(t *testing.T) {
 			t.Errorf("attached %+v", a)
 		}
 	})
-	t.Run("empty transcript shows placeholder", func(t *testing.T) {
+	t.Run("empty transcript has no placeholder", func(t *testing.T) {
+		// FR-210a: no speech never reaches write_note; should an empty text
+		// get here anyway, no "(no speech recognized)" text is invented.
 		r := newRig(t)
 		r.audio.files["5.ogg"] = []byte("A")
 		cc := c
 		cc.Text = ""
 		r.run(capture.StepWriteNote, cc)
-		if !strings.Contains(r.notes.created[0].Content, "(no speech recognized)") {
-			t.Errorf("content %q", r.notes.created[0].Content)
+		if got := r.notes.created[0].Content; got != "#inbox" {
+			t.Errorf("content %q, want only the tags", got)
 		}
 	})
 	t.Run("failure becomes placeholder", func(t *testing.T) {
@@ -1586,4 +1606,141 @@ func TestAttachNameIsDeterministicAndPrivate(t *testing.T) {
 			}
 		})
 	}
+}
+
+// FR-210a: a successful transcript that is empty after trimming marks an
+// audio capture NoSpeech; a non-empty one or a failure never does.
+func TestExtractSetsNoSpeech(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		out  capture.Outcome
+		want bool
+	}{
+		{"empty transcript", "", capture.OK(), true},
+		{"blank transcript", " \n\t ", capture.OK(), true},
+		{"speech", " buy milk ", capture.OK(), false},
+		{"permanent failure is not no speech", "", capture.Permanent("http 415"), false},
+		{"temporary failure is not no speech", "", capture.Temporary("down"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := newRig(t)
+			r.tr.res, r.tr.out = pipeline.TranscribeResult{Text: tt.text}, tt.out
+			r.audio.files["5.ogg"] = []byte("A")
+			c := base()
+			c.Files[0].LocalPath = "5.ogg"
+			got, out := r.run(capture.StepExtract, c)
+			if out.Class != tt.out.Class {
+				t.Fatalf("outcome %+v, want class %v", out, tt.out.Class)
+			}
+			if got.NoSpeech != tt.want {
+				t.Errorf("NoSpeech = %v, want %v", got.NoSpeech, tt.want)
+			}
+		})
+	}
+	t.Run("a failed audio file is not no speech", func(t *testing.T) {
+		r := newRig(t)
+		c := base()
+		c.Files[0].State, c.Files[0].Failure = capture.FileFailed, "audio file missing"
+		got, out := r.run(capture.StepExtract, c)
+		if out.Class != capture.ClassOK || got.NoSpeech || r.tr.call != 0 {
+			t.Errorf("out %+v NoSpeech %v calls %d", out, got.NoSpeech, r.tr.call)
+		}
+	})
+	t.Run("speech after a no-speech run clears it", func(t *testing.T) {
+		r := newRig(t)
+		r.tr.res = pipeline.TranscribeResult{Text: "hello"}
+		r.audio.files["5.ogg"] = []byte("A")
+		c := base()
+		c.Files[0].LocalPath, c.NoSpeech = "5.ogg", true
+		if got, _ := r.run(capture.StepExtract, c); got.NoSpeech {
+			t.Error("NoSpeech kept with a transcript")
+		}
+	})
+}
+
+// FR-210a: the reply of a no-speech capture says nothing was saved, for
+// Telegram and the microphone alike.
+func TestNoSpeechReply(t *testing.T) {
+	for _, src := range []string{"", capture.SourceMic} {
+		t.Run("source "+src, func(t *testing.T) {
+			r := newRig(t)
+			c := base()
+			c.Source, c.ReplyMessageID, c.NoSpeech = src, 9, true
+			c.Files[0].LocalPath = "5.wav"
+			_, out := r.run(capture.StepFinalizeReply, c)
+			if out.Class != capture.ClassOK || len(r.rep.edits) != 1 {
+				t.Fatalf("out %+v edits %v", out, r.rep.edits)
+			}
+			if got := r.rep.edits[0].text; got != "🔇 no speech heard — not saved" {
+				t.Errorf("reply %q", got)
+			}
+		})
+	}
+}
+
+// FR-210b: a Telegram no-speech capture's audio is deleted; a microphone
+// one's is moved to the hold area as <id>.wav. Both drop the content.
+func TestCleanupNoSpeech(t *testing.T) {
+	noSpeech := func(src string) capture.Capture {
+		c := base()
+		c.Source, c.NoSpeech, c.ReplyMessageID = src, true, 9
+		c.Files[0].LocalPath, c.Files[0].MimeType = "rec-ab12.wav", "audio/wav"
+		return c
+	}
+	t.Run("telegram audio is removed", func(t *testing.T) {
+		r := newRig(t)
+		r.audio.files["rec-ab12.wav"] = []byte("A")
+		c := noSpeech("telegram")
+		got, out := r.run(capture.StepCleanup, c)
+		if out.Class != capture.ClassOK || len(r.audio.files) != 0 || len(r.audio.held) != 0 {
+			t.Fatalf("out %+v files %v held %v", out, r.audio.files, r.audio.held)
+		}
+		if got.Files[0].LocalPath != "" {
+			t.Errorf("local path kept: %q", got.Files[0].LocalPath)
+		}
+	})
+	t.Run("mic audio is held as id.wav", func(t *testing.T) {
+		r := newRig(t)
+		r.audio.files["rec-ab12.wav"] = []byte("WAV")
+		got, out := r.run(capture.StepCleanup, noSpeech(capture.SourceMic))
+		if out.Class != capture.ClassOK {
+			t.Fatalf("out %+v", out)
+		}
+		if len(r.audio.files) != 0 || string(r.audio.held["5.wav"]) != "WAV" || len(r.audio.held) != 1 {
+			t.Errorf("files %v held %v, want the audio held as 5.wav", r.audio.files, r.audio.held)
+		}
+		if got.Files[0].LocalPath != "" || got.Text != "" || got.ReplyMessageID != 9 || !got.NoSpeech {
+			t.Errorf("got %+v", got)
+		}
+	})
+	t.Run("mic hold is idempotent on retry", func(t *testing.T) {
+		r := newRig(t)
+		r.audio.held["5.wav"] = []byte("WAV") // moved before a crash
+		_, out := r.run(capture.StepCleanup, noSpeech(capture.SourceMic))
+		if out.Class != capture.ClassOK || string(r.audio.held["5.wav"]) != "WAV" {
+			t.Errorf("out %+v held %v", out, r.audio.held)
+		}
+	})
+	t.Run("mic hold failure is temporary and keeps the file", func(t *testing.T) {
+		r := newRig(t)
+		r.audio.files["rec-ab12.wav"] = []byte("WAV")
+		r.audio.holdErr = errNet
+		got, out := r.run(capture.StepCleanup, noSpeech(capture.SourceMic))
+		if out.Class != capture.ClassTemporary || got.Files[0].LocalPath != "rec-ab12.wav" ||
+			string(r.audio.files["rec-ab12.wav"]) != "WAV" {
+			t.Errorf("out %+v got %+v files %v", out, got, r.audio.files)
+		}
+	})
+	t.Run("mic with speech is removed as before", func(t *testing.T) {
+		r := newRig(t)
+		r.audio.files["rec-ab12.wav"] = []byte("WAV")
+		c := noSpeech(capture.SourceMic)
+		c.NoSpeech = false
+		if _, out := r.run(capture.StepCleanup, c); out.Class != capture.ClassOK ||
+			len(r.audio.files) != 0 || len(r.audio.held) != 0 {
+			t.Errorf("out %+v files %v held %v", out, r.audio.files, r.audio.held)
+		}
+	})
 }

@@ -158,26 +158,35 @@ func (s startReplies) TakeStartReply(
 	return s.db.TakeStartReply(ctx, recordingID) //nolint:wrapcheck // pass-through adapter
 }
 
-// replyPurger purges done captures through the store and stale start replies
-// through the janitor.
-type replyPurger struct {
+// heldPurger purges done captures through the store and held no-speech
+// audio through HeldAudio.
+type heldPurger struct {
 	*sqlite.DB
+	pipeline.HeldAudio
+}
+
+// micPurger adds the start-reply janitor to heldPurger.
+type micPurger struct {
+	heldPurger
 	pipeline.StartReplyJanitor
 }
 
-// purgerFor returns the purge target of PurgeLoop: the store alone, or, with
-// the microphone enabled, one that also marks stale start messages.
+// purgerFor returns the purge target of PurgeLoop: the store plus the held
+// audio in heldDir (purged even with the microphone off, so audio held before
+// it was disabled still goes) and, with the microphone enabled, the janitor
+// that marks stale start messages.
 //
 //nolint:ireturn // the result is either implementation
 func purgerFor(
-	cfg config.Config, db *sqlite.DB, replier pipeline.Replier, log *zap.Logger,
+	cfg config.Config, db *sqlite.DB, replier pipeline.Replier, heldDir string, log *zap.Logger,
 ) pipeline.Purger {
+	held := heldPurger{db, pipeline.HeldAudio{Dir: heldDir, Hold: cfg.MicNoSpeechHold}}
 	if cfg.MicUploadToken == "" {
-		return db
+		return held
 	}
 	janitor := pipeline.StartReplyJanitor{Store: startReplies{db: db}, Replier: replier, Log: log}
 
-	return replyPurger{db, janitor}
+	return micPurger{held, janitor}
 }
 
 // alertStore adapts the SQLite store to micapi.AlertStore, which speaks mic

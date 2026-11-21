@@ -119,6 +119,11 @@ func build(cfg config.Config, log *zap.Logger, started time.Time) (*service, err
 	if err := os.MkdirAll(filesDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
+	// Microphone audio with no speech waits here for MIC_NOSPEECH_HOLD.
+	heldDir := filepath.Join(cfg.DataDir, pipeline.NoSpeechDir)
+	if err := os.MkdirAll(heldDir, 0o700); err != nil {
+		return nil, fmt.Errorf("create nospeech dir: %w", err)
+	}
 	db, err := sqlite.Open(cfg.DataDir)
 	if err != nil {
 		return nil, fmt.Errorf("open store: %w", err)
@@ -194,7 +199,9 @@ func wire(
 	mux := http.NewServeMux()
 	mux.Handle("/healthz", health.Handler(collector))
 	micHandler := mountMic(mux, cfg, log, db, ingester, tg, filesDir)
-	purger := purgerFor(cfg, db, tg, log)
+	// The sibling of filesDir, where DirFiles.Hold puts no-speech audio.
+	heldDir := filepath.Join(filepath.Dir(filesDir), pipeline.NoSpeechDir)
+	purger := purgerFor(cfg, db, tg, heldDir, log)
 
 	goroutines := append([]func(context.Context){
 		func(ctx context.Context) { tg.Run(ctx, handler) },

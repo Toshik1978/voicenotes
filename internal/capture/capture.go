@@ -123,7 +123,8 @@ type Capture struct {
 	// ReplyMessageID is the reply to edit; 0 until a reply has been sent.
 	ReplyMessageID int64
 	// NoSpeech is true when an audio capture's transcript was empty after a
-	// successful transcription.
+	// successful transcription. Such a capture creates no note: an OK outcome
+	// at extract skips enrich and write_note (Policy.Next).
 	NoSpeech bool
 
 	Kind       Kind

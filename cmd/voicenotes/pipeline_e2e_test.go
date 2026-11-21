@@ -416,3 +416,25 @@ func TestAlbumWithAckSlowerThanTheQuietPeriodYieldsOneNote(t *testing.T) {
 		t.Fatalf("notes = %d, replies = %q, want one note, one ⏳ and one saved reply", len(notes), replies)
 	}
 }
+
+// FR-210a/b (supersedes the 001 "silence or unintelligible audio" case): a
+// Telegram voice message with no speech makes no note, its ⏳ says so, and
+// its local audio is deleted, since the original stays in the chat.
+func TestTelegramSilenceMakesNoNote(t *testing.T) {
+	e := startE2E(t, e2eConfig(), voiceTranscriber{text: " \n"})
+	e.handler.Handle(t.Context(), voiceMessage(42))
+
+	notes, attachments, replies := e.waitForIdle(t)
+	if len(notes) != 0 || len(attachments) != 0 {
+		t.Errorf("notes = %+v, attachments = %q; want none", notes, attachments)
+	}
+	if !slices.Equal(replies, []string{"⏳", "🔇 no speech heard — not saved"}) {
+		t.Errorf("replies = %q, want the ⏳ edited to the no-speech reply", replies)
+	}
+	if entries, err := os.ReadDir(e.world.filesDir); err != nil || len(entries) != 0 {
+		t.Errorf("files dir holds %v (%v), want nothing", entries, err)
+	}
+	if entries, _ := os.ReadDir(filepath.Join(filepath.Dir(e.world.filesDir), "nospeech")); len(entries) != 0 {
+		t.Errorf("nospeech holds %v, want nothing for Telegram", entries)
+	}
+}

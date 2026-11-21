@@ -3,6 +3,8 @@ package pipeline_test
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -194,5 +196,146 @@ func TestPurgeLoopPurgesStartReplies(t *testing.T) {
 
 func TestPurgeLoopSurvivesStartReplyErrors(t *testing.T) {
 	p := &replyingPurger{err: errors.New("disk full")}
+	runPurge(t, &p.fakePurger, time.Date(2026, 5, 31, 12, 0, 0, 0, time.UTC), p)
+}
+
+func TestExpiredHeld(t *testing.T) {
+	now := time.Date(2026, 5, 31, 12, 0, 0, 0, time.UTC)
+	hold := 168 * time.Hour
+	files := []pipeline.StoredFile{
+		{Name: "1.wav", ModTime: now.Add(-hold - time.Second), Regular: true},
+		{Name: "2.wav", ModTime: now.Add(-hold), Regular: true},
+		{Name: "3.wav", ModTime: now.Add(-time.Hour), Regular: true},
+		{Name: "sub", ModTime: now.Add(-2 * hold), Regular: false},
+		{Name: "4.wav", ModTime: now.Add(-2 * hold), Regular: true},
+	}
+	got := pipeline.ExpiredHeld(files, now, hold)
+	if len(got) != 2 || got[0] != "1.wav" || got[1] != "4.wav" {
+		t.Fatalf("expired = %v, want [1.wav 4.wav]", got)
+	}
+}
+
+// heldWorld is a DATA_DIR with files/ and nospeech/, each holding a file
+// older than the hold and one younger.
+func heldWorld(t *testing.T, now time.Time, hold time.Duration) (filesDir, heldDir string) {
+	t.Helper()
+	dataDir := t.TempDir()
+	filesDir = filepath.Join(dataDir, "files")
+	heldDir = filepath.Join(dataDir, pipeline.NoSpeechDir)
+	for _, d := range []string{filesDir, heldDir} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		for name, age := range map[string]time.Duration{"old.wav": hold + time.Minute, "new.wav": hold - time.Minute} {
+			p := filepath.Join(d, name)
+			if err := os.WriteFile(p, []byte("RIFF"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			mt := now.Add(-age)
+			if err := os.Chtimes(p, mt, mt); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	return filesDir, heldDir
+}
+
+func exists(t *testing.T, p string) bool {
+	t.Helper()
+	_, err := os.Stat(p)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+
+	return err == nil
+}
+
+func TestHeldAudioPurgesOnlyExpiredHeldFiles(t *testing.T) {
+	now := time.Date(2026, 5, 31, 12, 0, 0, 0, time.UTC)
+	hold := 168 * time.Hour
+	filesDir, heldDir := heldWorld(t, now, hold)
+
+	n, err := pipeline.HeldAudio{Dir: heldDir, Hold: hold}.PurgeHeld(context.Background(), now)
+	if err != nil || n != 1 {
+		t.Fatalf("n=%d err=%v, want 1 removed", n, err)
+	}
+	if exists(t, filepath.Join(heldDir, "old.wav")) {
+		t.Error("expired held audio survived")
+	}
+	if !exists(t, filepath.Join(heldDir, "new.wav")) {
+		t.Error("held audio inside the hold was deleted")
+	}
+	for _, name := range []string{"old.wav", "new.wav"} {
+		if !exists(t, filepath.Join(filesDir, name)) {
+			t.Errorf("files/%s touched by the held purge", name)
+		}
+	}
+}
+
+func TestHeldAudioMissingDirIsEmpty(t *testing.T) {
+	h := pipeline.HeldAudio{Dir: filepath.Join(t.TempDir(), "nospeech"), Hold: time.Hour}
+	if n, err := h.PurgeHeld(context.Background(), time.Now()); err != nil || n != 0 {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+}
+
+func TestHeldAudioCancelledStops(t *testing.T) {
+	now := time.Date(2026, 5, 31, 12, 0, 0, 0, time.UTC)
+	_, heldDir := heldWorld(t, now, time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	n, err := pipeline.HeldAudio{Dir: heldDir, Hold: time.Hour}.PurgeHeld(ctx, now)
+	if !errors.Is(err, context.Canceled) || n != 0 || !exists(t, filepath.Join(heldDir, "old.wav")) {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+}
+
+func TestOrphanSweepLeavesHeldAudio(t *testing.T) {
+	now := time.Date(2026, 5, 31, 12, 0, 0, 0, time.UTC)
+	filesDir, heldDir := heldWorld(t, now, 2*time.Hour)
+
+	if _, err := pipeline.SweepOrphanFiles(context.Background(), filesDir, fakeRefs{}, now, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"old.wav", "new.wav"} {
+		if !exists(t, filepath.Join(heldDir, name)) {
+			t.Errorf("orphan sweep removed nospeech/%s", name)
+		}
+	}
+}
+
+type heldPurger struct {
+	fakePurger
+
+	nows []time.Time
+	err  error
+}
+
+func (h *heldPurger) PurgeHeld(_ context.Context, now time.Time) (int, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.nows = append(h.nows, now)
+
+	return 1, h.err
+}
+
+func TestPurgeLoopPurgesHeldAudio(t *testing.T) {
+	p := &heldPurger{}
+	now := time.Date(2026, 5, 31, 12, 0, 0, 0, time.UTC)
+	runPurge(t, &p.fakePurger, now, p)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.nows) == 0 {
+		t.Fatal("held audio never purged")
+	}
+	if !p.nows[0].Equal(now) {
+		t.Errorf("now = %v, want %v", p.nows[0], now)
+	}
+}
+
+func TestPurgeLoopSurvivesHeldAudioErrors(t *testing.T) {
+	p := &heldPurger{err: errors.New("disk full")}
 	runPurge(t, &p.fakePurger, time.Date(2026, 5, 31, 12, 0, 0, 0, time.UTC), p)
 }
