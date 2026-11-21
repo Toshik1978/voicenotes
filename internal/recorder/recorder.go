@@ -20,6 +20,9 @@ const (
 	rediscoverInterval = 5 * time.Second
 	// tickInterval paces the maximum-length check.
 	tickInterval = time.Second
+	// grabRetryInterval paces re-grabbing a receiver input that was not held
+	// exclusively (FR-202).
+	grabRetryInterval = 10 * time.Second
 	// defaultFrameBuffer is the frame queue's capacity in audio callbacks: at
 	// miniaudio's ~10 ms period, several seconds of slack for a slow fsync.
 	defaultFrameBuffer = 1024
@@ -49,6 +52,11 @@ type KeyStream struct {
 	Close func() error
 	// Grabbed reports whether the input is held exclusively (FR-202).
 	Grabbed bool
+	// GrabErr is why the initial grab failed; nil when Grabbed.
+	GrabErr error
+	// Regrab retries the exclusive grab and returns why it still fails, or
+	// nil once the input is held. It may be nil when the stream cannot retry.
+	Regrab func() error
 }
 
 // KeySource opens the receiver's key input (micdev.Keys).
@@ -115,7 +123,7 @@ const (
 	Rejected
 )
 
-// Handoff uploads a finished recording (recorder.HTTPHandoff).
+// Handoff uploads a finished recording ([Client]).
 type Handoff interface {
 	// Upload sends size bytes of body. The error, if any, explains a result
 	// other than Stored or Duplicate; the result alone decides what happens.
@@ -160,6 +168,14 @@ type Status struct {
 	Misconfigured bool
 	// SpoolError is set while the spool cannot be listed.
 	SpoolError bool
+	// AudioError is set when a recording could not start (the audio device
+	// or the spool failed to open) and cleared by the next successful start.
+	// While it is set taps do not record.
+	AudioError bool
+	// FinishError is set when a finished recording could not be closed in
+	// the spool, which hides it from the hand-off until the next start's
+	// recovery; the next successful finish clears it.
+	FinishError bool
 	// Running is true while Run's loops are up.
 	Running bool
 }
@@ -230,6 +246,11 @@ type Recorder struct {
 	wake   chan struct{}
 	notes  sync.WaitGroup
 
+	// discovered is closed once the first discovery has completed: nothing
+	// found, or the receiver's session is up (FR-227a).
+	discovered     chan struct{}
+	discoveredOnce sync.Once
+
 	// Owned by the event loop.
 	active *activeRec
 
@@ -251,12 +272,13 @@ func New(d Deps, o Options) (*Recorder, error) {
 	d, o = withDefaults(d, o)
 
 	return &Recorder{
-		d:        d,
-		o:        o,
-		log:      d.Log,
-		toggle:   mic.NewToggle(o.Debounce, o.MinLength, o.MaxLength, o.NewID),
-		wake:     make(chan struct{}, 1),
-		rejected: map[int64]bool{},
+		d:          d,
+		o:          o,
+		log:        d.Log,
+		toggle:     mic.NewToggle(o.Debounce, o.MinLength, o.MaxLength, o.NewID),
+		wake:       make(chan struct{}, 1),
+		discovered: make(chan struct{}),
+		rejected:   map[int64]bool{},
 	}, nil
 }
 
@@ -384,6 +406,10 @@ func (r *Recorder) deviceLoop(ctx context.Context) {
 			r.log.Warn("receiver discovery failed", zap.Error(err))
 		}
 
+		if !ok {
+			r.markDiscovered()
+		}
+
 		switch {
 		case ok:
 			present = true
@@ -401,24 +427,37 @@ func (r *Recorder) deviceLoop(ctx context.Context) {
 	}
 }
 
+// markDiscovered releases the first check-in.
+func (r *Recorder) markDiscovered() {
+	r.discoveredOnce.Do(func() { close(r.discovered) })
+}
+
 // session runs one receiver until it is lost or ctx ends.
 func (r *Recorder) session(ctx context.Context, rcv mic.Receiver) {
 	keys, err := r.d.Keys.Open(rcv.InputPath)
 	if err != nil {
 		r.log.Error("open receiver input", zap.String("input", rcv.InputPath), zap.Error(err))
+		r.markDiscovered()
+
 		return
 	}
 
 	if !keys.Grabbed {
-		r.log.Warn("receiver input not held exclusively", zap.String("input", rcv.InputPath))
+		r.log.Warn("receiver input not held exclusively", zap.String("input", rcv.InputPath), zap.Error(keys.GrabErr))
 	}
 
 	r.log.Info("receiver ready", zap.Int("card", rcv.Card), zap.String("input", rcv.InputPath))
 	r.setStatus(func(s *Status) { s.ReceiverPresent, s.InputGrabbed = true, keys.Grabbed })
+	r.markDiscovered()
 
 	tick, stop := r.o.Clock.NewTicker(tickInterval)
 
+	nextGrab := r.o.Clock.Now().Add(grabRetryInterval)
+
 	for r.step(ctx, rcv, keys.Events, tick) {
+		if !keys.Grabbed {
+			nextGrab = r.regrab(&keys, nextGrab)
+		}
 	}
 
 	stop()
@@ -428,6 +467,25 @@ func (r *Recorder) session(ctx context.Context, rcv mic.Receiver) {
 	}
 
 	r.setStatus(func(s *Status) { s.ReceiverPresent, s.InputGrabbed = false, false })
+}
+
+// regrab retries the exclusive grab once due and returns when to try next.
+// Recording is unaffected either way; a success clears the not-grabbed state.
+func (r *Recorder) regrab(keys *KeyStream, due time.Time) time.Time {
+	now := r.o.Clock.Now()
+	if keys.Regrab == nil || now.Before(due) {
+		return due
+	}
+
+	if err := keys.Regrab(); err != nil {
+		r.log.Warn("receiver input grab failed", zap.Error(err), zap.Duration("retry_in", grabRetryInterval))
+	} else {
+		keys.Grabbed = true
+		r.log.Info("receiver input now held exclusively")
+		r.setStatus(func(s *Status) { s.InputGrabbed = true })
+	}
+
+	return now.Add(grabRetryInterval)
 }
 
 // step handles one event and reports whether the session goes on.
@@ -573,7 +631,7 @@ func (r *Recorder) start(ctx context.Context, rcv mic.Receiver, a mic.Action) {
 	go act.write()
 
 	r.active = act
-	r.setStatus(func(s *Status) { s.Recording = true })
+	r.setStatus(func(s *Status) { s.Recording, s.AudioError = true, false })
 	r.log.Info("recording started", zap.Int64("recording_id", a.ID))
 
 	r.notes.Go(func() {
@@ -583,9 +641,11 @@ func (r *Recorder) start(ctx context.Context, rcv mic.Receiver, a mic.Action) {
 	})
 }
 
-// abort undoes a start that failed, so the next tap starts afresh.
+// abort undoes a start that failed, so the next tap starts afresh, and
+// reports the failure until a recording starts again.
 func (r *Recorder) abort(id int64, err error) {
 	r.toggle.Interrupt(r.o.Clock.Now())
+	r.setStatus(func(s *Status) { s.AudioError = true })
 	r.log.Error("recording could not start", zap.Int64("recording_id", id), zap.Error(err))
 }
 
@@ -595,11 +655,14 @@ func (r *Recorder) stop(id int64, endedAt time.Time, reason mic.EndReason) {
 	}
 
 	if err := r.d.Spool.Finish(id, endedAt, reason); err != nil {
+		r.setStatus(func(s *Status) { s.FinishError = true })
 		r.log.Error("finish recording; recovery completes it at the next start",
 			zap.Int64("recording_id", id), zap.Error(err))
 
 		return
 	}
+
+	r.setStatus(func(s *Status) { s.FinishError = false })
 
 	r.log.Info("recording finished", zap.Int64("recording_id", id), zap.String("end_reason", string(reason)))
 	r.wakeHandoff()
@@ -615,6 +678,15 @@ func (r *Recorder) discard(ctx context.Context, id int64) {
 	}
 
 	r.log.Info("short recording discarded", zap.Int64("recording_id", id))
+	r.notifyDiscarded(ctx, id)
+}
+
+// notifyDiscarded sends the discard notice that deletes the start message.
+// It outlives ctx, so a recording discarded at shutdown still loses its
+// start message; the notifier bounds the request itself.
+func (r *Recorder) notifyDiscarded(ctx context.Context, id int64) {
+	ctx = context.WithoutCancel(ctx)
+
 	r.notes.Go(func() {
 		if err := r.d.Notifier.Discarded(ctx, id); err != nil {
 			r.log.Info("discard notice not sent", zap.Int64("recording_id", id), zap.Error(err))
@@ -690,12 +762,40 @@ func (r *Recorder) handoffOnce(ctx context.Context) (time.Duration, bool) {
 
 	r.listFailures = 0
 
-	next, ok := r.pending(recs)
+	next, ok := r.pending(r.dropShort(ctx, recs))
 	if !ok {
 		return 0, true
 	}
 
 	return r.upload(ctx, next), false
+}
+
+// dropShort discards the interrupted recordings below the minimum length and
+// returns the rest. Such a recording was finished by crash recovery, whose
+// end time comes from the audio length, or left behind by a discard that did
+// not complete (FR-209). Other end reasons were judged by the tap state
+// machine. A recording whose discard fails is skipped, never uploaded, and
+// retried on the next pass.
+func (r *Recorder) dropShort(ctx context.Context, recs []Recording) []Recording {
+	out := make([]Recording, 0, len(recs))
+
+	for _, rec := range recs {
+		if rec.EndReason != mic.EndInterrupted || rec.EndedAt.Sub(rec.StartedAt) >= r.o.MinLength {
+			out = append(out, rec)
+			continue
+		}
+
+		if err := r.d.Spool.Discard(rec.ID); err != nil {
+			r.log.Error("discard short recording", zap.Int64("recording_id", rec.ID), zap.Error(err))
+			continue
+		}
+
+		r.log.Info("short recording discarded", zap.Int64("recording_id", rec.ID),
+			zap.String("end_reason", string(rec.EndReason)))
+		r.notifyDiscarded(ctx, rec.ID)
+	}
+
+	return out
 }
 
 // pending publishes the queue's state and returns the oldest recording not
@@ -795,18 +895,42 @@ func (r *Recorder) checkInLoop(ctx context.Context) {
 	tick, stop := r.o.Clock.NewTicker(r.o.CheckinInterval)
 	defer stop()
 
+	// The first check-in waits for the first discovery so it never reports
+	// a missing receiver the recorder has (FR-227a), but at most one
+	// interval, so a hung discovery never leaves the recorder silent.
+	select {
+	case <-ctx.Done():
+		return
+	case <-r.discovered:
+	case <-tick:
+	}
+
 	for {
 		r.refreshStorage()
 
-		if err := r.d.CheckIn.Send(ctx, r.Status()); err != nil && ctx.Err() == nil {
-			r.log.Warn("check-in failed", zap.Error(err))
-		}
+		r.checkIn(ctx)
 
 		select {
 		case <-ctx.Done():
 			return
 		case <-tick:
 		}
+	}
+}
+
+// checkIn sends one check-in. A refused credential (401) sets Misconfigured
+// as upload does; an accepted check-in proves the credential and clears it.
+func (r *Recorder) checkIn(ctx context.Context) {
+	err := r.d.CheckIn.Send(ctx, r.Status())
+
+	switch {
+	case err == nil:
+		r.setStatus(func(s *Status) { s.Misconfigured = false })
+	case errors.Is(err, ErrUnauthorized):
+		r.setStatus(func(s *Status) { s.Misconfigured = true })
+		r.log.Error("check-in credential refused; check MIC_UPLOAD_TOKEN", zap.Error(err))
+	case ctx.Err() == nil:
+		r.log.Warn("check-in failed", zap.Error(err))
 	}
 }
 

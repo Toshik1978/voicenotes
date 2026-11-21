@@ -66,19 +66,40 @@ func TestAlertStoreAdaptsRecorders(t *testing.T) {
 		t.Fatal(err)
 	}
 	st := alertStore{db: db}
-	if err = st.SetRecorderAlert(t.Context(), "bed", mic.AlertSilent); err != nil {
+	both := mic.NewAlertSet(mic.AlertMissingReceiver, mic.AlertSilent)
+	if err = st.SetRecorderAlert(t.Context(), "bed", both); err != nil {
 		t.Fatal(err)
 	}
 	got, err := st.RecorderStatuses(t.Context())
 	if err != nil || len(got) != 1 {
 		t.Fatalf("got=%v err=%v", got, err)
 	}
-	want := mic.RecorderStatus{Name: "bed", LastSeen: seen, ReceiverPresent: true, Alert: mic.AlertSilent}
+	want := mic.RecorderStatus{Name: "bed", LastSeen: seen, ReceiverPresent: true, Outstanding: both}
 	if !got[0].LastSeen.Equal(seen) {
 		t.Fatalf("last seen = %v", got[0].LastSeen)
 	}
 	got[0].LastSeen = want.LastSeen
 	if got[0] != want {
 		t.Fatalf("got %+v want %+v", got[0], want)
+	}
+	if rows, _ := db.Recorders(t.Context()); rows[0].Alert != "missing_receiver,silent" {
+		t.Fatalf("stored alert = %q", rows[0].Alert)
+	}
+}
+
+func TestAlertStoreRejectsUnknownStoredAlert(t *testing.T) {
+	db, err := sqlite.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err = db.UpsertRecorder(t.Context(), "bed", time.Now(), true, false); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.SetRecorderAlert(t.Context(), "bed", "bogus"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = (alertStore{db: db}).RecorderStatuses(t.Context()); err == nil {
+		t.Fatal("want an error for an unknown stored alert")
 	}
 }

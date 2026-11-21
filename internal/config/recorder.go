@@ -150,6 +150,9 @@ func (r *recorderValidator) validateRecording() {
 	r.inRange("MIC_DEBOUNCE", c.Debounce, 0, 5*time.Second, "0 and 5s")
 	r.inRange("MIC_MIN_LENGTH", c.MinLength, 0, time.Minute, "0 and 60s")
 	r.inRange("MIC_MAX_LENGTH", c.MaxLength, 10*time.Second, 12*time.Minute, "10s and 12m")
+	if !r.failed["MIC_MIN_LENGTH"] && !r.failed["MIC_MAX_LENGTH"] && c.MinLength >= c.MaxLength {
+		r.fail("MIC_MIN_LENGTH", "must be shorter than MIC_MAX_LENGTH")
+	}
 }
 
 func (r *recorderValidator) validateSpool(stateDir string) {

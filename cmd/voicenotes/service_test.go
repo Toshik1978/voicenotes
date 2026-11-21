@@ -688,6 +688,56 @@ func TestPurgerFor(t *testing.T) {
 	}
 }
 
+// The daily purge forgets recorders not seen for 30 days (with or without
+// the microphone enabled), so a retired name stops degrading health.
+func TestPurgerForForgetsRetiredRecorders(t *testing.T) {
+	db, err := sqlite.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	now := time.Now()
+	if err = db.UpsertRecorder(t.Context(), "old-name", now.Add(-31*24*time.Hour), true, false); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.UpsertRecorder(t.Context(), "bedside", now.Add(-time.Minute), true, false); err != nil {
+		t.Fatal(err)
+	}
+	heldDir := filepath.Join(t.TempDir(), "nospeech")
+	if _, ok := purgerFor(config.Config{}, db, nopReplier{}, heldDir, zap.NewNop()).(pipeline.RecorderForgetter); !ok {
+		t.Error("purger without a token must forget retired recorders")
+	}
+	cfg := config.Config{MicUploadToken: micTestToken, MicNoSpeechHold: time.Hour}
+	p := purgerFor(cfg, db, nopReplier{}, heldDir, zap.NewNop())
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		pipeline.PurgeLoop(ctx, p, time.Hour, func() time.Time { return now }, zap.NewNop())
+		close(done)
+	}()
+	deadline := time.After(5 * time.Second)
+	for {
+		recs, rerr := db.Recorders(t.Context())
+		if rerr != nil {
+			t.Fatal(rerr)
+		}
+		if len(recs) == 1 {
+			if recs[0].Name != "bedside" {
+				t.Fatalf("remaining = %+v", recs)
+			}
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("old recorder never forgotten: %+v", recs)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+}
+
 func TestBuildWithMicTokenMountsAndPurges(t *testing.T) {
 	dir := t.TempDir()
 	cfg := buildConfig(t, dir)

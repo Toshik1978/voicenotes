@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -239,6 +240,16 @@ func TestCheckIn(t *testing.T) {
 			Status{Pending: 3, StorageFull: true, OldestPendingAt: testStart()},
 			`{"receiver_present":false,"storage_full":true,"pending":3,"oldest_pending_at":"2026-11-20T06:30:00.123456789Z"}`,
 		},
+		{
+			"audio cannot start: taps won't record",
+			Status{ReceiverPresent: true, AudioError: true},
+			`{"receiver_present":false,"storage_full":false,"pending":0,"oldest_pending_at":null}`,
+		},
+		{
+			"a recording cannot be finished",
+			Status{ReceiverPresent: true, FinishError: true},
+			`{"receiver_present":false,"storage_full":false,"pending":0,"oldest_pending_at":null}`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -284,6 +295,16 @@ func TestCheckInFailure(t *testing.T) {
 	err := c.Send(t.Context(), Status{})
 	if err == nil || !strings.Contains(err.Error(), "400") || !strings.Contains(err.Error(), "bad name") {
 		t.Errorf("err = %v", err)
+	}
+}
+
+func TestCheckInUnauthorized(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}, "")
+
+	if err := c.Send(t.Context(), Status{}); !errors.Is(err, ErrUnauthorized) {
+		t.Errorf("err = %v, want ErrUnauthorized", err)
 	}
 }
 

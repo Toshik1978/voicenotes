@@ -127,6 +127,11 @@ func TestParseRecorderErrors(t *testing.T) {
 		{"min high", recEnv("MIC_MIN_LENGTH", "61s"), "MIC_MIN_LENGTH: must be between"},
 		{"max low", recEnv("MIC_MAX_LENGTH", "9s"), "MIC_MAX_LENGTH: must be between"},
 		{"max high", recEnv("MIC_MAX_LENGTH", "13m"), "MIC_MAX_LENGTH: must be between"},
+		{
+			"min not below max",
+			recEnv("MIC_MIN_LENGTH", "30s", "MIC_MAX_LENGTH", "30s", "MIC_SPOOL_MIN_FREE", "10000000"),
+			"MIC_MIN_LENGTH: must be shorter than MIC_MAX_LENGTH",
+		},
 		{"free low", recEnv("MIC_SPOOL_MIN_FREE", "1000"), "MIC_SPOOL_MIN_FREE: must be at least"},
 		{"free just below", recEnv("MIC_SPOOL_MIN_FREE", "38399999", "MIC_MAX_LENGTH", "10m"), "MIC_SPOOL_MIN_FREE"},
 		{"free junk", recEnv("MIC_SPOOL_MIN_FREE", "lots"), "MIC_SPOOL_MIN_FREE: invalid value"},

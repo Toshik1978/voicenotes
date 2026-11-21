@@ -90,6 +90,8 @@ type fakeReplier struct {
 	block    chan struct{} // when set, Send waits on it
 	entered  chan struct{}
 	deadline bool
+	// failAfter > 0 makes sendErr apply only once that many sends succeeded.
+	failAfter int
 }
 
 func (f *fakeReplier) Send(ctx context.Context, chat, replyTo int64, text string) (int64, error) {
@@ -106,7 +108,7 @@ func (f *fakeReplier) Send(ctx context.Context, chat, replyTo int64, text string
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	_, f.deadline = ctx.Deadline()
-	if f.sendErr != nil {
+	if f.sendErr != nil && len(f.sends) >= f.failAfter {
 		return 0, f.sendErr
 	}
 	f.sends = append(f.sends, sent{chat, replyTo, text})

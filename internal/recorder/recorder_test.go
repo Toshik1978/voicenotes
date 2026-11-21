@@ -3,9 +3,12 @@ package recorder
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"sync"
@@ -18,6 +21,7 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/Toshik1978/voicenotes/internal/capture"
+	"github.com/Toshik1978/voicenotes/internal/health"
 	"github.com/Toshik1978/voicenotes/internal/mic"
 )
 
@@ -145,6 +149,8 @@ type fakeKeys struct {
 	cur     chan KeyEvent
 	errs    int // fail this many Opens
 	grabbed bool
+	grabErr error
+	regrab  func() error // KeyStream.Regrab for opened streams
 	closes  int
 }
 
@@ -169,6 +175,8 @@ func (k *fakeKeys) Open(path string) (KeyStream, error) {
 	return KeyStream{
 		Events:  ch,
 		Grabbed: k.grabbed,
+		GrabErr: k.grabErr,
+		Regrab:  k.regrab,
 		Close: func() error {
 			k.mu.Lock()
 			defer k.mu.Unlock()
@@ -266,6 +274,7 @@ type fakeDiscovery struct {
 	mu     sync.Mutex
 	script []discoverResult // consumed in order; the last one repeats
 	calls  chan struct{}
+	gate   chan struct{} // if set, each Discover waits for a value or close
 }
 
 func newFakeDiscovery(script ...discoverResult) *fakeDiscovery {
@@ -273,6 +282,10 @@ func newFakeDiscovery(script ...discoverResult) *fakeDiscovery {
 }
 
 func (d *fakeDiscovery) Discover() (mic.Receiver, bool, error) {
+	if d.gate != nil {
+		<-d.gate
+	}
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -289,19 +302,21 @@ func (d *fakeDiscovery) Discover() (mic.Receiver, bool, error) {
 // ---------------------------------------------------------------- spool
 
 type memSpool struct {
-	mu        sync.Mutex
-	events    chan string
-	lists     atomic.Int64
-	audio     map[int64]*memWriter
-	done      map[int64]Recording
-	free      int64
-	freeErr   error
-	recErr    error
-	beginErrs int
-	listErrs  int
-	openErrs  int
-	rmErrs    int
-	writeErr  error
+	mu          sync.Mutex
+	events      chan string
+	lists       atomic.Int64
+	audio       map[int64]*memWriter
+	done        map[int64]Recording
+	free        int64
+	freeErr     error
+	recErr      error
+	beginErrs   int
+	listErrs    int
+	openErrs    int
+	rmErrs      int
+	discardErrs int
+	finishErrs  int
+	writeErr    error
 }
 
 func newMemSpool() *memSpool {
@@ -366,6 +381,13 @@ func (s *memSpool) Finish(id int64, endedAt time.Time, reason mic.EndReason) err
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.finishErrs > 0 {
+		s.finishErrs--
+		s.emitf("finish %d failed", id)
+
+		return errFake
+	}
+
 	w := s.audio[id]
 	r := s.done[id]
 	r.EndedAt, r.EndReason = endedAt, reason
@@ -378,6 +400,11 @@ func (s *memSpool) Finish(id int64, endedAt time.Time, reason mic.EndReason) err
 func (s *memSpool) Discard(id int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.discardErrs > 0 {
+		s.discardErrs--
+		return errFake
+	}
 
 	delete(s.done, id)
 	delete(s.audio, id)
@@ -395,6 +422,19 @@ func (s *memSpool) add(id int64, startedAt time.Time) {
 	w.buf.WriteString("audio-" + idName(id))
 	s.audio[id] = w
 	s.done[id] = Recording{ID: id, Recorder: "kitchen", StartedAt: startedAt, EndedAt: startedAt, EndReason: mic.EndTap}
+}
+
+// addEnded puts a finished recording of the given length and end reason
+// straight into the spool.
+func (s *memSpool) addEnded(id int64, startedAt time.Time, length time.Duration, reason mic.EndReason) {
+	s.add(id, startedAt)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	r := s.done[id]
+	r.EndedAt, r.EndReason = startedAt.Add(length), reason
+	s.done[id] = r
 }
 
 func (s *memSpool) Finished() ([]Recording, error) {
@@ -542,16 +582,49 @@ func (n *fakeNotifier) Started(ctx context.Context, id int64, startedAt time.Tim
 	return errFake // failures must never matter
 }
 
-func (n *fakeNotifier) Discarded(_ context.Context, id int64) error {
+// Discarded records id unless ctx is already done: like the real client, a
+// cancelled context sends nothing.
+func (n *fakeNotifier) Discarded(ctx context.Context, id int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	n.discarded <- id
+
 	return errFake
 }
 
-type fakeCheckIn struct{ sent chan Status }
+type fakeCheckIn struct {
+	sent chan Status
+	at   chan time.Time // the clock's time at each Send
+	clk  *manualClock
+	mu   sync.Mutex
+	err  error // what Send returns; nil means errFake
+	ok   bool  // Send succeeds
+}
 
 func (c *fakeCheckIn) Send(_ context.Context, s Status) error {
+	c.at <- c.clk.Now()
+
 	c.sent <- s
-	return errFake
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	switch {
+	case c.ok:
+		return nil
+	case c.err != nil:
+		return c.err
+	default:
+		return errFake
+	}
+}
+
+func (c *fakeCheckIn) answer(ok bool, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ok, c.err = ok, err
 }
 
 // ---------------------------------------------------------------- harness
@@ -589,11 +662,11 @@ func newHarness(t *testing.T) *harness {
 		spool: newMemSpool(),
 		hand:  newFakeHandoff(),
 		note:  newFakeNotifier(),
-		check: &fakeCheckIn{sent: make(chan Status, 64)},
 		logs:  logs,
 		core:  core,
 		done:  make(chan error, 1),
 	}
+	h.check = &fakeCheckIn{sent: make(chan Status, 64), at: make(chan time.Time, 64), clk: h.clk}
 	h.build(t)
 
 	return h
@@ -809,6 +882,88 @@ func TestReportsUngrabbedInput(t *testing.T) {
 	})
 }
 
+func TestRegrabsUngrabbedInput(t *testing.T) {
+	h := newHarness(t)
+	h.keys.grabbed = false
+
+	var mu sync.Mutex
+
+	calls, succeed := 0, false
+
+	h.keys.regrab = func() error {
+		mu.Lock()
+		defer mu.Unlock()
+
+		calls++
+
+		if succeed {
+			return nil
+		}
+
+		return errFake
+	}
+	h.session(t)
+	eventually(t, "present, not grabbed", func() bool {
+		s := h.r.Status()
+		return s.ReceiverPresent && !s.InputGrabbed
+	})
+
+	tickOnce := func() {
+		h.clk.waitFor(t, time.Second)
+		h.clk.advance(time.Second)
+	}
+
+	for range grabRetryInterval/time.Second - 1 {
+		tickOnce()
+	}
+
+	if got := h.logs.FilterMessage("receiver input grab failed").Len(); got != 0 {
+		t.Fatalf("grab retried before its interval: %d failures logged", got)
+	}
+
+	tickOnce()
+	eventually(t, "failed retry logged with its cause", func() bool {
+		return h.logs.FilterMessage("receiver input grab failed").Len() == 1
+	})
+
+	if h.r.Status().InputGrabbed {
+		t.Fatal("status reports grabbed after a failed retry")
+	}
+
+	mu.Lock()
+	succeed = true
+	mu.Unlock()
+
+	for range grabRetryInterval / time.Second {
+		tickOnce()
+	}
+
+	eventually(t, "grab succeeded", func() bool { return h.r.Status().InputGrabbed })
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if calls != 2 {
+		t.Fatalf("grab attempts = %d, want 2", calls)
+	}
+}
+
+func TestLogsInitialGrabFailureCause(t *testing.T) {
+	h := newHarness(t)
+	h.keys.grabbed = false
+	h.keys.grabErr = errFake
+	h.session(t)
+	eventually(t, "initial grab failure logged", func() bool {
+		for _, e := range h.logs.FilterMessage("receiver input not held exclusively").All() {
+			if e.ContextMap()["error"] == errFake.Error() {
+				return true
+			}
+		}
+
+		return false
+	})
+}
+
 func TestKeyOpenFailureRediscovers(t *testing.T) {
 	h := newHarness(t)
 	h.keys.errs = 1
@@ -991,9 +1146,9 @@ func TestShutdownFinishesRecordingAsInterrupted(t *testing.T) {
 
 	h.keys.send(t, KeyTap)
 	expectEvent(t, h.spool.events, h.beginEvent(1, start))
-	h.clk.advance(time.Second) // below the minimum: still kept
+	h.clk.advance(2 * time.Second) // exactly the minimum: kept
 	h.cancel()
-	expectEvent(t, h.spool.events, h.finishEvent(1, mic.EndInterrupted, start.Add(time.Second)))
+	expectEvent(t, h.spool.events, h.finishEvent(1, mic.EndInterrupted, start.Add(2*time.Second)))
 
 	select {
 	case err := <-h.done:
@@ -1009,6 +1164,37 @@ func TestShutdownFinishesRecordingAsInterrupted(t *testing.T) {
 	if s := h.r.Status(); s.Running || s.Recording || s.ReceiverPresent {
 		t.Fatalf("status after shutdown = %+v", s)
 	}
+}
+
+// A recording stopped by shutdown below the minimum length is discarded and
+// its start message deleted, although the run's context is already cancelled
+// (FR-209, SC-206).
+func TestShutdownDiscardsShortRecording(t *testing.T) {
+	h := newHarness(t)
+	h.session(t)
+
+	h.keys.send(t, KeyTap)
+	expectEvent(t, h.spool.events, h.beginEvent(1, start))
+	h.clk.advance(2*time.Second - time.Millisecond)
+	h.cancel()
+	expectEvent(t, h.spool.events, "discard 1")
+	expect(t, h.note.discarded, 1)
+}
+
+// A write failure below the minimum length discards the recording too.
+func TestWriteFailureOfShortRecordingDiscards(t *testing.T) {
+	h := newHarness(t)
+	h.session(t)
+
+	h.keys.send(t, KeyTap)
+	expectEvent(t, h.spool.events, h.beginEvent(1, start))
+	expect(t, h.audio.opened, kitchen)
+	h.spool.mu.Lock()
+	h.spool.writeErr = errFake
+	h.spool.mu.Unlock()
+	h.audio.queue().Offer([]byte("ab"))
+	expectEvent(t, h.spool.events, "discard 1")
+	expect(t, h.note.discarded, 1)
 }
 
 func TestBeginFailureResetsToggle(t *testing.T) {
@@ -1043,6 +1229,73 @@ func TestAudioOpenFailureDiscardsSpool(t *testing.T) {
 	h.clk.advance(time.Second)
 	h.keys.send(t, KeyTap)
 	expectEvent(t, h.spool.events, h.beginEvent(2, start.Add(time.Second)))
+}
+
+// An audio device that cannot be opened makes every tap a no-op, so it must
+// show in health and in the check-in until a recording starts again.
+func TestAudioOpenFailureIsReportedUntilNextStart(t *testing.T) {
+	h := newHarness(t)
+	h.audio.errs = 1
+	h.session(t)
+
+	h.keys.send(t, KeyTap)
+	expectEvent(t, h.spool.events, h.beginEvent(1, start))
+	expectEvent(t, h.spool.events, "discard 1")
+	eventually(t, "audio error set", func() bool { return h.r.Status().AudioError })
+
+	if rep := ComputeHealth(h.r.Status(), start, time.Hour); rep.Status != health.StatusDegraded || !rep.AudioError {
+		t.Fatalf("health = %+v, want degraded with audio_error", rep)
+	}
+
+	h.clk.advance(time.Second)
+	h.keys.send(t, KeyTap)
+	expectEvent(t, h.spool.events, h.beginEvent(2, start.Add(time.Second)))
+	eventually(t, "audio error cleared", func() bool {
+		s := h.r.Status()
+		return s.Recording && !s.AudioError
+	})
+}
+
+func TestBeginFailureIsReportedUntilNextStart(t *testing.T) {
+	h := newHarness(t)
+	h.spool.beginErrs = 1
+	h.session(t)
+
+	h.keys.send(t, KeyTap)
+	eventually(t, "audio error set", func() bool { return h.r.Status().AudioError })
+
+	h.clk.advance(time.Second)
+	h.keys.send(t, KeyTap)
+	expectEvent(t, h.spool.events, h.beginEvent(2, start.Add(time.Second)))
+	eventually(t, "audio error cleared", func() bool { return !h.r.Status().AudioError })
+}
+
+// A recording whose Finish fails is hidden from the hand-off until the next
+// start's recovery, so health says so until a later Finish succeeds.
+func TestFinishFailureIsReportedUntilNextFinish(t *testing.T) {
+	h := newHarness(t)
+	h.spool.finishErrs = 1
+	h.session(t)
+
+	h.keys.send(t, KeyTap)
+	expectEvent(t, h.spool.events, h.beginEvent(1, start))
+	h.clk.advance(3 * time.Second)
+	h.keys.send(t, KeyTap)
+	expectEvent(t, h.spool.events, "finish 1 failed")
+	eventually(t, "finish error set", func() bool { return h.r.Status().FinishError })
+
+	rep := ComputeHealth(h.r.Status(), start, time.Hour)
+	if rep.Status != health.StatusDegraded || rep.Storage != "error" {
+		t.Fatalf("health = %+v, want degraded with storage error", rep)
+	}
+
+	h.clk.advance(time.Second)
+	h.keys.send(t, KeyTap)
+	expectEvent(t, h.spool.events, h.beginEvent(2, start.Add(4*time.Second)))
+	h.clk.advance(3 * time.Second)
+	h.keys.send(t, KeyTap)
+	expectEvent(t, h.spool.events, h.finishEvent(2, mic.EndTap, start.Add(7*time.Second)))
+	eventually(t, "finish error cleared", func() bool { return !h.r.Status().FinishError })
 }
 
 func TestWriteFailureStopsRecording(t *testing.T) {
@@ -1117,6 +1370,48 @@ func TestHandoffOldestFirstDeletesOnStoredOrDuplicate(t *testing.T) {
 		s := h.r.Status()
 		return s.Pending == 0 && s.OldestPendingAt.IsZero()
 	})
+}
+
+// An interrupted recording below the minimum length (one finished by crash
+// recovery, or left by a discard cut short) is discarded with its start
+// message instead of uploaded. One at the minimum, and short recordings with
+// another end reason (the tap state machine already judged those), are
+// uploaded.
+func TestHandoffDiscardsShortInterruptedRecording(t *testing.T) {
+	h := handoffHarness(t, Stored, Stored)
+	h.spool.addEnded(1, start, 2*time.Second-time.Millisecond, mic.EndInterrupted)
+	h.spool.addEnded(2, start.Add(time.Minute), 2*time.Second, mic.EndInterrupted)
+	h.spool.add(3, start.Add(2*time.Minute)) // tap, zero length
+	h.run(t)
+
+	expectEvent(t, h.spool.events, "discard 1")
+	expect(t, h.note.discarded, 1)
+	expect(t, h.hand.calls, 2)
+	expectEvent(t, h.spool.events, "open 2")
+	expectEvent(t, h.spool.events, "remove 2")
+	expect(t, h.hand.calls, 3)
+	expectEvent(t, h.spool.events, "open 3")
+	expectEvent(t, h.spool.events, "remove 3")
+	noEvent(t, h.note.discarded)
+}
+
+// A short recording whose discard fails is never uploaded; it is retried.
+func TestHandoffNeverUploadsShortRecordingWhoseDiscardFails(t *testing.T) {
+	h := handoffHarness(t)
+	h.spool.discardErrs = 1
+	h.spool.addEnded(1, start, time.Second, mic.EndInterrupted)
+	h.run(t)
+
+	eventually(t, "discard failure logged", func() bool {
+		return h.logs.FilterMessage("discard short recording").Len() == 1
+	})
+	noEvent(t, h.note.discarded)
+	noEvent(t, h.hand.calls)
+
+	h.r.wakeHandoff()
+	expectEvent(t, h.spool.events, "discard 1")
+	expect(t, h.note.discarded, 1)
+	noEvent(t, h.hand.calls)
 }
 
 func TestHandoffRetryBacksOff(t *testing.T) {
@@ -1257,6 +1552,64 @@ func TestCheckInSendsStatusEveryInterval(t *testing.T) {
 	}
 }
 
+// A refused credential on the check-in shows locally, as on upload, so a new
+// box with a wrong token and nothing to upload is not reported ok; a later
+// accepted check-in clears it.
+func TestCheckInUnauthorizedSetsMisconfigured(t *testing.T) {
+	h := handoffHarness(t)
+	h.check.answer(false, fmt.Errorf("check-in: %w", ErrUnauthorized))
+	h.run(t)
+
+	<-h.check.sent
+	eventually(t, "misconfigured set", func() bool { return h.r.Status().Misconfigured })
+
+	h.check.answer(true, nil)
+	h.clk.waitFor(t, time.Minute)
+	h.clk.advance(time.Minute)
+	<-h.check.sent
+	eventually(t, "misconfigured cleared", func() bool { return !h.r.Status().Misconfigured })
+}
+
+// The first check-in waits for the first discovery, so a receiver present
+// from the start is never reported missing (FR-227a, SC-209, US3/AC3).
+func TestFirstCheckInReportsReceiverPresentFromStart(t *testing.T) {
+	h := newHarness(t)
+	h.disc.gate = make(chan struct{})
+	h.run(t)
+
+	h.clk.waitFor(t, time.Minute) // the check-in ticker is armed
+	close(h.disc.gate)
+	expect(t, h.keys.opened, kitchen.InputPath)
+
+	if first := <-h.check.sent; !first.ReceiverPresent || !first.InputGrabbed {
+		t.Fatalf("first check-in = %+v, want the receiver present", first)
+	}
+
+	if at := <-h.check.at; !at.Equal(start) {
+		t.Fatalf("first check-in at %v, want %v (no wait past discovery)", at, start)
+	}
+}
+
+// A discovery that hangs delays the first check-in by at most one interval,
+// so the service never sees the recorder silent.
+func TestFirstCheckInWaitsAtMostOneIntervalForDiscovery(t *testing.T) {
+	h := newHarness(t)
+	h.disc.gate = make(chan struct{})
+	h.run(t)
+	t.Cleanup(func() { close(h.disc.gate) }) // runs before Run's cleanup
+
+	h.clk.waitFor(t, time.Minute)
+	h.clk.advance(time.Minute)
+
+	if at := <-h.check.at; !at.Equal(start.Add(time.Minute)) {
+		t.Fatalf("first check-in at %v, want %v", at, start.Add(time.Minute))
+	}
+
+	if first := <-h.check.sent; first.ReceiverPresent || !first.Running {
+		t.Fatalf("first check-in = %+v, want running without a receiver", first)
+	}
+}
+
 // ---------------------------------------------------------------- real spool
 
 func TestRecorderWithDirSpool(t *testing.T) {
@@ -1308,6 +1661,76 @@ func TestRecorderWithDirSpool(t *testing.T) {
 		recs, err := ds.Finished()
 		return err == nil && len(recs) == 0 && !exists(dir, "1.json") && !exists(dir, "1.wav")
 	})
+}
+
+// Crash recovery with the real spool: a left-over recording below the
+// minimum length is deleted with its start message, never uploaded; one at
+// the minimum is uploaded (FR-205, FR-209).
+func TestRecoveredShortRecordingIsDiscarded(t *testing.T) {
+	h := newHarness(t)
+	h.disc = newFakeDiscovery(discoverResult{})
+	dir := t.TempDir()
+
+	for id, data := range map[int64]int{1: 2*bytesPerSecond - mic.FrameSize, 2: 2 * bytesPerSecond} {
+		rec := Recording{ID: id, Recorder: "kitchen", StartedAt: start.Add(time.Duration(id) * time.Minute)}
+		writePart(t, dir, rec, data)
+	}
+
+	ds, err := NewDirSpool(dir, h.clk.Now)
+	if err != nil {
+		t.Fatalf("NewDirSpool: %v", err)
+	}
+
+	r, err := New(Deps{
+		Keys: h.keys, Audio: h.audio, Discovery: h.disc, Spool: ds,
+		Handoff: h.hand, Notifier: h.note, CheckIn: h.check, Log: zap.NewNop(),
+	}, Options{
+		Recorder: "kitchen", MinLength: 2 * time.Second, MaxLength: time.Minute,
+		SpoolMinFree: 1, CheckinInterval: time.Minute, RetryMaxInterval: time.Minute,
+		Clock: h.clk,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+
+	go func() { done <- r.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	expect(t, h.note.discarded, 1)
+	expect(t, h.hand.calls, 2)
+
+	if body := h.hand.body(0); len(body) != mic.HeaderSize+2*bytesPerSecond {
+		t.Fatalf("uploaded %d bytes, want recording 2", len(body))
+	}
+
+	eventually(t, "spool emptied", func() bool {
+		recs, err := ds.Finished()
+		return err == nil && len(recs) == 0 && !exists(dir, "1.json") && !exists(dir, "1.wav")
+	})
+	noEvent(t, h.hand.calls)
+}
+
+// writePart leaves a recording as a crash would: its sidecar and a .part.wav
+// with a placeholder header and data bytes of audio.
+func writePart(t *testing.T, dir string, rec Recording, data int) {
+	t.Helper()
+
+	b, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	audio := append(mic.Header(0), make([]byte, data)...)
+	if err := os.WriteFile(filepath.Join(dir, idName(rec.ID)+extSidecar), b, filePerm); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, idName(rec.ID)+extPart), audio, filePerm); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestSystemClock(t *testing.T) {

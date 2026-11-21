@@ -83,20 +83,27 @@ tap starts a new recording, as the spec edge case "Missed stop tap" describes.
 | LastSeen | time | Server time of the last check-in. Every recorder checks in over HTTP, including one on the service's host. |
 | ReceiverPresent | bool | From the check-in. |
 | StorageFull | bool | From the check-in. |
-| Alert | enum | `ok`, `missing_receiver`, `storage_full`, `silent`. The outstanding alert. |
+| Outstanding | set (`mic.AlertSet`) | Any of `missing_receiver`, `storage_full`, `silent`, each tracked independently. Stored in the `alert` column as `ok` for the empty set, else the names joined by commas in that order (for example `missing_receiver,storage_full`). |
 
 The evaluation function is pure:
 
 ```text
-Eval(status, now, silence) → (newAlert, message?)
+Eval(status, now, silence) → []step{outstanding, message}
 ```
 
-1. Compute the desired alert, in priority order: `now − LastSeen > silence` → `silent`; otherwise
-   `StorageFull` → `storage_full`; otherwise `!ReceiverPresent` → `missing_receiver`; otherwise
-   `ok`.
-2. If it differs from the stored `Alert`, emit one message (the alert, or recovery when it is
-   `ok`) and store the new alert.
-3. Never emit while the alert is unchanged.
+1. Compute the desired set. If `now − LastSeen > silence`, it is the stored set plus `silent`:
+   the last check-in is stale, so the other conditions keep their reported state (neither raised
+   nor recovered) while the recorder is silent. Otherwise it is `storage_full` if `StorageFull`,
+   plus `missing_receiver` if `!ReceiverPresent`; `silent` is cleared.
+2. For each condition that differs, in the order `silent`, `storage_full`, `missing_receiver`, emit
+   one step: its alert when it starts, its recovery when it clears. A step's set is the set after
+   that one change.
+3. Never emit for a condition that persists.
+
+`AlertLoop` sends each step's message and stores its set before the next step, so a crash repeats
+at most one message and a failed send stores nothing for that step (the next pass retries). The
+existing `alert` column holds the set; no migration is needed, since every single-alert value
+written before is a valid set.
 
 ## SQLite migration `004_mic.sql`
 
@@ -121,9 +128,13 @@ CREATE TABLE mic_recorders (
 
 - `mic_replies` rows are taken (selected and deleted) inside the ingest transaction. Leftovers
   older than 1 day are purged by `PurgeLoop`. A start that never led to an upload leaves its
-  message as "🎙 recording…"; the purge edits it to "⚠ recording not received" before deleting
-  the row, best-effort.
-- `mic_recorders` rows are kept indefinitely. There is one per recorder name, and they are tiny.
+  message as "🎙 recording…"; the purge takes (deletes) the row first and, only if it took it,
+  edits the message to "⚠ recording not received", best-effort, so an upload that took the row
+  in the meantime keeps its own outcome.
+- `mic_recorders` has one row per recorder name. A row whose `last_seen` is older than 30 days
+  is deleted by the daily `PurgeLoop`, which logs each forgotten name, so a renamed or retired
+  recorder stops keeping `/healthz` degraded. A recorder that checks in again is added back with
+  alert `ok`. To forget one sooner, delete its row by hand with the service stopped (README).
 
 ## Directories under `DATA_DIR` (server)
 

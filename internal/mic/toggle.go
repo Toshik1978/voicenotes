@@ -117,12 +117,17 @@ func (g *Toggle) DeviceLost(t time.Time) Action {
 	return g.end(t, Action{Kind: ActionStop, ID: g.id, End: EndReceiverLost})
 }
 
-// Interrupt handles a recorder shutdown at t: an active recording is stopped
-// as interrupted (never discarded, so nothing recorded is lost).
+// Interrupt handles a recorder shutdown or write failure at t. A recording
+// below the minimum length is discarded like a short tapped one (FR-209),
+// otherwise it is stopped as interrupted.
 func (g *Toggle) Interrupt(t time.Time) Action {
 	if !g.recording {
 		return Action{}
 	}
+	if t.Sub(g.startedAt) < g.minLen {
+		return g.end(t, Action{Kind: ActionDiscard, ID: g.id})
+	}
+
 	return g.end(t, Action{Kind: ActionStop, ID: g.id, End: EndInterrupted})
 }
 

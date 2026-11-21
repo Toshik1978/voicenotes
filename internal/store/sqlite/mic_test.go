@@ -3,6 +3,7 @@ package sqlite_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -167,6 +168,41 @@ func TestRecorders(t *testing.T) {
 	}
 	if err = s.SetRecorderAlert(ctx, "nobody", "ok"); !errors.Is(err, sqlite.ErrNotFound) {
 		t.Errorf("unknown recorder: got %v", err)
+	}
+}
+
+func TestForgetRecorders(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, t.TempDir())
+	cutoff := ts0()
+	for name, seen := range map[string]time.Time{
+		"old-name": cutoff.Add(-time.Nanosecond),
+		"ancient":  cutoff.Add(-90 * 24 * time.Hour),
+		"edge":     cutoff,
+		"kitchen":  cutoff.Add(time.Hour),
+	} {
+		if err := s.UpsertRecorder(ctx, name, seen, true, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	names, err := s.ForgetRecorders(ctx, cutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(names)
+	if !slices.Equal(names, []string{"ancient", "old-name"}) {
+		t.Errorf("forgotten = %v", names)
+	}
+	recs, err := s.Recorders(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 2 || recs[0].Name != "edge" || recs[1].Name != "kitchen" {
+		t.Errorf("remaining = %+v", recs)
+	}
+	if names, err = s.ForgetRecorders(ctx, cutoff); err != nil || len(names) != 0 {
+		t.Errorf("second pass = %v, %v", names, err)
 	}
 }
 

@@ -730,6 +730,16 @@ func TestFinalizeReply(t *testing.T) {
 			}
 		})
 	}
+	t.Run("mic capture without a start message sends without reply-to", func(t *testing.T) {
+		r := newRig(t)
+		c := done()
+		c.Source, c.ReplyMessageID = capture.SourceMic, 0
+		got, out := r.run(capture.StepFinalizeReply, c)
+		if out.Class != capture.ClassOK || len(r.rep.sends) != 1 || r.rep.sends[0].replyTo != 0 ||
+			got.ReplyMessageID != 77 {
+			t.Errorf("out %+v sends %v got %d", out, r.rep.sends, got.ReplyMessageID)
+		}
+	})
 	t.Run("edit fallback id is recorded", func(t *testing.T) {
 		r := newRig(t)
 		r.rep.editID = 88
