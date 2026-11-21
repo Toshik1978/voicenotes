@@ -33,6 +33,28 @@ func TestSTTShimPassesTheExtension(t *testing.T) {
 	}
 }
 
+func TestSTTShimAsksTheVoiceDetector(t *testing.T) {
+	var path, name string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		if _, fh, err := r.FormFile("file"); err == nil {
+			name = fh.Filename
+		}
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	t.Cleanup(srv.Close)
+	tr := openai.NewTranscriber(
+		openai.Config{BaseURL: srv.URL + "/v1", Model: "m", ResponseFormat: "json"},
+		srv.Client(),
+	)
+
+	speech, out := sttShim{t: tr}.HasSpeech(context.Background(),
+		pipeline.TranscribeRequest{ID: "4", Ext: ".wav", Audio: []byte("a")})
+	if out.Class != capture.ClassOK || speech || path != "/v1/audio/speech/timestamps" || name != "capture-4.wav" {
+		t.Errorf("out %+v speech %v path %q filename %q", out, speech, path, name)
+	}
+}
+
 func TestAlertStoreAdaptsRecorders(t *testing.T) {
 	db, err := sqlite.Open(t.TempDir())
 	if err != nil {

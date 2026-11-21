@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"time"
 
 	"go.uber.org/zap"
@@ -87,21 +90,84 @@ func (j StartReplyJanitor) PurgeStartReplies(ctx context.Context, olderThan time
 	return removed, nil
 }
 
+// HeldPurger purges held no-speech audio. A Purger that also implements it
+// has its held audio purged by PurgeLoop; the implementation knows its hold.
+type HeldPurger interface {
+	PurgeHeld(ctx context.Context, now time.Time) (int, error)
+}
+
+// ExpiredHeld returns, in listing order, the regular files last modified
+// more than hold before now: held no-speech audio whose hold has passed.
+func ExpiredHeld(files []StoredFile, now time.Time, hold time.Duration) []string {
+	var out []string
+	cutoff := now.Add(-hold)
+	for _, f := range files {
+		if f.Regular && f.ModTime.Before(cutoff) {
+			out = append(out, f.Name)
+		}
+	}
+
+	return out
+}
+
+// HeldAudio is a HeldPurger over DATA_DIR/nospeech: it deletes the files
+// whose mtime is older than Hold (MIC_NOSPEECH_HOLD). It touches nothing
+// outside Dir and never recurses.
+type HeldAudio struct {
+	Dir  string
+	Hold time.Duration
+}
+
+var _ HeldPurger = HeldAudio{}
+
+// PurgeHeld deletes the expired files (see ExpiredHeld) and returns how many
+// it removed. A missing directory holds nothing. A file that cannot be
+// removed is skipped and reported in the error after the others are tried;
+// one already gone counts as neither. Cancellation stops the pass.
+func (h HeldAudio) PurgeHeld(ctx context.Context, now time.Time) (int, error) {
+	files, err := listFiles(h.Dir)
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	var errs []error
+	for _, name := range ExpiredHeld(files, now, h.Hold) {
+		if ctx.Err() != nil {
+			return removed, fmt.Errorf("pipeline: purge of held audio stopped: %w", ctx.Err())
+		}
+		err := os.Remove(filepath.Join(h.Dir, name))
+		switch {
+		case err == nil:
+			removed++
+		case !errors.Is(err, fs.ErrNotExist):
+			errs = append(errs, fmt.Errorf("pipeline: remove held audio: %w", err))
+		}
+	}
+
+	return removed, errors.Join(errs...)
+}
+
 // PurgeLoop purges done rows older than DoneRetention once at start and then
 // every interval (and, when p is a ReplyPurger, the start replies older than
-// StartReplyRetention), until ctx is cancelled. A purge error is logged (without
+// StartReplyRetention; when p is a HeldPurger, the held no-speech audio past
+// its hold), until ctx is cancelled. A purge error is logged (without
 // capture data) and never stops the loop. A nil log means no logging.
 func PurgeLoop(ctx context.Context, p Purger, interval time.Duration, now func() time.Time, log *zap.Logger) {
 	if log == nil {
 		log = zap.NewNop()
 	}
 	rp, hasReplies := p.(ReplyPurger)
+	hp, hasHeld := p.(HeldPurger)
 	run := func() {
 		n, err := p.PurgeDone(ctx, now().Add(-DoneRetention))
 		logPurge(log, "finished captures", n, err)
 		if hasReplies {
 			k, rerr := rp.PurgeStartReplies(ctx, now().Add(-StartReplyRetention))
 			logPurge(log, "stale start replies", int64(k), rerr)
+		}
+		if hasHeld {
+			k, herr := hp.PurgeHeld(ctx, now())
+			logPurge(log, "held no-speech audio", int64(k), herr)
 		}
 	}
 

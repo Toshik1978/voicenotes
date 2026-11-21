@@ -1,11 +1,14 @@
 package pipeline_test
 
 import (
+	"context"
 	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
+	"time"
 
 	"github.com/Toshik1978/voicenotes/internal/pipeline"
 )
@@ -155,5 +158,133 @@ func TestMigrateFilesDirErrors(t *testing.T) {
 	writeTree(t, data, map[string]string{"audio": "x", "files": "y"})
 	if err := pipeline.MigrateFilesDir(data); err == nil {
 		t.Fatal("want an error when audio and files are not directories")
+	}
+}
+
+// FR-210b: Hold moves a file from DATA_DIR/files to DATA_DIR/nospeech under
+// the given name, creating the directory; a missing file is not an error, so
+// a retry after the move succeeds.
+func TestDirFilesHold(t *testing.T) {
+	data := t.TempDir()
+	a := pipeline.NewDirFiles(filepath.Join(data, "files"))
+	if err := a.Write("rec-1.wav", []byte("WAV")); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Hold("rec-1.wav", "5.wav"); err != nil {
+		t.Fatalf("hold: %v", err)
+	}
+	held := filepath.Join(data, pipeline.NoSpeechDir, "5.wav")
+	if got, err := os.ReadFile(held); err != nil || string(got) != "WAV" {
+		t.Fatalf("held file %q, %v", got, err)
+	}
+	if fi, err := os.Stat(filepath.Dir(held)); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Errorf("hold dir %v, %v; want mode 0700", fi, err)
+	}
+	if ok, _ := a.Exists("rec-1.wav"); ok {
+		t.Error("source still in files")
+	}
+	if err := a.Hold("rec-1.wav", "5.wav"); err != nil {
+		t.Errorf("hold again: %v", err)
+	}
+	if got, err := os.ReadFile(held); err != nil || string(got) != "WAV" {
+		t.Errorf("held file after retry %q, %v", got, err)
+	}
+	for _, bad := range [][2]string{{"../x", "5.wav"}, {"rec-1.wav", "../5.wav"}, {"", "5.wav"}, {"a", ""}} {
+		if err := a.Hold(bad[0], bad[1]); err == nil {
+			t.Errorf("hold %q -> %q: want an error", bad[0], bad[1])
+		}
+	}
+}
+
+// Review 1: a retry after the rename (crash or failed fsync before it was
+// durable) still fsyncs both directories, and reports a failed fsync.
+func TestDirFilesHoldRetrySyncsDirs(t *testing.T) {
+	data := t.TempDir()
+	filesDir, holdDir := filepath.Join(data, "files"), filepath.Join(data, pipeline.NoSpeechDir)
+	a := pipeline.NewDirFiles(filesDir)
+	if err := a.Write("rec-1.wav", []byte("WAV")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(holdDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// The rename happened, but its fsync never did.
+	if err := os.Rename(filepath.Join(filesDir, "rec-1.wav"), filepath.Join(holdDir, "5.wav")); err != nil {
+		t.Fatal(err)
+	}
+	var synced []string
+	errSync := errors.New("EIO")
+	var fail bool
+	a.SetSyncDir(func(dir string) error {
+		synced = append(synced, dir)
+		if fail {
+			return errSync
+		}
+
+		return nil
+	})
+
+	if err := a.Hold("rec-1.wav", "5.wav"); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if len(synced) != 2 || !slices.Contains(synced, holdDir) || !slices.Contains(synced, filesDir) {
+		t.Errorf("synced %q, want both %q and %q", synced, holdDir, filesDir)
+	}
+	fail = true
+	if err := a.Hold("rec-1.wav", "5.wav"); !errors.Is(err, errSync) {
+		t.Errorf("retry with a failing fsync = %v, want it reported", err)
+	}
+}
+
+// Review 1 of T028: the hold starts when the audio is held. Hold stamps the
+// held file's mtime with its clock, so a capture whose upload is older than
+// MIC_NOSPEECH_HOLD (an STT outage) is not purged right after the move. The
+// stamp is in place before the directory fsyncs.
+func TestDirFilesHoldStampsHoldTime(t *testing.T) {
+	heldAt := time.Date(2026, 5, 31, 12, 0, 0, 0, time.UTC)
+	hold := 168 * time.Hour
+	for _, retry := range []bool{false, true} {
+		data := t.TempDir()
+		filesDir, holdDir := filepath.Join(data, "files"), filepath.Join(data, pipeline.NoSpeechDir)
+		a := pipeline.NewDirFiles(filesDir)
+		a.SetNow(func() time.Time { return heldAt })
+		if err := a.Write("rec-1.wav", []byte("WAV")); err != nil {
+			t.Fatal(err)
+		}
+		uploaded := heldAt.Add(-2 * hold)
+		if err := os.Chtimes(filepath.Join(filesDir, "rec-1.wav"), uploaded, uploaded); err != nil {
+			t.Fatal(err)
+		}
+		held := filepath.Join(holdDir, "5.wav")
+		if retry { // a crash between the rename and the stamp
+			if err := os.MkdirAll(holdDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(filepath.Join(filesDir, "rec-1.wav"), held); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var stampedBeforeSync bool
+		a.SetSyncDir(func(string) error {
+			fi, err := os.Stat(held)
+			stampedBeforeSync = err == nil && fi.ModTime().Equal(heldAt)
+
+			return nil
+		})
+
+		if err := a.Hold("rec-1.wav", "5.wav"); err != nil {
+			t.Fatalf("retry=%v: hold: %v", retry, err)
+		}
+		if fi, err := os.Stat(held); err != nil || !fi.ModTime().Equal(heldAt) {
+			t.Fatalf("retry=%v: held mtime %v, %v; want %v", retry, fi, err, heldAt)
+		}
+		if !stampedBeforeSync {
+			t.Errorf("retry=%v: mtime not stamped before the directory fsync", retry)
+		}
+		purge := pipeline.HeldAudio{Dir: holdDir, Hold: hold}
+		n, err := purge.PurgeHeld(context.Background(), heldAt.Add(hold-time.Minute))
+		if err != nil || n != 0 || !exists(t, held) {
+			t.Errorf("retry=%v: purge inside the hold removed %d, %v", retry, n, err)
+		}
 	}
 }

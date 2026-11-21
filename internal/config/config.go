@@ -34,6 +34,13 @@ type Config struct {
 	STTModel          string        `env:"STT_MODEL"`
 	STTResponseFormat string        `env:"STT_RESPONSE_FORMAT" envDefault:"verbose_json"`
 	STTTimeout        time.Duration `env:"STT_TIMEOUT"         envDefault:"120s"`
+	// STTVAD asks speaches' voice activity detector before transcribing; audio
+	// with no speech region is no speech and is not transcribed.
+	STTVAD bool `env:"STT_VAD" envDefault:"false"`
+	// STTNoSpeechThreshold is the per-segment no-speech probability at which a
+	// transcript counts as no speech when every segment reaches it; 0 is off.
+	// It is ignored once STT_VAD has heard speech.
+	STTNoSpeechThreshold float64 `env:"STT_NO_SPEECH_THRESHOLD" envDefault:"0"`
 
 	// Languages. An empty SourceLanguages means auto-detect.
 	SourceLanguages []string `env:"-"` // SOURCE_LANGUAGES, comma-separated
@@ -242,6 +249,9 @@ func (v *validator) validateSTT() {
 		v.fail("STT_RESPONSE_FORMAT", "must be verbose_json or json")
 	}
 	v.positive("STT_TIMEOUT", c.STTTimeout > 0 || v.failed["STT_TIMEOUT"])
+	if t := c.STTNoSpeechThreshold; !(t >= 0 && t <= 1) {
+		v.inRange("STT_NO_SPEECH_THRESHOLD", v.failed["STT_NO_SPEECH_THRESHOLD"], "0 and 1")
+	}
 }
 
 func (v *validator) validateLanguages(environ map[string]string) {

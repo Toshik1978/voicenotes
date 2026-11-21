@@ -50,6 +50,10 @@ type Request struct {
 type Result struct {
 	Text     string
 	Language string
+	// NoSpeechProbs holds each segment's no_speech_prob from a verbose_json
+	// answer, in order. It is nil unless every segment reports one, so a
+	// caller never mistakes a partial report for silence.
+	NoSpeechProbs []float64
 }
 
 // Transcriber calls POST {BaseURL}/audio/transcriptions.
@@ -72,7 +76,15 @@ func NewTranscriber(cfg Config, client *http.Client) *Transcriber {
 // capture.WaitingSTT. The Result is meaningful only when Outcome.Class is
 // capture.ClassOK. Outcome reasons never contain the key or response bodies.
 func (t *Transcriber) Transcribe(ctx context.Context, r Request) (Result, capture.Outcome) {
-	body, contentType, err := t.buildBody(r)
+	fields := [][2]string{
+		{"model", t.cfg.Model},
+		{"response_format", t.cfg.ResponseFormat},
+		{"temperature", "0"},
+	}
+	if r.Language != "" {
+		fields = append(fields, [2]string{"language", r.Language})
+	}
+	body, contentType, err := buildBody(r, fields)
 	if err != nil {
 		return Result{}, capture.Permanent("build request: " + err.Error()).On(capture.WaitingSTT)
 	}
@@ -101,15 +113,28 @@ func (t *Transcriber) Transcribe(ctx context.Context, r Request) (Result, captur
 	var parsed struct {
 		Text     string `json:"text"`
 		Language string `json:"language"`
+		Segments []struct {
+			NoSpeechProb *float64 `json:"no_speech_prob"`
+		} `json:"segments"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
 		return Result{}, capture.Temporary("malformed response").On(capture.WaitingSTT)
 	}
 
-	return Result{Text: parsed.Text, Language: parsed.Language}, capture.OK()
+	res := Result{Text: parsed.Text, Language: parsed.Language}
+	for _, seg := range parsed.Segments {
+		if seg.NoSpeechProb == nil {
+			res.NoSpeechProbs = nil
+
+			break
+		}
+		res.NoSpeechProbs = append(res.NoSpeechProbs, *seg.NoSpeechProb)
+	}
+
+	return res, capture.OK()
 }
 
-func (t *Transcriber) buildBody(r Request) (*bytes.Buffer, string, error) {
+func buildBody(r Request, fields [][2]string) (*bytes.Buffer, string, error) {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	fw, err := mw.CreateFormFile("file", "capture-"+r.ID+fileExt(r.Ext))
@@ -118,14 +143,6 @@ func (t *Transcriber) buildBody(r Request) (*bytes.Buffer, string, error) {
 	}
 	if _, err := fw.Write(r.Audio); err != nil {
 		return nil, "", fmt.Errorf("write audio: %w", err)
-	}
-	fields := [][2]string{
-		{"model", t.cfg.Model},
-		{"response_format", t.cfg.ResponseFormat},
-		{"temperature", "0"},
-	}
-	if r.Language != "" {
-		fields = append(fields, [2]string{"language", r.Language})
 	}
 	for _, f := range fields {
 		if err := mw.WriteField(f[0], f[1]); err != nil {
@@ -137,6 +154,49 @@ func (t *Transcriber) buildBody(r Request) (*bytes.Buffer, string, error) {
 	}
 
 	return &buf, mw.FormDataContentType(), nil
+}
+
+// HasSpeech asks speaches' voice activity detector,
+// POST {BaseURL}/audio/speech/timestamps, whether the audio has any speech
+// region. Only the file is sent: that endpoint's "model" field names the VAD
+// model. It is not part of the OpenAI API; other services answer 404, which
+// classifies as Misconfig. Outcomes are classified like Transcribe's.
+func (t *Transcriber) HasSpeech(ctx context.Context, r Request) (bool, capture.Outcome) {
+	body, contentType, err := buildBody(r, nil)
+	if err != nil {
+		return false, capture.Permanent("build request: " + err.Error()).On(capture.WaitingSTT)
+	}
+	endpoint := strings.TrimRight(t.cfg.BaseURL, "/") + "/audio/speech/timestamps"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, body)
+	if err != nil {
+		return false, capture.Misconfig("invalid STT_BASE_URL").On(capture.WaitingSTT)
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("User-Agent", "VoiceNotes/"+t.cfg.Version)
+	if t.cfg.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+t.cfg.APIKey)
+	}
+
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return false, capture.NetworkError(err).On(capture.WaitingSTT)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if out := capture.ClassifyHTTP(resp.StatusCode); out.Class != capture.ClassOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+		return false, out.On(capture.WaitingSTT)
+	}
+
+	var regions []struct {
+		Start int64 `json:"start"`
+		End   int64 `json:"end"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&regions); err != nil {
+		return false, capture.Temporary("malformed response").On(capture.WaitingSTT)
+	}
+
+	return len(regions) > 0, capture.OK()
 }
 
 // fileExt returns ext when it looks like ".<1-5 lowercase letters or

@@ -173,6 +173,8 @@ and should not appear on the command line (use `--env-file` or `-e NAME` without
 | `STT_MODEL` | yes | | no | Model id passed as `model` |
 | `STT_RESPONSE_FORMAT` | no | `verbose_json` | no | `verbose_json` (reports the detected language) or `json` (for models that reject `verbose_json`) |
 | `STT_TIMEOUT` | no | `120s` | no | Per-request timeout |
+| `STT_VAD` | no | `false` | no | speaches only: ask its voice activity detector (`/v1/audio/speech/timestamps`) before transcribing; audio with no speech is not transcribed and creates no note. If the check fails, the audio is transcribed anyway |
+| `STT_NO_SPEECH_THRESHOLD` | no | `0` (off) | no | `0`-`1`; a transcript whose every segment has at least this `no_speech_prob` is no speech (`verbose_json` only). For backends without `STT_VAD`; ignored once the detector has heard speech. Short words can score 0.64 |
 
 ### Languages
 
@@ -262,7 +264,7 @@ no transcoding), `model`, `response_format`, `temperature=0` and, only when one 
 forced, `language`. `Authorization: Bearer` is sent only when `STT_API_KEY` is set.
 
 - speaches with any CTranslate2 Whisper model, for example `Systran/faster-whisper-large-v3`: use
-  `STT_RESPONSE_FORMAT=verbose_json`. Download the model before first use; speaches answers 404
+  `STT_RESPONSE_FORMAT=verbose_json` and `STT_VAD=true`. Download the model before first use; speaches answers 404
   for models that are not installed, and VoiceNotes reports that as degraded health.
 - OpenAI `whisper-1`: `verbose_json`.
 - OpenAI `gpt-4o-transcribe` and `gpt-4o-mini-transcribe`: set `STT_RESPONSE_FORMAT=json`. These

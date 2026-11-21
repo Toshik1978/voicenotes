@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -230,5 +231,123 @@ func TestTranscribeNetworkErrorOmitsURLCredentials(t *testing.T) {
 	}
 	if out.Reason == "" || strings.Contains(out.Reason, "user") || strings.Contains(out.Reason, "secret") {
 		t.Errorf("reason = %q", out.Reason)
+	}
+}
+
+// verbose_json segments carry Whisper's no_speech_prob. The values are kept
+// only when every segment reports one; the shape is a real speaches answer
+// for five seconds of silence.
+func TestTranscribeNoSpeechProbs(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want []float64
+	}{
+		{
+			"silence hallucination",
+			`{"text":"Teksting av Nicolai Winther","language":"nn","duration":5.0,"segments":[` +
+				`{"id":0,"text":" Teksting av Nicolai Winther","avg_logprob":-0.302,` +
+				`"compression_ratio":0.78,"no_speech_prob":0.837}]}`,
+			[]float64{0.837},
+		},
+		{
+			"two segments",
+			`{"text":"a b","segments":[{"text":" a","no_speech_prob":0.064},{"text":" b","no_speech_prob":0.9}]}`,
+			[]float64{0.064, 0.9},
+		},
+		{
+			"a segment without the field",
+			`{"text":"a b","segments":[{"text":" a","no_speech_prob":0.9},{"text":" b"}]}`,
+			nil,
+		},
+		{"no segments (json format)", `{"text":"hello"}`, nil},
+		{"empty segment list", `{"text":"","segments":[]}`, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tr := newTestTranscriber(t, func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, tt.body)
+			}, nil)
+			res, out := tr.Transcribe(context.Background(), Request{ID: "1", Audio: []byte("A")})
+			if out.Class != capture.ClassOK {
+				t.Fatalf("outcome = %+v", out)
+			}
+			if !slices.Equal(res.NoSpeechProbs, tt.want) || (tt.want == nil) != (res.NoSpeechProbs == nil) {
+				t.Errorf("NoSpeechProbs = %v, want %v", res.NoSpeechProbs, tt.want)
+			}
+		})
+	}
+}
+
+// HasSpeech asks speaches' voice activity detector for speech regions. Only
+// the file is sent: the endpoint's own "model" field names the VAD model, so
+// the transcription model must not leak into it.
+func TestHasSpeech(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"no regions", `[]`, false},
+		{"one region", `[{"start":352,"end":736}]`, true},
+		{"two regions", `[{"start":2656,"end":4544},{"start":6752,"end":8000}]`, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotPath, gotAuth, gotName string
+			var gotFields map[string][]string
+			tr := newTestTranscriber(t, func(w http.ResponseWriter, r *http.Request) {
+				gotPath, gotAuth = r.URL.Path, r.Header.Get("Authorization")
+				if err := r.ParseMultipartForm(1 << 20); err != nil {
+					t.Errorf("parse multipart: %v", err)
+
+					return
+				}
+				gotFields = r.MultipartForm.Value
+				gotName = r.MultipartForm.File["file"][0].Filename
+				_, _ = io.WriteString(w, tt.body)
+			}, nil)
+			got, out := tr.HasSpeech(
+				context.Background(),
+				Request{ID: "7", Ext: ".wav", Audio: []byte("RIFF"), Language: "ru"},
+			)
+			if out.Class != capture.ClassOK {
+				t.Fatalf("outcome = %+v", out)
+			}
+			if got != tt.want {
+				t.Errorf("HasSpeech = %v, want %v", got, tt.want)
+			}
+			if gotPath != "/v1/audio/speech/timestamps" || gotAuth != "Bearer FAKE-KEY" || gotName != "capture-7.wav" {
+				t.Errorf("request = %q %q %q", gotPath, gotAuth, gotName)
+			}
+			if len(gotFields) != 0 {
+				t.Errorf("fields = %v, want only the file", gotFields)
+			}
+		})
+	}
+}
+
+func TestHasSpeechFailures(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   capture.Class
+	}{
+		{"not found (not speaches)", http.StatusNotFound, `{"detail":"Not Found"}`, capture.ClassMisconfig},
+		{"server error", http.StatusInternalServerError, ``, capture.ClassTemporary},
+		{"malformed", http.StatusOK, `{"text":"x"}`, capture.ClassTemporary},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tr := newTestTranscriber(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.status)
+				_, _ = io.WriteString(w, tt.body)
+			}, nil)
+			_, out := tr.HasSpeech(context.Background(), Request{ID: "7", Audio: []byte("A")})
+			if out.Class != tt.want {
+				t.Errorf("class = %v, want %v (%+v)", out.Class, tt.want, out)
+			}
+		})
 	}
 }

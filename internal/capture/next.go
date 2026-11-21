@@ -29,6 +29,12 @@ func (p Policy) Next(c Capture, o Outcome, now time.Time) Capture {
 
 	switch o.Class {
 	case ClassOK:
+		if c.Step == StepExtract && c.NoSpeech {
+			// A transcript with no speech creates no note: skip enrich and
+			// write_note and go straight to finalize_reply.
+			return advanceTo(c, StepFinalizeReply, now)
+		}
+
 		return advance(c, now)
 	case ClassProgress:
 		return progress(c, now)

@@ -296,17 +296,17 @@ through the unchanged pipeline, and the recorder loop runs against fakes.
 
 **Independent Test**: quickstart.md §3 (silent recording) and §4 (Telegram silence regression).
 
-- [ ] T026 [US4] Add the no-speech policy in `internal/capture/capture.go` and `internal/capture/next.go`, with tests alongside.
+- [x] T026 [US4] Add the no-speech policy in `internal/capture/capture.go` and `internal/capture/next.go`, with tests alongside.
   - Add `Capture.NoSpeech bool`.
   - In `Policy.Next`: an OK outcome at `extract` for a capture with `NoSpeech` advances to `finalize_reply`, skipping `enrich` and `write_note`. Every other transition is unchanged.
   - A `Permanent` failure at `extract` still goes to `write_note` with `Failure` (a placeholder note).
-- [ ] T027 [US4] Apply the rule in the pipeline. Tests go in `internal/pipeline/steps_test.go` and `internal/render/render_test.go`; update the 001 silence case in `cmd/voicenotes/pipeline_e2e_test.go` to FR-210a.
+- [x] T027 [US4] Apply the rule in the pipeline. Tests go in `internal/pipeline/steps_test.go` and `internal/render/render_test.go`; update the 001 silence case in `cmd/voicenotes/pipeline_e2e_test.go` to FR-210a.
   - In `internal/pipeline/steps.go`:
     - `extract` sets `NoSpeech` when an audio capture's successful transcript is empty after `strings.TrimSpace`.
     - `replyText` returns `🔇 no speech heard — not saved` for `NoSpeech`.
     - `cleanup`, for `NoSpeech` with `Source == capture.SourceMic`, moves each local file to `$DATA_DIR/nospeech/<id>.wav` (rename, then directory fsync) instead of deleting it. Telegram files are removed as before.
   - In `internal/render/render.go`: remove `NoSpeech` and its use in `mainText`.
-- [ ] T028 [US4] Purge held audio in `internal/pipeline/purge.go`. Tests go in `internal/pipeline/purge_test.go`.
+- [x] T028 [US4] Purge held audio in `internal/pipeline/purge.go`. Tests go in `internal/pipeline/purge_test.go`.
   - `PurgeLoop` deletes files in `$DATA_DIR/nospeech/` whose mtime is older than `MIC_NOSPEECH_HOLD` (default `168h`).
   - Create the directory at startup in `cmd/voicenotes/service.go`, next to `files/`, with mode 0700.
 

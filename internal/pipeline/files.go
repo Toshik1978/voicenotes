@@ -6,10 +6,17 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"time"
 )
 
-// DirFiles is the FileStore over a directory (DATA_DIR/files).
-type DirFiles struct{ dir string }
+// DirFiles is the FileStore over a directory (DATA_DIR/files). syncDir is
+// the directory fsync Hold uses and now the clock that stamps a held file;
+// nil means the real ones (tests replace them).
+type DirFiles struct {
+	dir     string
+	syncDir func(dir string) error
+	now     func() time.Time
+}
 
 // NewDirFiles returns a store rooted at dir, created on first write.
 func NewDirFiles(dir string) *DirFiles { return &DirFiles{dir: dir} }
@@ -90,6 +97,73 @@ func (a *DirFiles) Remove(name string) error {
 	}
 	if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("pipeline: remove file: %w", err)
+	}
+
+	return nil
+}
+
+// NoSpeechDir is the directory under DATA_DIR, next to files/, that holds
+// microphone recordings with no speech until MIC_NOSPEECH_HOLD passes.
+const NoSpeechDir = "nospeech"
+
+// Hold moves name out of the files directory into its sibling NoSpeechDir as
+// heldName, creating that directory (0700) when needed. The rename is made
+// durable with an fsync of both directories. The held file's mtime is set to
+// the hold time first, so the hold is measured from the move, not the upload.
+// A missing name is not an error, so a retry after a crash past the rename
+// succeeds, and it still stamps and fsyncs.
+func (a *DirFiles) Hold(name, heldName string) error {
+	src, err := a.path(name)
+	if err != nil {
+		return err
+	}
+	holdDir := filepath.Join(filepath.Dir(a.dir), NoSpeechDir)
+	dst, err := (&DirFiles{dir: holdDir}).path(heldName)
+	if err != nil {
+		return err
+	}
+	if err = os.MkdirAll(holdDir, 0o700); err != nil {
+		return fmt.Errorf("pipeline: create hold dir: %w", err)
+	}
+	// A missing source means an earlier attempt already renamed it; that
+	// rename may not be durable yet, so both directories are synced anyway.
+	if err = os.Rename(src, dst); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("pipeline: hold file: %w", err)
+	}
+	// The hold starts now, not at upload: MIC_NOSPEECH_HOLD is measured by
+	// mtime and a rename keeps the old one. Stamped on a retry too (a crash
+	// between rename and stamp), which only lengthens the hold. A missing
+	// destination was never held here, so there is nothing to stamp.
+	now := a.now
+	if now == nil {
+		now = time.Now
+	}
+	heldAt := now()
+	if err = os.Chtimes(dst, heldAt, heldAt); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("pipeline: stamp held file: %w", err)
+	}
+
+	sync := a.syncDir
+	if sync == nil {
+		sync = syncDir
+	}
+
+	return errors.Join(sync(holdDir), sync(a.dir))
+}
+
+// syncDir fsyncs a directory so a rename into or out of it survives a crash.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("pipeline: sync dir: %w", err)
+	}
+	if err = d.Sync(); err != nil {
+		_ = d.Close()
+
+		return fmt.Errorf("pipeline: sync dir: %w", err)
+	}
+	if err = d.Close(); err != nil {
+		return fmt.Errorf("pipeline: sync dir: %w", err)
 	}
 
 	return nil

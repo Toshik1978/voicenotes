@@ -447,6 +447,8 @@ type micSetup struct {
 	prepare func(t *testing.T, dir string)
 	// spoolMinFree is MIC_SPOOL_MIN_FREE.
 	spoolMinFree int64
+	// silent: speech-to-text hears nothing in any recording.
+	silent bool
 }
 
 // startMicE2E wires the service (pipeline and microphone API, as wire does)
@@ -479,8 +481,12 @@ func startMicE2EWith(t *testing.T, setup micSetup) *micE2E {
 		clock: newMicClock(micFirstTap().Add(-time.Minute)), keys: &micKeys{events: make(chan micrec.KeyEvent)},
 		uploads: &micUploads{}, spoolDir: filepath.Join(t.TempDir(), "spool"),
 	}
+	said := micSaid
+	if setup.silent {
+		said = ""
+	}
 	p, err := newPipeline(cfg, zap.NewNop(), db, pipeline.Deps{
-		Transcriber: voiceTranscriber{text: micSaid}, Notes: m.world, Replier: m.tg, Downloader: m.world,
+		Transcriber: voiceTranscriber{text: said}, Notes: m.world, Replier: m.tg, Downloader: m.world,
 		Files: pipeline.NewDirFiles(filesDir), Log: zap.NewNop(),
 	})
 	if err != nil {
@@ -764,6 +770,35 @@ func TestMicDirectDoubleTapDeletesStartAndKeepsNothing(t *testing.T) {
 		if e.op == "edit" {
 			t.Errorf("unexpected edit %+v", e)
 		}
+	}
+	checkSpoolEmpty(t, m)
+}
+
+// US4 scenario 2, FR-210a/b: a recording with no speech makes no note; its
+// "🎙 recording…" says so, and its audio is held in DATA_DIR/nospeech as
+// <capture id>.wav, out of the files directory.
+func TestMicSilentRecordingMakesNoNoteAndHoldsAudio(t *testing.T) {
+	m := startMicE2EWith(t, micSetup{silent: true})
+
+	start := m.startRecording(t, micFirstTap(), 4101)
+	m.tapAt(t, micFirstTap().Add(5*time.Second))
+	edit := m.waitForSaved(t, start)
+
+	if edit.chat != micNotifyChat || edit.text != "🔇 no speech heard — not saved" {
+		t.Errorf("outcome = %+v, want 🔇 no speech heard — not saved in the notify chat", edit)
+	}
+	if notes, attachments, _ := m.world.snapshot(); len(notes) != 0 || len(attachments) != 0 {
+		t.Errorf("notes = %+v, attachments = %q; want none", notes, attachments)
+	}
+	held, err := os.ReadFile(filepath.Join(filepath.Dir(m.world.filesDir), "nospeech", "1.wav"))
+	if want := string(mic.Header(micAudioBytes)) + string(micAudioFixture()); err != nil || string(held) != want {
+		t.Errorf("held audio is %d bytes (%v), want the %d-byte WAV", len(held), err, len(want))
+	}
+	if entries, err := os.ReadDir(m.world.filesDir); err != nil || len(entries) != 0 {
+		t.Errorf("files dir holds %v (%v), want nothing", entries, err)
+	}
+	if has, err := m.db.HasRecording(t.Context(), micNotifyChat, 4101); err != nil || !has {
+		t.Errorf("recording identity kept = %v (%v), want it for dedupe", has, err)
 	}
 	checkSpoolEmpty(t, m)
 }
