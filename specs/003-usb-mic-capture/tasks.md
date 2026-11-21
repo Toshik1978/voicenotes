@@ -377,3 +377,14 @@ T016 micdev (keys + discovery)      T017 micaudio (malgo)      (alongside T012â€
 3. **Add US3**: alerts and interruption safety.
 4. **Add US4**: the general no-speech rule. It can be pulled forward.
 5. **Polish**: docs, kit verification, the full quickstart.
+
+## Phase 8: Convergence
+
+- [x] T032 Track each recorder alert condition separately in `internal/mic/alerts.go`, `internal/micapi/alerts.go` and the `mic_recorders` alert storage (migration if needed): one alert when a condition starts and one recovery when it clears, so moving between conditions never drops a recovery ("storage OK", "back online") nor hides a second condition (missing receiver while storage is full). Update `data-model.md` to match; tests alongside, per FR-227a, SC-209 (contradicts)
+- [x] T033 Do not evaluate `silent` in `internal/micapi/alerts.go` for a recorder that has not checked in since this service start, so a VoiceNotes outage longer than `MIC_SILENCE_ALERT` does not send "not heard from" plus "back online" for every recorder at restart; tests alongside, per FR-227a (partial)
+- [x] T034 Send the recorder's first check-in in `internal/recorder/recorder.go` only after the first receiver discovery has completed (or a session is up), so a recorder restart never reports a missing receiver it has; add a test with the receiver present from the start, per FR-227a, SC-209, US3/AC3 (partial)
+- [x] T035 Send a microphone capture's outcome message without reply-to when it has no start message (`ReplyMessageID` 0) instead of replying to the recording ID, in `internal/pipeline` and the Telegram replier; make the e2e Telegram fake in `cmd/voicenotes/mic_e2e_test.go` reject a reply to a message it never sent, per contracts/telegram-ux, FR-210, US2/AC6 (contradicts)
+- [x] T036 Apply the minimum recording length to recordings ended by recorder stop or crash and to recordings recovered at startup in `internal/recorder/recorder.go`, deleting their start message as for a tapped short recording; tests alongside, per FR-209, SC-206 (contradicts)
+- [x] T037 Run the "recording not received" start-reply cleanup (`StartReplyJanitor`, `internal/pipeline/purge.go`) hourly instead of only in the daily purge, so a stale start message is edited within about a day as the edge case states; tests alongside, per spec edge case "after one day" (partial)
+- [x] T038 Degrade recorder health in `internal/recorder/health.go` (and retry the grab in `internal/micdev/keys.go`) when the receiver is present but its key input could not be grabbed exclusively, so the owner learns taps reach the host; tests alongside, per FR-202, SC-204 (partial)
+- [x] T039 Record the `voicenotes-mic health --strict` flag in `plan.md` (Commands) and README, keeping the implemented behaviour, per plan: Commands (unrequested)

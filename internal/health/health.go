@@ -48,15 +48,16 @@ type Input struct {
 	RecorderAlerts []RecorderAlert // every known recorder; empty when the mic API is off
 }
 
-// RecorderAlert is one recorder and its outstanding alert. An empty Alert or
-// "ok" means none.
+// RecorderAlert is one recorder and its outstanding conditions: Alert is
+// "ok" (or empty) for none, else the condition names joined by commas, such
+// as "missing_receiver,storage_full".
 type RecorderAlert struct {
 	Name     string
 	Alert    string
 	LastSeen time.Time
 }
 
-// outstanding reports whether the recorder has an alert raised.
+// outstanding reports whether the recorder has any condition raised.
 func (r RecorderAlert) outstanding() bool { return r.Alert != "" && r.Alert != "ok" }
 
 // RecorderReport is the JSON form of a RecorderAlert.

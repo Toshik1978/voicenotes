@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -222,13 +223,28 @@ type micTelegram struct {
 	mu     sync.Mutex
 	nextID int64
 	events []tgEvent
+	sent   map[int64]bool
 }
 
-func (tg *micTelegram) Send(_ context.Context, chatID, _ int64, text string) (int64, error) {
+// Send rejects a reply to a message this fake never sent, as real Telegram
+// does ("message to be replied not found"); a mic capture has no incoming
+// Telegram message to reply to.
+func (tg *micTelegram) Send(_ context.Context, chatID, replyTo int64, text string) (int64, error) {
 	tg.mu.Lock()
 	defer tg.mu.Unlock()
+	if replyTo != 0 && !tg.sent[replyTo] {
+		return 0, fmt.Errorf(
+			"telegram: message to be replied not found (reply to %d): %w",
+			replyTo,
+			pipeline.ErrRejected,
+		)
+	}
 	tg.nextID++
 	id := 700 + tg.nextID
+	if tg.sent == nil {
+		tg.sent = map[int64]bool{}
+	}
+	tg.sent[id] = true
 	tg.events = append(tg.events, tgEvent{op: "send", chat: chatID, msg: id, text: text})
 
 	return id, nil
@@ -933,11 +949,11 @@ func TestMicProxyWrongTokenStoresNothing(t *testing.T) {
 
 	m.beginRecording(t, micFirstTap())
 	m.tapAt(t, micFirstTap().Add(5*time.Second))
-	waitFor(t, "the recorder to report misconfigured", func() bool { return m.rec.Status().Misconfigured })
+	// The check-in's 401 may report it first; wait for the refused upload too.
+	waitFor(t, "the recorder to try the upload and report misconfigured", func() bool {
+		return m.rec.Status().Misconfigured && len(m.uploads.all()) > 0
+	})
 
-	if ups := m.uploads.all(); len(ups) == 0 {
-		t.Fatal("the recorder never tried to upload")
-	}
 	if recs, err := m.spool.Finished(); err != nil || len(recs) != 1 {
 		t.Errorf("spool holds %v (%v), want the recording kept", recs, err)
 	}
@@ -1331,4 +1347,39 @@ func TestMicSilenceAlertsOnceAndRecovers(t *testing.T) {
 	m.passAlerts(t)
 	m.passAlerts(t)
 	m.wantAlerts(t, "not heard from since 08:00", "back online")
+}
+
+// FR-227a: each condition is tracked on its own. The receiver goes missing,
+// then the box goes silent, then it comes back with the receiver still
+// missing: one "back online", and "receiver not connected" is not repeated.
+func TestMicSilenceOverMissingReceiverRecoversOnlySilence(t *testing.T) {
+	m := startMicE2EWith(t, micSetup{discovery: &micSwitchDiscovery{}, noReceiver: true})
+
+	m.checkInUntil(t, "a check-in without the receiver", func(r sqlite.Recorder) bool { return !r.ReceiverPresent })
+	m.passAlerts(t)
+	m.wantAlerts(t, "receiver not connected")
+
+	m.net.setRule(func(r *http.Request) micFault {
+		if r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/mic/v1/recorders/") {
+			return faultDown
+		}
+
+		return faultNone
+	})
+	m.clock.tick(time.Minute) // a check-in that never arrives
+	m.svc.advance(micSilence + time.Minute)
+	m.passAlerts(t)
+	m.passAlerts(t)
+	m.wantAlerts(t, "receiver not connected", "not heard from since")
+
+	m.net.setRule(nil)
+	m.checkInUntil(t, "a check-in after the silence", func(r sqlite.Recorder) bool {
+		return r.LastSeen.Equal(m.svc.Now())
+	})
+	m.passAlerts(t)
+	m.passAlerts(t)
+	m.wantAlerts(t, "receiver not connected", "not heard from since", "back online")
+	if r, _ := m.recorderRow(t); r.Alert != "missing_receiver" {
+		t.Errorf("stored alert = %q, want missing_receiver still outstanding", r.Alert)
+	}
 }

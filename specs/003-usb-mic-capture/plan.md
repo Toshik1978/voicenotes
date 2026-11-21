@@ -192,7 +192,11 @@ audio" is superseded by FR-210a, allowed by constitution v1.1.0.
 **Commands**:
 
 - `voicenotes-mic` (or `run`): start the recorder.
-- `voicenotes-mic health`: GET the recorder's own `/healthz`.
+- `voicenotes-mic health [--strict]`: GET the recorder's own `/healthz` on `MIC_HTTP_ADDR` (an empty or
+  unspecified host is reached over loopback), print the body, and exit `0` on HTTP 200 and `1` otherwise
+  (including a request failure or timeout of 5 s). `--strict` additionally exits `1` when the body's `status`
+  is not `ok` (so `degraded`, or an unparsable body). It is a container or supervisor probe: without
+  `--strict` a `degraded` recorder still passes.
 - `voicenotes-mic version`: print the version.
 
 ### Service (`cmd/voicenotes`, `internal/micapi`, `internal/pipeline`, `internal/capture`, …)
@@ -210,7 +214,9 @@ audio" is superseded by FR-210a, allowed by constitution v1.1.0.
   `Replier.Delete` and `telegram.API.Delete`).
 - **`micapi.AlertLoop`**: runs `mic.Alerts` over `mic_recorders` every 30 s and sends
   transitions.
-- **Server timeouts**: `serveHTTP` gains `ReadTimeout: 2m` and `WriteTimeout: 30s`.
+- **Server timeouts**: `serveHTTP` gains `ReadTimeout: 2m` and `WriteTimeout: 2m30s` (the read
+  timeout plus 30 s, since Go's `WriteTimeout` runs from the end of the headers through the reply). The upload
+  handler extends both for its request from `Content-Length` at no less than 64 KiB/s (floor 2m).
 - **No speech**:
   - `capture.NoSpeech` plus a `Policy.Next` rule: extract OK with no speech goes to
     `finalize_reply`.

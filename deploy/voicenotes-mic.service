@@ -13,6 +13,7 @@ After=network-online.target sound.target
 User=voicenotes-mic
 SupplementaryGroups=audio input
 StateDirectory=voicenotes-mic
+StateDirectoryMode=0700
 EnvironmentFile=/usr/local/etc/voicenotes-mic.env
 ExecStart=/usr/local/bin/voicenotes-mic
 Restart=always

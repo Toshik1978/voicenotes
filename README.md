@@ -144,7 +144,7 @@ sudo systemctl enable --now voicenotes-mic
 
 The system user must be in the `audio` group (capture device) and the `input` group (the receiver's
 key events). The unit also adds both as supplementary groups, keeps the spool in
-`/var/lib/voicenotes-mic` (`StateDirectory`) and restarts the recorder on failure. The recorder
+`/var/lib/voicenotes-mic` (`StateDirectory`, mode `0700`) and restarts the recorder on failure. The recorder
 refuses to start on an invalid setting and names it, never its value.
 
 Edit `/usr/local/etc/voicenotes-mic.env` (see [`deploy/voicenotes-mic.env.example`](deploy/voicenotes-mic.env.example)
@@ -160,7 +160,9 @@ must equal the service's `MIC_UPLOAD_TOKEN`.
   `MIC_SERVER_URL=http://voicenotes.example.org:8080`, and publish the service's port (`-p 8080:8080`).
   The listener also serves `/healthz`: keep it on a trusted network or behind a TLS reverse proxy, and
   use an `https://` URL when it crosses an untrusted one, since the bearer token travels in every
-  request.
+  request. A reverse proxy's request body limit must be at least `MIC_UPLOAD_MAX_BYTES` (for nginx,
+  `client_max_body_size 30m` for the default); nginx's default of `1m` refuses every recording with
+  413, and a refused recording is kept but not retried until the recorder restarts.
 
 Notes for the Pi:
 
@@ -191,7 +193,10 @@ Set these on the service (all optional except `MIC_UPLOAD_TOKEN`, which turns th
 The recorder reads its own settings, listed in the example file: for instance `MIC_RECORDER_NAME`
 (default: the hostname), `MIC_MIN_LENGTH` (`2s`), `MIC_MAX_LENGTH` (`10m`, maximum `12m`),
 `MIC_SPOOL_MIN_FREE` (256 MiB), `MIC_CHECKIN_INTERVAL` (`1m`) and `MIC_HTTP_ADDR`
-(`127.0.0.1:8081`).
+(`127.0.0.1:8081`). `MIC_MIN_LENGTH` must be shorter than `MIC_MAX_LENGTH`. Keep
+`MIC_CHECKIN_INTERVAL` below the service's `MIC_SILENCE_ALERT`: the two live on different hosts and
+cannot be checked against each other, and a check-in interval at or above the silence threshold
+makes the recorder flap between "not heard from" and "back online".
 
 ### No speech
 
@@ -210,16 +215,48 @@ first check-in.
 
 | Condition | Alert | Recovery |
 |---|---|---|
-| Receiver unplugged | `🎙 <name>: receiver not connected — taps won't record` | `🎙 <name>: receiver connected` |
+| Receiver unplugged, or a recording could not start or finish | `🎙 <name>: receiver not connected — taps won't record` | `🎙 <name>: receiver connected` |
 | Spool below `MIC_SPOOL_MIN_FREE` | `🎙 <name>: storage full — new recordings refused` | `🎙 <name>: storage OK` |
 | No check-in for `MIC_SILENCE_ALERT` | `🎙 <name>: not heard from since HH:MM` | `🎙 <name>: back online` |
 
-The service's `/healthz` gains a `recorders` list (`name`, `alert`, `last_seen`) and reports
-`degraded` while any recorder has an alert outstanding. The recorder serves its own
+The recorder also reports its receiver as missing while the audio device cannot be opened (for
+example because a sound server holds it), until a recording starts again, and while a finished
+recording could not be closed in the spool, until one is. Its own `/healthz` says which: see below.
+
+Each condition is tracked on its own, so a receiver unplugged while storage is full still alerts,
+and each recovery is sent when its condition clears. While a recorder is silent, only the silence is
+reported; when it comes back, "back online" is followed by whatever has changed meanwhile.
+
+The service's `/healthz` gains a `recorders` list (`name`, `alert`, `last_seen`; `alert` is `ok`
+or the outstanding conditions joined by commas, such as `missing_receiver,storage_full`) and
+reports `degraded` while any recorder has an alert outstanding. The recorder serves its own
 `GET /healthz` on `MIC_HTTP_ADDR` (default `127.0.0.1:8081`, loopback only): `receiver`, `storage`,
-`pending`, `rejected` and so on; `degraded` for a missing receiver, full storage, a rejected
-recording, a refused token or a recording stuck longer than `MIC_PENDING_THRESHOLD`, and `unhealthy`
+`pending`, `rejected` and so on; `degraded` for a missing receiver, full storage, a spool error
+(`storage: error`, also set when a finished recording could not be closed), a recording that could
+not start (`audio_error: true`), a rejected recording, a refused token (`misconfigured: true`, from
+an upload or a check-in) or a recording stuck longer than `MIC_PENDING_THRESHOLD`, and `unhealthy`
 (HTTP 503) once the recorder's loops have stopped.
+
+`voicenotes-mic health` calls that endpoint (a `MIC_HTTP_ADDR` with an empty or unspecified host is
+reached over loopback), prints the body and exits `0` on HTTP 200 and `1` otherwise, including when the
+request fails or times out after 5 seconds. `voicenotes-mic health --strict` also exits `1` unless the
+status is `ok`, so `degraded` fails it. A usage error exits `2`: an unknown command (`-h` included)
+prints `usage: voicenotes-mic [run|health|version]`, and `voicenotes-mic health -h` or an unknown flag
+prints the `health` flags.
+
+The service forgets a recorder that has not checked in for 30 days (the daily purge logs
+`recorder forgotten` with its name), so a renamed or retired recorder stops keeping `/healthz`
+degraded. To forget one sooner, stop the service, delete its row and start it again:
+
+```sh
+docker stop voicenotes
+sqlite3 <DATA_DIR>/voicenotes.db "DELETE FROM mic_recorders WHERE name='old-name';"
+docker start voicenotes
+```
+
+`<DATA_DIR>` is the host directory behind the container's `DATA_DIR` (for a named volume, see
+`docker volume inspect voicenotes-data`). Delete the row rather than editing it; a recorder that
+checks in again is simply added back.
 
 ```sh
 curl -s 127.0.0.1:8081/healthz

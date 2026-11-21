@@ -128,7 +128,8 @@ func listenHealth(addr string) (net.Listener, error) {
 	return ln, nil
 }
 
-// uploadReadTimeout bounds reading a whole request, a recording upload included.
+// uploadReadTimeout bounds reading a whole request. A recording upload may take
+// longer: micapi extends its deadlines from its length (extendDeadlines).
 const uploadReadTimeout = 2 * time.Minute
 
 // newHTTPServer returns the service's HTTP server. Go starts WriteTimeout when

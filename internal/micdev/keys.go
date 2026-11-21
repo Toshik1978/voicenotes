@@ -24,7 +24,8 @@ var _ recorder.KeySource = Keys{}
 
 // Open opens the input device at path read-only and tries to grab it, so the
 // key neither changes the host volume nor reaches other programs. A failed
-// grab is not an error: the stream is returned with Grabbed false.
+// grab is not an error: the stream is returned with Grabbed false and a
+// Regrab the recorder retries on a schedule.
 func (Keys) Open(path string) (recorder.KeyStream, error) {
 	// The path is operator configuration or discovered under /dev/input.
 	f, err := os.Open(path) //nolint:gosec // G304,G703: see above
@@ -32,9 +33,13 @@ func (Keys) Open(path string) (recorder.KeyStream, error) {
 		return recorder.KeyStream{}, fmt.Errorf("micdev: open input device: %w", err)
 	}
 
-	grabbed := grab(f) == nil
+	grabErr := grab(f)
 
-	return newStream(f, f, grabbed), nil
+	st := newStream(f, f, grabErr == nil)
+	st.GrabErr = grabErr
+	st.Regrab = func() error { return grab(f) }
+
+	return st, nil
 }
 
 // grab takes exclusive access to the device. It goes through SyscallConn so

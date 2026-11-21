@@ -227,7 +227,7 @@ func (s *stepRunner) download(ctx context.Context, c capture.Capture) (capture.C
 	}
 
 	if c.ReplyMessageID == 0 {
-		id, err := s.d.Replier.Send(ctx, c.SourceChatID, c.SourceMessageID, textPending)
+		id, err := s.d.Replier.Send(ctx, c.SourceChatID, replyTarget(c), textPending)
 		if err != nil {
 			s.log(c, "acknowledgement failed, finalize will send a new reply", err)
 		} else {
@@ -676,6 +676,18 @@ func (s *stepRunner) finalizeReply(ctx context.Context, c capture.Capture) (capt
 	return s.reply(ctx, c)
 }
 
+// replyTarget is the message a new outcome message replies to. A Telegram
+// capture replies to the user's voice message; a microphone capture has no
+// incoming message (its SourceMessageID is the recording ID), so it is sent
+// as a plain new message.
+func replyTarget(c capture.Capture) int64 {
+	if c.Source == capture.SourceMic {
+		return 0
+	}
+
+	return c.SourceMessageID
+}
+
 func (s *stepRunner) reply(ctx context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
 	text := replyText(c)
 	var (
@@ -683,7 +695,7 @@ func (s *stepRunner) reply(ctx context.Context, c capture.Capture) (capture.Capt
 		err error
 	)
 	if c.ReplyMessageID == 0 || c.SendNewReply {
-		id, err = s.d.Replier.Send(ctx, c.SourceChatID, c.SourceMessageID, text)
+		id, err = s.d.Replier.Send(ctx, c.SourceChatID, replyTarget(c), text)
 	} else {
 		id, err = s.d.Replier.Edit(ctx, c.SourceChatID, c.ReplyMessageID, text)
 	}

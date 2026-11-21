@@ -141,6 +141,9 @@ func TestComputeRecorders(t *testing.T) {
 		{"one outstanding", []RecorderAlert{
 			{Name: "a", Alert: "ok", LastSeen: seen}, {Name: "bed", Alert: "storage_full", LastSeen: seen},
 		}, StatusDegraded},
+		{"several outstanding", []RecorderAlert{
+			{Name: "bed", Alert: "missing_receiver,storage_full", LastSeen: seen},
+		}, StatusDegraded},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

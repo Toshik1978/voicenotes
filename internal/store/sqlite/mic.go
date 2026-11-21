@@ -20,7 +20,8 @@ type StartReply struct {
 }
 
 // Recorder is the last known state of one microphone recorder. Alert is the
-// outstanding alert name (ok, missing_receiver, storage_full, silent).
+// stored set of outstanding conditions: "ok", or a comma-separated list of
+// missing_receiver, storage_full and silent (see mic.AlertSet).
 type Recorder struct {
 	Name            string
 	LastSeen        time.Time
@@ -159,6 +160,33 @@ storage_full = excluded.storage_full`,
 	return nil
 }
 
+// ForgetRecorders deletes the recorders last seen before notSeenSince and
+// returns their names, so a renamed or retired recorder stops being
+// evaluated for alerts and health.
+func (s *DB) ForgetRecorders(ctx context.Context, notSeenSince time.Time) ([]string, error) {
+	// last_seen has TEXT affinity: compare it as the integer it holds.
+	rows, err := s.db.QueryContext(ctx,
+		`DELETE FROM mic_recorders WHERE CAST(last_seen AS INTEGER) < ? RETURNING name`, ts(notSeenSince))
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: forget recorders: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var names []string
+	for rows.Next() {
+		var name string
+		if err = rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("sqlite: scan forgotten recorder: %w", err)
+		}
+		names = append(names, name)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlite: forget recorders: %w", err)
+	}
+
+	return names, nil
+}
+
 // Recorders returns every recorder, ordered by name.
 func (s *DB) Recorders(ctx context.Context) ([]Recorder, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT name, CAST(last_seen AS INTEGER), receiver_present,
@@ -185,8 +213,8 @@ storage_full, alert FROM mic_recorders ORDER BY name`)
 	return out, nil
 }
 
-// SetRecorderAlert stores the outstanding alert of recorder name, returning
-// ErrNotFound if there is no such recorder.
+// SetRecorderAlert stores the outstanding conditions of recorder name,
+// returning ErrNotFound if there is no such recorder.
 func (s *DB) SetRecorderAlert(ctx context.Context, name, alert string) error {
 	res, err := s.db.ExecContext(ctx, "UPDATE mic_recorders SET alert = ? WHERE name = ?", alert, name)
 	if err != nil {
