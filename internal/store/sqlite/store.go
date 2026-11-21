@@ -44,83 +44,18 @@ func (duplicateError) Error() string { return "sqlite: duplicate capture" }
 // Duplicate marks the error as a duplicate insert.
 func (duplicateError) Duplicate() bool { return true }
 
-// Store is the capture queue used by ingest, the worker and health.
-// Optional columns map to the zero value of the field: NULL reads back as
-// "" or 0, and zero values are written as NULL. Timestamps are stored as
-// Unix nanoseconds and read back in UTC.
-type Store interface {
-	// Insert stores c and its files in one transaction, sets c.ID and each
-	// file's ID and CaptureID, and returns ErrDuplicate if the capture's or
-	// any file's identity already exists (nothing is stored then).
-	Insert(ctx context.Context, c *capture.Capture) error
-	// AppendFile adds one incoming file item to the chat's open batch, or
-	// starts a new one, in a single BEGIN IMMEDIATE transaction (research
-	// R3). item is a new files capture at collect holding that one file.
-	// capture.JoinBatch decides join or new at the wall-clock now with quiet
-	// and sets the batch deadline. The result holds the stored batch,
-	// whether it was created, and whether its deadline moved later, so the
-	// caller wakes the worker only then. It returns
-	// ErrDuplicate if the item's identity was already stored.
-	AppendFile(
-		ctx context.Context,
-		item capture.Capture,
-		quiet time.Duration,
-	) (capture.AppendResult, error)
-	// JoinOpenBatch is AppendFile that never starts a batch: it adds item
-	// only when capture.JoinBatch joins it to the chat's open batch, and
-	// otherwise stores nothing and reports joined false. A file over the
-	// Telegram download limit uses it, since alone it is rejected.
-	JoinOpenBatch(
-		ctx context.Context,
-		item capture.Capture,
-		quiet time.Duration,
-	) (res capture.AppendResult, joined bool, err error)
-	// NextDue is due-first within a lane (FR-114a): it returns, with OK
-	// true, the lowest-ID unfinished capture of the lane whose NextAttemptAt
-	// is not after now; a capture that is not due never blocks later ones.
-	// When none is due, OK is false and WakeAt is the lane's earliest
-	// NextAttemptAt (UTC) so the worker can sleep until then; with an empty
-	// lane WakeAt is the zero time. Lane membership matches capture.LaneOf.
-	NextDue(ctx context.Context, now time.Time, lane capture.Lane) (capture.Due, error)
-	// Update persists every mutable field of c and of its files in one
-	// transaction, returning ErrNotFound if c.ID does not exist. Files are
-	// inserted only at ingest: each must already have a row, and its
-	// identity, kind and position are never changed. A zero ReplyMessageID keeps the stored one: a
-	// worker copy read before ingest recorded the reply must not erase it.
-	Update(ctx context.Context, c capture.Capture) error
-	// AdvanceCollect is Update for the collect step's result next, as a
-	// compare-and-set against read, the capture the worker ran collect on:
-	// it writes only while the row is still at collect with read's
-	// next_attempt_at and file count. It returns false, writing nothing,
-	// when a batch join landed since read (or the row is gone), so the
-	// worker re-reads instead of dropping the joined file's caption and
-	// deadline.
-	AdvanceCollect(ctx context.Context, read, next capture.Capture) (bool, error)
-	// SetReplyMessageID records the reply to edit, touching no other
-	// column, so it cannot race the worker's step updates. A reply already
-	// recorded is kept. It returns ErrNotFound if id does not exist.
-	SetReplyMessageID(ctx context.Context, id, msgID int64) error
-	// OldestUnfinished returns the unfinished capture with the lowest ID,
-	// due or not; ok is false when the queue is empty.
-	OldestUnfinished(ctx context.Context) (c capture.Capture, ok bool, err error)
-	// PurgeDone deletes done captures last updated before olderThan, with
-	// their files, and returns how many captures were removed.
-	PurgeDone(ctx context.Context, olderThan time.Time) (int64, error)
-	// Close releases the database.
-	Close() error
-}
-
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
-// DB is the SQLite-backed implementation of Store.
+// DB is the SQLite-backed capture queue used by ingest, the worker and health.
+// Optional columns map to the zero value of the field: NULL reads back as
+// "" or 0, and zero values are written as NULL. Timestamps are stored as
+// Unix nanoseconds and read back in UTC.
 type DB struct {
 	db *sql.DB
 	// now is the wall clock batching decides by.
 	now func() time.Time
 }
-
-var _ Store = (*DB)(nil)
 
 // Open opens (creating if needed) $dataDir/voicenotes.db, applies pending
 // migrations and returns the store. The dataDir must exist.
@@ -214,7 +149,7 @@ album_id, text, language, enriched_json,
 llm_skipped, failure, note_name, note_url, task_count, reply_message_id,
 step, status, waiting_on, attempts, next_attempt_at, updated_at,
 misconfig, last_error, queue_reply_edit, minimal_note, send_new_reply,
-enrich_started_at`
+enrich_started_at, no_speech`
 
 const fileColumns = `id, capture_id, position, source, source_chat_id, source_message_id,
 kind, file_id, mime_type, file_name, file_size, local_path, state, text,
@@ -233,7 +168,7 @@ kind=?, received_at=?, album_id=?, text=?,
 language=?, enriched_json=?, llm_skipped=?, failure=?, note_name=?, note_url=?,
 task_count=?, reply_message_id=COALESCE(?, reply_message_id), step=?, status=?, waiting_on=?, attempts=?,
 next_attempt_at=?, updated_at=?, misconfig=?, last_error=?, queue_reply_edit=?,
-minimal_note=?, send_new_reply=?, enrich_started_at=?
+minimal_note=?, send_new_reply=?, enrich_started_at=?, no_speech=?
 WHERE id=?`
 
 // advanceCollect is updateCapture guarded for AdvanceCollect: the row is
@@ -248,8 +183,9 @@ var errBatchChanged = errors.New("batch changed since read")
 // inserted at ingest, never by Update.
 var errFileNotInserted = errors.New("file was never inserted")
 
-// Insert stores c and its files in one transaction, setting c.ID and each
-// file's ID and CaptureID.
+// Insert stores c and its files in one transaction, sets c.ID and each
+// file's ID and CaptureID, and returns ErrDuplicate if the capture's or
+// any file's identity already exists (nothing is stored then).
 func (s *DB) Insert(ctx context.Context, c *capture.Capture) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -267,10 +203,18 @@ func (s *DB) Insert(ctx context.Context, c *capture.Capture) error {
 	return nil
 }
 
-// AppendFile stores item inside BEGIN IMMEDIATE, so the write lock is taken
-// before the open batch is read and concurrent appends serialise (research
-// R3). capture.JoinBatch, applied at the wall-clock now once the lock is
-// held (not item.ReceivedAt, the sender's clock), decides: a join adds
+// AppendFile adds one incoming file item to the chat's open batch, or
+// starts a new one, in a single BEGIN IMMEDIATE transaction (research
+// R3). item is a new files capture at collect holding that one file.
+// capture.JoinBatch decides join or new at the wall-clock now with quiet
+// and sets the batch deadline. The result holds the stored batch,
+// whether it was created, and whether its deadline moved later, so the
+// caller wakes the worker only then. It returns
+// ErrDuplicate if the item's identity was already stored.
+//
+// BEGIN IMMEDIATE takes the write lock before the open batch is read, so
+// concurrent appends serialise. JoinBatch runs at the wall-clock now once
+// the lock is held (not item.ReceivedAt, the sender's clock): a join adds
 // the file at the next position, updates the batch text and moves
 // next_attempt_at only when the deadline moved later; otherwise item becomes
 // a new capture due at the decision's deadline. JoinBatch is the single
@@ -283,7 +227,10 @@ func (s *DB) AppendFile(
 	return res, err
 }
 
-// JoinOpenBatch is AppendFile restricted to a join; see Store.
+// JoinOpenBatch is AppendFile that never starts a batch: it adds item
+// only when capture.JoinBatch joins it to the chat's open batch, and
+// otherwise stores nothing and reports joined false. A file over the
+// Telegram download limit uses it, since alone it is rejected.
 func (s *DB) JoinOpenBatch(
 	ctx context.Context, item capture.Capture, quiet time.Duration,
 ) (capture.AppendResult, bool, error) {
@@ -457,8 +404,8 @@ album_id, text, language, enriched_json,
 llm_skipped, failure, note_name, note_url, task_count, reply_message_id,
 step, status, waiting_on, attempts, next_attempt_at, updated_at,
 misconfig, last_error, queue_reply_edit, minimal_note, send_new_reply,
-enrich_started_at)
-VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?, ?)`,
+enrich_started_at, no_speech)
+VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?, ?,?)`,
 		c.Source, c.SourceChatID, c.SourceMessageID, string(c.Kind), ts(c.ReceivedAt),
 		nullStr(c.AlbumID), nullStr(c.Text), nullStr(c.Language), nullStr(c.EnrichedJSON),
 		nullStr(c.LLMSkipped), nullStr(c.Failure), nullStr(c.NoteName), nullStr(c.NoteURL),
@@ -466,7 +413,7 @@ VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?, ?)`,
 		string(c.Step), string(c.Status), nullStr(string(c.WaitingOn)), c.Attempts,
 		ts(c.NextAttemptAt), ts(c.UpdatedAt),
 		c.Misconfig, nullStr(c.LastError), c.QueueReplyEdit, c.MinimalNote, c.SendNewReply,
-		nullTS(c.EnrichStartedAt))
+		nullTS(c.EnrichStartedAt), c.NoSpeech)
 	if err != nil {
 		if isUnique(err) {
 			return ErrDuplicate
@@ -519,15 +466,22 @@ VALUES (?,?,?,?,?, ?,?,?,?,?,?,?,?, ?,?,?,?,?,?, ?,?)`,
 	return nil
 }
 
-// Update persists c and the mutable columns of its files in one
-// transaction. A file's identity, kind and position are fixed at ingest; a
-// file without a row is an error, not an insert.
+// Update persists every mutable field of c and of its files in one
+// transaction, returning ErrNotFound if c.ID does not exist. Files are
+// inserted only at ingest: each must already have a row, and its
+// identity, kind and position are never changed. A zero ReplyMessageID keeps the stored one: a
+// worker copy read before ingest recorded the reply must not erase it.
 func (s *DB) Update(ctx context.Context, c capture.Capture) error {
 	return s.update(ctx, c, nil)
 }
 
-// AdvanceCollect persists next only while the batch is as read left it; see
-// Store. A missing row also reads as changed.
+// AdvanceCollect is Update for the collect step's result next, as a
+// compare-and-set against read, the capture the worker ran collect on:
+// it writes only while the row is still at collect with read's
+// next_attempt_at and file count. It returns false, writing nothing,
+// when a batch join landed since read (or the row is gone), so the
+// worker re-reads instead of dropping the joined file's caption and
+// deadline.
 func (s *DB) AdvanceCollect(ctx context.Context, read, next capture.Capture) (bool, error) {
 	if read.ID != next.ID {
 		return false, fmt.Errorf("sqlite: advance collect: read %d, next %d", read.ID, next.ID)
@@ -578,6 +532,9 @@ func oneRow(res sql.Result) error {
 	return nil
 }
 
+// SetReplyMessageID records the reply to edit, touching no other
+// column, so it cannot race the worker's step updates. A reply already
+// recorded is kept. It returns ErrNotFound if id does not exist.
 func (s *DB) SetReplyMessageID(ctx context.Context, id, msgID int64) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE captures SET reply_message_id=COALESCE(reply_message_id, ?) WHERE id=?`, msgID, id)
@@ -595,6 +552,12 @@ func (s *DB) SetReplyMessageID(ctx context.Context, id, msgID int64) error {
 	return nil
 }
 
+// NextDue is due-first within a lane (FR-114a): it returns, with OK
+// true, the lowest-ID unfinished capture of the lane whose NextAttemptAt
+// is not after now; a capture that is not due never blocks later ones.
+// When none is due, OK is false and WakeAt is the lane's earliest
+// NextAttemptAt (UTC) so the worker can sleep until then; with an empty
+// lane WakeAt is the zero time. Lane membership matches capture.LaneOf.
 func (s *DB) NextDue(ctx context.Context, now time.Time, lane capture.Lane) (capture.Due, error) {
 	var inLane string
 	switch lane {
@@ -624,6 +587,8 @@ func (s *DB) NextDue(ctx context.Context, now time.Time, lane capture.Lane) (cap
 	return capture.Due{WakeAt: fromTS(wake.Int64)}, nil
 }
 
+// OldestUnfinished returns the unfinished capture with the lowest ID,
+// due or not; ok is false when the queue is empty.
 func (s *DB) OldestUnfinished(ctx context.Context) (capture.Capture, bool, error) {
 	return s.queryOne(ctx, "SELECT "+columns+
 		" FROM captures WHERE status != 'done' ORDER BY id LIMIT 1")
@@ -664,8 +629,8 @@ func (s *DB) FilePaths(ctx context.Context) ([]string, error) {
 	return out, nil
 }
 
-// PurgeDone deletes old done captures; their capture_files rows go with them
-// (ON DELETE CASCADE).
+// PurgeDone deletes done captures last updated before olderThan, with
+// their files, and returns how many captures were removed.
 func (s *DB) PurgeDone(ctx context.Context, olderThan time.Time) (int64, error) {
 	res, err := s.db.ExecContext(ctx,
 		"DELETE FROM captures WHERE status = 'done' AND updated_at < ?", ts(olderThan))
@@ -680,6 +645,7 @@ func (s *DB) PurgeDone(ctx context.Context, olderThan time.Time) (int64, error) 
 	return n, nil
 }
 
+// Close releases the database.
 func (s *DB) Close() error {
 	if err := s.db.Close(); err != nil {
 		return fmt.Errorf("sqlite: close: %w", err)
@@ -741,7 +707,7 @@ func (s *DB) update(ctx context.Context, c capture.Capture, read *capture.Captur
 		c.TaskCount, nullInt(c.ReplyMessageID), string(c.Step), string(c.Status),
 		nullStr(string(c.WaitingOn)), c.Attempts,
 		ts(c.NextAttemptAt), ts(c.UpdatedAt), c.Misconfig, nullStr(c.LastError),
-		c.QueueReplyEdit, c.MinimalNote, c.SendNewReply, nullTS(c.EnrichStartedAt),
+		c.QueueReplyEdit, c.MinimalNote, c.SendNewReply, nullTS(c.EnrichStartedAt), c.NoSpeech,
 		c.ID,
 	}
 	if read != nil {
@@ -806,7 +772,7 @@ func scanCapture(row *sql.Row) (capture.Capture, bool, error) {
 		&skipped, &failure, &noteName, &noteURL, &c.TaskCount, &replyID,
 		&step, &status, &waiting, &c.Attempts, &next, &updated,
 		&c.Misconfig, &lastErr, &c.QueueReplyEdit, &c.MinimalNote, &c.SendNewReply,
-		&enrichStarted,
+		&enrichStarted, &c.NoSpeech,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return capture.Capture{}, false, nil

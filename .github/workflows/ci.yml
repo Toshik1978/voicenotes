@@ -85,7 +85,7 @@ jobs:
         run: |
           set +e
           go test -race -v \
-            -coverpkg=./internal/config,./internal/capture,./internal/pipeline,./internal/language,./internal/enrich,./internal/render,./internal/digest,./internal/health \
+            -coverpkg=./internal/config,./internal/capture,./internal/pipeline,./internal/language,./internal/enrich,./internal/render,./internal/digest,./internal/health,./internal/mic,./internal/recorder,./internal/micapi \
             -covermode=atomic -coverprofile=coverage.txt \
             ./... > test_status.log 2>&1
           echo "TEST_EXIT=$?" >> "$GITHUB_ENV"
@@ -230,3 +230,68 @@ jobs:
       # task build sets CGO_ENABLED=0.
       - name: Run build
         run: task build
+
+  # The recorder links malgo (cgo), so it builds natively on each target
+  # architecture with no cross-compiler. gcc is preinstalled on the runners;
+  # miniaudio loads libasound at runtime, so no ALSA -dev package is needed.
+  build-mic:
+    name: build-mic (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    needs: [lint, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Golang
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          check-latest: true
+
+      - name: Install Task
+        uses: go-task/setup-task@v2
+
+      - name: Setup project
+        run: task setup
+
+      # task build:mic sets CGO_ENABLED=1.
+      - name: Run build
+        run: task build:mic
+
+  # Builds the recorder archives exactly as release.yml will (.goreleaser.yaml,
+  # arm64 cross-compiled), so a broken config or cross build fails here and
+  # not on a tag. Publishes nothing.
+  release-snapshot:
+    name: release-snapshot
+    # Same runner as release.yml: the glibc the archives link against.
+    runs-on: ubuntu-24.04
+    needs: [lint, test]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install the arm64 C cross-compiler
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+
+      - name: Setup Golang
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          check-latest: true
+
+      - name: Build the release archives
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --snapshot --clean --skip=publish

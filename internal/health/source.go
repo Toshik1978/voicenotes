@@ -32,9 +32,16 @@ type Worker interface {
 	StoreOK() bool
 }
 
+// Recorders is the read side of the microphone recorders. It is optional.
+type Recorders interface {
+	// RecorderAlerts returns every known recorder with its outstanding alert.
+	RecorderAlerts(ctx context.Context) ([]RecorderAlert, error)
+}
+
 // CollectorConfig wires a Collector.
 type CollectorConfig struct {
 	Queue     Queue
+	Recorders Recorders // nil unless the mic API is enabled
 	Worker    Worker
 	LastPoll  func() time.Time // last successful Telegram poll; zero if none yet
 	Clock     func() time.Time
@@ -44,8 +51,6 @@ type CollectorConfig struct {
 
 // Collector is the Source built from the live components.
 type Collector struct{ cfg CollectorConfig }
-
-var _ Source = (*Collector)(nil)
 
 // NewCollector returns a Collector. Started is passed on so that, until the
 // first successful poll, Compute measures poll staleness from process start
@@ -85,6 +90,15 @@ func (c *Collector) Snapshot(ctx context.Context) Input {
 
 	if date, err := c.cfg.Queue.LastDigestDate(ctx); err == nil {
 		in.LastDigest = date
+	}
+
+	if c.cfg.Recorders != nil {
+		recs, err := c.cfg.Recorders.RecorderAlerts(ctx)
+		if err != nil {
+			in.StoreOK = false
+			return in
+		}
+		in.RecorderAlerts = recs
 	}
 
 	return in

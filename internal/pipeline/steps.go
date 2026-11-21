@@ -70,11 +70,13 @@ type NotesWriter interface {
 	Attach(ctx context.Context, name, filename, mime string, data []byte) capture.Outcome
 }
 
-// Replier sends and edits silent capture replies; Edit falls back to a new
-// reply when the message cannot be edited and returns the holding ID.
+// Replier sends, edits and deletes silent capture replies; Edit falls back to
+// a new reply when the message cannot be edited and returns the holding ID.
+// Delete is best-effort: ErrRejected means the message is gone or undeletable.
 type Replier interface {
 	Send(ctx context.Context, chatID, replyTo int64, text string) (int64, error)
 	Edit(ctx context.Context, chatID, msgID int64, text string) (int64, error)
+	Delete(ctx context.Context, chatID, msgID int64) error
 }
 
 // Downloader fetches a file's bytes by its source file ID.
@@ -84,12 +86,14 @@ type Downloader interface {
 
 // FileStore holds capture files by name, relative to the files directory.
 // Write is durable and replaces an existing file; Remove of a missing file
-// is not an error.
+// is not an error. Hold durably moves a file into the no-speech hold area as
+// heldName; a missing file is not an error there either.
 type FileStore interface {
 	Write(name string, data []byte) error
 	Read(name string) ([]byte, error)
 	Exists(name string) (bool, error)
 	Remove(name string) error
+	Hold(name, heldName string) error
 }
 
 // Enricher is the chat call of the optional LLM step. It is nil when the LLM
@@ -223,7 +227,7 @@ func (s *stepRunner) download(ctx context.Context, c capture.Capture) (capture.C
 	}
 
 	if c.ReplyMessageID == 0 {
-		id, err := s.d.Replier.Send(ctx, c.SourceChatID, c.SourceMessageID, textPending)
+		id, err := s.d.Replier.Send(ctx, c.SourceChatID, replyTarget(c), textPending)
 		if err != nil {
 			s.log(c, "acknowledgement failed, finalize will send a new reply", err)
 		} else {
@@ -307,7 +311,8 @@ func (s *stepRunner) downloadFile(ctx context.Context, c *capture.Capture, i int
 // one is wired, and a photo it barely read (or every photo, without a reader)
 // then goes to the vision model when one is wired. Files no reader can take
 // are skipped; videos always are. Once none remain, an audio capture takes its
-// file's text and language, so enrich and render see a voice note as before.
+// file's text and language, so enrich and render see a voice note as before;
+// a transcript that is empty once trimmed marks it NoSpeech (FR-210a).
 func (s *stepRunner) extract(ctx context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
 	c.Files = slices.Clone(c.Files)
 	skipUnreadFiles(c.Files, s.d.Extractor != nil, s.d.Describer != nil)
@@ -322,6 +327,9 @@ func (s *stepRunner) extract(ctx context.Context, c capture.Capture) (capture.Ca
 	if c.Kind == capture.KindAudio {
 		if i := slices.IndexFunc(c.Files, func(f capture.File) bool { return f.Kind == capture.FileAudio }); i >= 0 {
 			c.Text, c.Language = c.Files[i].Text, c.Files[i].Language
+			// Only a successful transcript can be "no speech"; a failed
+			// file still yields a placeholder note.
+			c.NoSpeech = c.Files[i].State == capture.FileDone && strings.TrimSpace(c.Text) == ""
 		}
 	}
 
@@ -668,6 +676,18 @@ func (s *stepRunner) finalizeReply(ctx context.Context, c capture.Capture) (capt
 	return s.reply(ctx, c)
 }
 
+// replyTarget is the message a new outcome message replies to. A Telegram
+// capture replies to the user's voice message; a microphone capture has no
+// incoming message (its SourceMessageID is the recording ID), so it is sent
+// as a plain new message.
+func replyTarget(c capture.Capture) int64 {
+	if c.Source == capture.SourceMic {
+		return 0
+	}
+
+	return c.SourceMessageID
+}
+
 func (s *stepRunner) reply(ctx context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
 	text := replyText(c)
 	var (
@@ -675,7 +695,7 @@ func (s *stepRunner) reply(ctx context.Context, c capture.Capture) (capture.Capt
 		err error
 	)
 	if c.ReplyMessageID == 0 || c.SendNewReply {
-		id, err = s.d.Replier.Send(ctx, c.SourceChatID, c.SourceMessageID, text)
+		id, err = s.d.Replier.Send(ctx, c.SourceChatID, replyTarget(c), text)
 	} else {
 		id, err = s.d.Replier.Edit(ctx, c.SourceChatID, c.ReplyMessageID, text)
 	}
@@ -747,7 +767,9 @@ func QueuedText(on capture.WaitingOn) string {
 }
 
 // cleanup removes every local file and the content (FR-012); the identity
-// needed for dedupe stays. Policy.Next clears SendNewReply when
+// needed for dedupe stays. A microphone recording with no speech has no
+// other copy, so its files are moved to the hold area as <id>.wav
+// (localName) instead (FR-210b). Policy.Next clears SendNewReply when
 // finalize_reply fails permanently and the step advances, so the new reply it
 // asked for is delivered here, before anything is erased.
 func (s *stepRunner) cleanup(ctx context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
@@ -761,8 +783,14 @@ func (s *stepRunner) cleanup(ctx context.Context, c capture.Capture) (capture.Ca
 	for i := range c.Files {
 		f := &c.Files[i]
 		if f.LocalPath != "" {
-			if err := s.d.Files.Remove(f.LocalPath); err != nil {
-				s.log(c, "file remove failed", err)
+			var err error
+			if c.NoSpeech && c.Source == capture.SourceMic {
+				err = s.d.Files.Hold(f.LocalPath, localName(c.ID, *f))
+			} else {
+				err = s.d.Files.Remove(f.LocalPath)
+			}
+			if err != nil {
+				s.log(c, "file cleanup failed", err)
 
 				return c, capture.Temporary("file store: " + err.Error())
 			}
@@ -785,8 +813,14 @@ func holdsAudio(c capture.Capture) bool {
 	return holdsFile(c) && !c.MinimalNote
 }
 
+// textNoSpeech is the reply for a transcript with no speech (FR-210a).
+const textNoSpeech = "🔇 no speech heard — not saved"
+
 // replyText builds the final reply (contracts/telegram-ux.md), HTML-escaped.
 func replyText(c capture.Capture) string {
+	if c.NoSpeech {
+		return textNoSpeech
+	}
 	link := `<a href="` + html.EscapeString(c.NoteURL) + `">open</a>`
 	if c.Kind == capture.KindFiles {
 		return filesReplyText(c, link)
@@ -830,6 +864,8 @@ const (
 	extWAV  = ".wav"
 	extFLAC = ".flac"
 	extWebM = ".webm"
+
+	mimeWAV = "audio/wav"
 )
 
 // localName is "<id>.<ext>" for the first file and "<id>-<position>.<ext>"
@@ -853,7 +889,7 @@ func audioExt(mime string) string {
 		return extMP3
 	case "audio/mp4", "audio/m4a", "audio/x-m4a", "audio/aac":
 		return extM4A
-	case "audio/wav", "audio/x-wav", "audio/wave":
+	case mimeWAV, "audio/x-wav", "audio/wave":
 		return extWAV
 	case "audio/flac", "audio/x-flac":
 		return extFLAC
@@ -885,7 +921,7 @@ func audioMime(name string) string {
 	case extM4A:
 		return "audio/mp4"
 	case extWAV:
-		return "audio/wav"
+		return mimeWAV
 	case extFLAC:
 		return "audio/flac"
 	case extWebM:

@@ -453,3 +453,130 @@ func TestDocumentErrorsNeverContainValues(t *testing.T) {
 		}
 	}
 }
+
+const fakeMicToken = "FAKE-0123456789abcdef0123456789abcdef"
+
+func TestParseMicDefaults(t *testing.T) {
+	c, err := Parse(baseEnv())
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	checks := []struct {
+		name      string
+		got, want any
+	}{
+		{"MicUploadToken", c.MicUploadToken, ""},
+		{"MicUploadMaxBytes", c.MicUploadMaxBytes, int64(31457280)},
+		{"MicNotifyChatID", c.MicNotifyChatID, int64(111)},
+		{"MicNoSpeechHold", c.MicNoSpeechHold, 168 * time.Hour},
+		{"MicSilenceAlert", c.MicSilenceAlert, 5 * time.Minute},
+	}
+	for _, ch := range checks {
+		if ch.got != ch.want {
+			t.Errorf("%s = %v, want %v", ch.name, ch.got, ch.want)
+		}
+	}
+}
+
+func TestParseMicOverrides(t *testing.T) {
+	c, err := Parse(with(
+		"MIC_UPLOAD_TOKEN", fakeMicToken,
+		"MIC_UPLOAD_MAX_BYTES", "1048576",
+		"MIC_NOTIFY_CHAT_ID", "-1001234567890",
+		"MIC_NOSPEECH_HOLD", "2h",
+		"MIC_SILENCE_ALERT", "10m",
+	))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if c.MicUploadToken != fakeMicToken || c.MicUploadMaxBytes != 1<<20 ||
+		c.MicNotifyChatID != -1001234567890 || c.MicNoSpeechHold != 2*time.Hour ||
+		c.MicSilenceAlert != 10*time.Minute {
+		t.Errorf("unexpected mic settings: %+v", c)
+	}
+}
+
+func TestParseMicNotifyDefaultsToDigestChat(t *testing.T) {
+	c, err := Parse(with("DIGEST_CHAT_ID", "-1001234567890", "MIC_UPLOAD_TOKEN", fakeMicToken))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if c.MicNotifyChatID != -1001234567890 {
+		t.Errorf("MicNotifyChatID = %d, want the digest chat", c.MicNotifyChatID)
+	}
+}
+
+func TestParseMicErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{"short token", with("MIC_UPLOAD_TOKEN", "short"), "config: MIC_UPLOAD_TOKEN: "},
+		{"token 31 chars", with("MIC_UPLOAD_TOKEN", strings.Repeat("a", 31)), "config: MIC_UPLOAD_TOKEN: "},
+		{"max bytes bad", with("MIC_UPLOAD_MAX_BYTES", "lots"), "config: MIC_UPLOAD_MAX_BYTES: "},
+		{"max bytes too small", with("MIC_UPLOAD_MAX_BYTES", "1048575"), "config: MIC_UPLOAD_MAX_BYTES: "},
+		{"max bytes too large", with("MIC_UPLOAD_MAX_BYTES", "1073741825"), "config: MIC_UPLOAD_MAX_BYTES: "},
+		{"bad chat id", with("MIC_NOTIFY_CHAT_ID", "x"), "config: MIC_NOTIFY_CHAT_ID: "},
+		{
+			"zero chat with token",
+			with("MIC_UPLOAD_TOKEN", fakeMicToken, "MIC_NOTIFY_CHAT_ID", "0"),
+			"config: MIC_NOTIFY_CHAT_ID: ",
+		},
+		{"hold too short", with("MIC_NOSPEECH_HOLD", "59m"), "config: MIC_NOSPEECH_HOLD: "},
+		{"hold too long", with("MIC_NOSPEECH_HOLD", "2161h"), "config: MIC_NOSPEECH_HOLD: "},
+		{"hold bad", with("MIC_NOSPEECH_HOLD", "soon"), "config: MIC_NOSPEECH_HOLD: "},
+		{"alert too short", with("MIC_SILENCE_ALERT", "59s"), "config: MIC_SILENCE_ALERT: "},
+		{"alert too long", with("MIC_SILENCE_ALERT", "25h"), "config: MIC_SILENCE_ALERT: "},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse(tt.env)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error %q lacks %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseMicBoundsAccepted(t *testing.T) {
+	_, err := Parse(with(
+		"MIC_UPLOAD_TOKEN", strings.Repeat("a", 32), "MIC_UPLOAD_MAX_BYTES", "1048576",
+		"MIC_NOSPEECH_HOLD", "1h", "MIC_SILENCE_ALERT", "1m",
+	))
+	if err != nil {
+		t.Fatalf("lower bounds: %v", err)
+	}
+	_, err = Parse(with(
+		"MIC_UPLOAD_MAX_BYTES", "1073741824", "MIC_NOSPEECH_HOLD", "2160h", "MIC_SILENCE_ALERT", "24h",
+	))
+	if err != nil {
+		t.Fatalf("upper bounds: %v", err)
+	}
+}
+
+func TestMicErrorsNeverContainValues(t *testing.T) {
+	_, err := Parse(with(
+		"MIC_UPLOAD_TOKEN", "short",
+		"MIC_UPLOAD_MAX_BYTES", secretValue,
+		"MIC_NOTIFY_CHAT_ID", secretValue,
+		"MIC_NOSPEECH_HOLD", secretValue,
+		"MIC_SILENCE_ALERT", secretValue,
+	))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if strings.Contains(err.Error(), secretValue) || strings.Contains(err.Error(), "short") {
+		t.Errorf("error leaks a value: %v", err)
+	}
+	for _, v := range []string{
+		"MIC_UPLOAD_TOKEN", "MIC_UPLOAD_MAX_BYTES", "MIC_NOTIFY_CHAT_ID", "MIC_NOSPEECH_HOLD", "MIC_SILENCE_ALERT",
+	} {
+		if !strings.Contains(err.Error(), "config: "+v+": ") {
+			t.Errorf("error lacks %s: %v", v, err)
+		}
+	}
+}

@@ -44,6 +44,27 @@ type Input struct {
 	WorkerAlive bool
 	StoreOK     bool
 	LastDigest  string // date of the last digest sent (YYYY-MM-DD); empty if none
+
+	RecorderAlerts []RecorderAlert // every known recorder; empty when the mic API is off
+}
+
+// RecorderAlert is one recorder and its outstanding conditions: Alert is
+// "ok" (or empty) for none, else the condition names joined by commas, such
+// as "missing_receiver,storage_full".
+type RecorderAlert struct {
+	Name     string
+	Alert    string
+	LastSeen time.Time
+}
+
+// outstanding reports whether the recorder has any condition raised.
+func (r RecorderAlert) outstanding() bool { return r.Alert != "" && r.Alert != "ok" }
+
+// RecorderReport is the JSON form of a RecorderAlert.
+type RecorderReport struct {
+	Name     string `json:"name"`
+	Alert    string `json:"alert"`
+	LastSeen string `json:"last_seen"`
 }
 
 // Report is the verdict plus the JSON body of GET /healthz.
@@ -54,6 +75,8 @@ type Report struct {
 	WaitingOn        string `json:"waiting_on,omitempty"`
 	LastPollOK       string `json:"last_poll_ok,omitempty"`
 	LastDigest       string `json:"last_digest,omitempty"`
+
+	Recorders []RecorderReport `json:"recorders,omitempty"`
 }
 
 // Compute derives the report from the snapshot.
@@ -69,11 +92,18 @@ func Compute(in Input) Report {
 		r.LastPollOK = in.LastPollOK.UTC().Format(time.RFC3339)
 	}
 
+	degraded := pollStale(in)
+	for _, rec := range in.RecorderAlerts {
+		r.Recorders = append(r.Recorders, RecorderReport{
+			Name: rec.Name, Alert: rec.Alert, LastSeen: rec.LastSeen.UTC().Format(time.RFC3339),
+		})
+		degraded = degraded || rec.outstanding()
+	}
+
 	switch {
 	case !in.StoreOK || !in.WorkerAlive:
 		r.Status = StatusUnhealthy
-	case in.Pending > 0 && (in.Misconfig || in.OldestPendingAge > in.Threshold),
-		pollStale(in):
+	case in.Pending > 0 && (in.Misconfig || in.OldestPendingAge > in.Threshold), degraded:
 		r.Status = StatusDegraded
 	}
 

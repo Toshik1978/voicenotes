@@ -5,6 +5,7 @@ dotenv: ['.env']
 
 vars:
   BINARY: bin/voicenotes
+  MIC_BINARY: bin/voicenotes-mic
   # Coverage gate scope: the pure decision logic (config, pipeline steps,
   # language selection, enrichment, note rendering, digest composition, health).
   # The I/O adapters run against real external services and are excluded, though
@@ -15,7 +16,7 @@ vars:
   # for a -coverpkg pattern that matches nothing, so the list is passed
   # verbatim. With no statements to measure the profile is empty and the floor
   # check passes with a notice; it enforces 80% as soon as code exists.
-  COVERPKG: ./internal/config,./internal/capture,./internal/pipeline,./internal/language,./internal/enrich,./internal/render,./internal/digest,./internal/health
+  COVERPKG: ./internal/config,./internal/capture,./internal/pipeline,./internal/language,./internal/enrich,./internal/render,./internal/digest,./internal/health,./internal/mic,./internal/recorder,./internal/micapi
   BUILDSTAMP:
     sh: date +%Y/%m/%d_%H:%M:%S
   COMMIT:
@@ -62,6 +63,23 @@ tasks:
     generates:
       - "{{.BINARY}}"
 
+  build:mic:
+    desc: Compile the voicenotes-mic recorder binary (cgo, for the malgo audio capture)
+    env:
+      CGO_ENABLED: "1"
+    cmds:
+      - rm -f {{.MIC_BINARY}}
+      - >-
+        go build -v
+        -ldflags "-X main.Buildstamp={{.BUILDSTAMP}} -X main.Commit={{.COMMIT}}"
+        -o {{.MIC_BINARY}} ./cmd/voicenotes-mic
+    generates:
+      - "{{.MIC_BINARY}}"
+
+  release:snapshot:
+    desc: Build the recorder release archives into dist/ as release.yml does, publishing nothing (needs goreleaser and gcc-aarch64-linux-gnu)
+    cmd: goreleaser release --snapshot --clean --skip=publish
+
   run:
     desc: Build and run the service (loads .env)
     deps: [build]
@@ -71,7 +89,7 @@ tasks:
     desc: Remove build artifacts and test cache
     cmds:
       - go clean -testcache
-      - rm -f {{.BINARY}} coverage.txt
+      - rm -rf {{.BINARY}} {{.MIC_BINARY}} coverage.txt dist
 
   changelog:
     desc: Prepend the generated commit list for the next release to CHANGELOG.md (TAG=vX.Y.Z)

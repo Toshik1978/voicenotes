@@ -47,6 +47,8 @@ func (r *lockedReplier) Edit(_ context.Context, chat, msg int64, text string) (i
 	return msg, nil
 }
 
+func (r *lockedReplier) Delete(_ context.Context, _, _ int64) error { return nil }
+
 func (r *lockedReplier) result() (sends []string, edits []sendCall) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

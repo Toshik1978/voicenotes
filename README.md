@@ -13,6 +13,9 @@ and replies with a link. Each morning it sends a digest of the notes that are st
 It also saves photos and files. A document or photo becomes a note with the original attached, and
 a short hint describing it ([Photos, files and albums](#photos-files-and-albums)).
 
+A wireless microphone captures too: tap the transmitter, talk, tap again, and the recording becomes
+a note the same way a voice message does ([Wireless microphone](#wireless-microphone)).
+
 ## How it works
 
 1. The bot receives a voice or text message from an allowlisted Telegram user (long polling, no
@@ -80,6 +83,189 @@ note. Voice and text captures behave as before and are never batched.
 A docling-serve container and a vision-capable model are a suggested setup, not a requirement: any
 server speaking the same API will do, and no image, version, OCR engine or model is mandated.
 
+## Wireless microphone
+
+A DJI Mic Mini 2S transmitter and its Mobile Receiver (USB-C) can feed VoiceNotes without a phone.
+Plug the receiver into a Linux host, tap the transmitter's record button, talk, and tap again. The
+recording is saved and goes through the same pipeline as a Telegram voice message: the chat that
+receives microphone replies shows a silent `🎙 recording…` at the first tap, which the pipeline later
+edits to `✓ saved · open`. The note is `#inbox`, carries the WAV and is timed at the first tap.
+
+Two programs take part:
+
+- **`voicenotes`** (the service) accepts uploads on `/mic/v1/` of its `HTTP_ADDR` listener. The
+  endpoints exist only when `MIC_UPLOAD_TOKEN` is set; otherwise they return 404.
+- **`voicenotes-mic`** (the recorder) runs on the host the receiver is plugged into. It records
+  16 kHz mono WAV, keeps it in a local spool until the service has stored it, and uploads it oldest
+  first with backoff. It is a separate binary because it links the audio library with cgo; the
+  service stays static and CGO-free.
+
+### What the receiver must do
+
+The recorder needs two things from the receiver, both over USB: an ALSA capture device for the audio,
+and an input device that reports the transmitter's record button as `KEY_VOLUMEUP` (one press and
+release per tap). It grabs that input device exclusively, so a tap does not change the host's volume.
+The hardware check below confirms both before anything is installed. When auto-discovery picks the
+wrong devices, name them with `MIC_CAPTURE_DEVICE` and `MIC_INPUT_DEVICE` (set both or neither).
+
+### Hardware check
+
+On the host the receiver is plugged into:
+
+```sh
+sudo apt install libasound2t64 evtest alsa-utils
+lsusb | grep -i 2ca3      # expect 2ca3:4011
+arecord -l                # a capture device for the receiver
+sudo evtest               # pick the receiver's "Consumer Control", tap the transmitter:
+                          # expect EV_KEY KEY_VOLUMEUP value 1, then value 0, per tap
+arecord -D hw:<card>,0 -f S16_LE -r 48000 -c 2 -d 5 test.wav && aplay test.wav
+```
+
+If `lsusb` shows a different ID, or no `KEY_VOLUMEUP` events appear, stop and report it before going
+further.
+
+### Install the recorder
+
+Each release attaches `voicenotes-mic_<version>_linux_amd64.tar.gz` and
+`voicenotes-mic_<version>_linux_arm64.tar.gz` (built on Ubuntu 24.04, so they run on 26.04), and
+`voicenotes-mic_<version>_checksums.txt` lists their SHA-256 sums. Each holds the binary, `LICENSE`, `voicenotes-mic.service` and `voicenotes-mic.env.example`; the last two
+are also in [`deploy/`](deploy). Download the tarball for the host's architecture from the
+[releases page](https://github.com/Toshik1978/voicenotes/releases), unpack it and run, from the
+unpacked directory:
+
+```sh
+sudo apt install libasound2t64
+sudo install -m 0755 voicenotes-mic /usr/local/bin/
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin --groups audio,input voicenotes-mic
+sudo install -m 0600 voicenotes-mic.env.example /usr/local/etc/voicenotes-mic.env   # then edit it
+sudo install -m 0644 voicenotes-mic.service /etc/systemd/system/
+sudo systemctl enable --now voicenotes-mic
+```
+
+The system user must be in the `audio` group (capture device) and the `input` group (the receiver's
+key events). The unit also adds both as supplementary groups, keeps the spool in
+`/var/lib/voicenotes-mic` (`StateDirectory`, mode `0700`) and restarts the recorder on failure. The recorder
+refuses to start on an invalid setting and names it, never its value.
+
+Edit `/usr/local/etc/voicenotes-mic.env` (see [`deploy/voicenotes-mic.env.example`](deploy/voicenotes-mic.env.example)
+for every setting and its default). `MIC_SERVER_URL` and `MIC_UPLOAD_TOKEN` are required; the token
+must equal the service's `MIC_UPLOAD_TOKEN`.
+
+### Direct mode and Pi mode
+
+- **Direct mode.** The receiver is plugged into the host that runs the service. Set
+  `MIC_SERVER_URL=http://127.0.0.1:8080` (the service's `HTTP_ADDR` port).
+- **Pi mode (proxy).** The receiver is plugged into a small box, for example a Raspberry Pi with
+  64-bit Ubuntu 26.04, which records and uploads to the server over the network. Set
+  `MIC_SERVER_URL=http://voicenotes.example.org:8080`, and publish the service's port (`-p 8080:8080`).
+  The listener also serves `/healthz`: keep it on a trusted network or behind a TLS reverse proxy, and
+  use an `https://` URL when it crosses an untrusted one, since the bearer token travels in every
+  request. A reverse proxy's request body limit must be at least `MIC_UPLOAD_MAX_BYTES` (for nginx,
+  `client_max_body_size 30m` for the default); nginx's default of `1m` refuses every recording with
+  413, and a refused recording is kept but not retried until the recorder restarts.
+
+Notes for the Pi:
+
+- Use 5 GHz Wi-Fi or Ethernet. The microphone link uses the 2.4 GHz band, which a 2.4 GHz Wi-Fi
+  connection would crowd.
+- Disable the Pi's own Bluetooth for the same reason: add `dtoverlay=disable-bt` to the boot
+  configuration (`/boot/firmware/config.txt` on Ubuntu) and reboot.
+- Keep the clock synchronised (the Ubuntu default, `systemd-timesyncd`). The service stamps check-ins
+  with its own clock, but the first-tap time is taken from the recorder's.
+
+Nothing is lost when something breaks. A recording is written to the spool as it is made, so a crash
+or a lost receiver keeps what was recorded; if the service is down, uploads wait in the spool and are
+sent in order when it returns, with no start message for recordings that finished while it was away.
+A recording shorter than `MIC_MIN_LENGTH` (a stray double tap) discards the start message and creates no capture.
+
+### Service settings
+
+Set these on the service (all optional except `MIC_UPLOAD_TOKEN`, which turns the feature on):
+
+| Variable | Required | Default | Secret | Meaning |
+|---|---|---|---|---|
+| `MIC_UPLOAD_TOKEN` | to enable | unset (feature off) | yes | Bearer token the recorder sends; at least 32 characters. Generate one, for example with `openssl rand -hex 32` |
+| `MIC_NOTIFY_CHAT_ID` | no | `DIGEST_CHAT_ID` | no | Chat for start messages and recorder alerts; must be non-zero once uploads are on |
+| `MIC_UPLOAD_MAX_BYTES` | no | `31457280` (30 MiB) | no | `1 MiB`-`1 GiB`; larger uploads get 413. The default covers about 16 minutes of 16 kHz mono audio, above the recorder's 12 minute maximum |
+| `MIC_NOSPEECH_HOLD` | no | `168h` (7 days) | no | `1h`-`2160h`; how long microphone audio with no speech is kept |
+| `MIC_SILENCE_ALERT` | no | `5m` | no | `1m`-`24h`; a recorder not heard from for this long raises an alert |
+
+The recorder reads its own settings, listed in the example file: for instance `MIC_RECORDER_NAME`
+(default: the hostname), `MIC_MIN_LENGTH` (`2s`), `MIC_MAX_LENGTH` (`10m`, maximum `12m`),
+`MIC_SPOOL_MIN_FREE` (256 MiB), `MIC_CHECKIN_INTERVAL` (`1m`) and `MIC_HTTP_ADDR`
+(`127.0.0.1:8081`). `MIC_MIN_LENGTH` must be shorter than `MIC_MAX_LENGTH`. Keep
+`MIC_CHECKIN_INTERVAL` below the service's `MIC_SILENCE_ALERT`: the two live on different hosts and
+cannot be checked against each other, and a check-in interval at or above the silence threshold
+makes the recorder flap between "not heard from" and "back online".
+
+### No speech
+
+A transcript with no speech creates no note, from any source. The `⏳` reply becomes
+`🔇 no speech heard — not saved`. A Telegram voice message's audio is deleted, because Telegram keeps
+the original. A microphone recording is the only copy, so its audio is moved to
+`$DATA_DIR/nospeech/` and deleted after `MIC_NOSPEECH_HOLD`; listen to it there if a recording was
+dropped by mistake. A transcription that fails is a different case and still produces a placeholder
+note.
+
+### Alerts and health
+
+The recorder checks in every `MIC_CHECKIN_INTERVAL`, and the service sends one silent message to
+`MIC_NOTIFY_CHAT_ID` when a condition starts and one when it clears. A recorder alerts only after its
+first check-in.
+
+| Condition | Alert | Recovery |
+|---|---|---|
+| Receiver unplugged, or a recording could not start or finish | `🎙 <name>: receiver not connected — taps won't record` | `🎙 <name>: receiver connected` |
+| Spool below `MIC_SPOOL_MIN_FREE` | `🎙 <name>: storage full — new recordings refused` | `🎙 <name>: storage OK` |
+| No check-in for `MIC_SILENCE_ALERT` | `🎙 <name>: not heard from since HH:MM` | `🎙 <name>: back online` |
+
+The recorder also reports its receiver as missing while the audio device cannot be opened (for
+example because a sound server holds it), until a recording starts again, and while a finished
+recording could not be closed in the spool, until one is. Its own `/healthz` says which: see below.
+
+Each condition is tracked on its own, so a receiver unplugged while storage is full still alerts,
+and each recovery is sent when its condition clears. While a recorder is silent, only the silence is
+reported; when it comes back, "back online" is followed by whatever has changed meanwhile.
+
+The service's `/healthz` gains a `recorders` list (`name`, `alert`, `last_seen`; `alert` is `ok`
+or the outstanding conditions joined by commas, such as `missing_receiver,storage_full`) and
+reports `degraded` while any recorder has an alert outstanding. The recorder serves its own
+`GET /healthz` on `MIC_HTTP_ADDR` (default `127.0.0.1:8081`, loopback only): `receiver`, `storage`,
+`pending`, `rejected` and so on; `degraded` for a missing receiver, full storage, a spool error
+(`storage: error`, also set when a finished recording could not be closed), a recording that could
+not start (`audio_error: true`), a rejected recording, a refused token (`misconfigured: true`, from
+an upload or a check-in) or a recording stuck longer than `MIC_PENDING_THRESHOLD`, and `unhealthy`
+(HTTP 503) once the recorder's loops have stopped.
+
+`voicenotes-mic health` calls that endpoint (a `MIC_HTTP_ADDR` with an empty or unspecified host is
+reached over loopback), prints the body and exits `0` on HTTP 200 and `1` otherwise, including when the
+request fails or times out after 5 seconds. `voicenotes-mic health --strict` also exits `1` unless the
+status is `ok`, so `degraded` fails it. A usage error exits `2`: an unknown command (`-h` included)
+prints `usage: voicenotes-mic [run|health|version]`, and `voicenotes-mic health -h` or an unknown flag
+prints the `health` flags.
+
+The service forgets a recorder that has not checked in for 30 days (the daily purge logs
+`recorder forgotten` with its name), so a renamed or retired recorder stops keeping `/healthz`
+degraded. To forget one sooner, stop the service, delete its row and start it again:
+
+```sh
+docker stop voicenotes
+sqlite3 <DATA_DIR>/voicenotes.db "DELETE FROM mic_recorders WHERE name='old-name';"
+docker start voicenotes
+```
+
+`<DATA_DIR>` is the host directory behind the container's `DATA_DIR` (for a named volume, see
+`docker volume inspect voicenotes-data`). Delete the row rather than editing it; a recorder that
+checks in again is simply added back.
+
+```sh
+curl -s 127.0.0.1:8081/healthz
+```
+
+The upload protocol between the two programs is in
+[`specs/003-usb-mic-capture/contracts/mic-http-api.md`](specs/003-usb-mic-capture/contracts/mic-http-api.md),
+and the step-by-step validation in [`specs/003-usb-mic-capture/quickstart.md`](specs/003-usb-mic-capture/quickstart.md).
+
 ## Quick start
 
 Create a `.env` file from the template and fill in real values (the file is git-ignored):
@@ -129,8 +315,9 @@ On upgrade, a `$DATA_DIR/audio` directory left by an earlier version is renamed 
 the entries are moved across without overwriting, and `audio/` is removed once empty. Nothing needs
 to be done by hand.
 
-Port 8080 serves health only and does not need to be published; omit `-p` unless a monitor outside
-the container reads it.
+Port 8080 serves health, and the microphone API when `MIC_UPLOAD_TOKEN` is set. It does not need to be
+published unless a monitor or a recorder reaches it. A recorder on the same host (direct mode) needs
+`-p 127.0.0.1:8080:8080`, loopback only; a Pi on the network needs a wider binding such as `-p 8080:8080`.
 
 For a host bind mount instead of a named volume, the directory must be writable by the container
 user:
@@ -238,11 +425,24 @@ hints.
 | `DIGEST_CATCHUP` | no | `3h` | no | Send a missed digest if started within this window |
 | `DIGEST_MAX_NOTES` | no | `30` | no | Lines listed before "...and N more" |
 
+### Wireless microphone (optional)
+
+Off unless `MIC_UPLOAD_TOKEN` is set. See [Wireless microphone](#wireless-microphone) for the meaning
+of each setting.
+
+| Variable | Required | Default | Secret | Meaning |
+|---|---|---|---|---|
+| `MIC_UPLOAD_TOKEN` | no | unset (feature off) | yes | Bearer token shared with the recorder; at least 32 characters |
+| `MIC_NOTIFY_CHAT_ID` | no | `DIGEST_CHAT_ID` | no | Chat for start messages and recorder alerts |
+| `MIC_UPLOAD_MAX_BYTES` | no | `31457280` | no | `1048576`-`1073741824`; maximum upload size in bytes |
+| `MIC_NOSPEECH_HOLD` | no | `168h` | no | `1h`-`2160h`; how long microphone audio with no speech is kept in `nospeech/` |
+| `MIC_SILENCE_ALERT` | no | `5m` | no | `1m`-`24h`; silence from a recorder that raises an alert |
+
 ### Runtime
 
 | Variable | Required | Default | Secret | Meaning |
 |---|---|---|---|---|
-| `DATA_DIR` | no | `/data` | no | SQLite file and queued audio and files (`files/`); mount a persistent volume here |
+| `DATA_DIR` | no | `/data` | no | SQLite file and queued audio and files (`files/`), plus held no-speech microphone audio (`nospeech/`); mount a persistent volume here |
 | `HTTP_ADDR` | no | `:8080` | no | Health listener; must listen on loopback (`:port` or `0.0.0.0:port`) for `voicenotes health` |
 | `HEALTH_PENDING_THRESHOLD` | no | `30m` | no | Oldest unfinished capture older than this makes health `degraded` |
 | `RETRY_MAX_INTERVAL` | no | `5m` | no | Backoff cap for dependency retries |
@@ -343,6 +543,8 @@ sound. Messages from users not in `TELEGRAM_ALLOWED_USERS` get no reply.
 | Files saved, some not kept | `⚠ saved, 1 of 4 not kept — scan.pdf (<reason>) · open` |
 | Files saved, some not attached | `⚠ saved, 1 of 4 not attached — photo 3 (<reason>) · open` |
 | No file could be kept | `⚠ files not kept — scan.pdf (<reason>), photo 2 (<reason>) · please send them again · open` |
+| Microphone recording started | `🎙 recording…` (silent, to `MIC_NOTIFY_CHAT_ID`; becomes the outcome reply) |
+| Transcript has no speech (any source) | `🔇 no speech heard — not saved` |
 | Unsupported message type | `VoiceNotes takes voice, text, photos and files.` |
 | Single file over 20 MB | `⚠ too large for Telegram bots (max 20 MB) — not saved.` |
 | Storing failed | `⚠ not saved — please send it again.` |
@@ -358,12 +560,13 @@ sent.
 
 `GET /healthz` on `HTTP_ADDR` (default `:8080`) needs no authentication and should not be exposed
 publicly. The body is JSON with `status`, `pending`, `oldest_pending_age`, `waiting_on`,
-`last_poll_ok` and `last_digest` (the local date of the last digest actually sent).
+`last_poll_ok` and `last_digest` (the local date of the last digest actually sent), plus a
+`recorders` list when a microphone recorder has checked in.
 
 | Status | HTTP | When |
 |---|---|---|
 | `ok` | 200 | Everything is fine |
-| `degraded` | 200 | The oldest unfinished capture is older than `HEALTH_PENDING_THRESHOLD` or is waiting on a misconfiguration (401, 403, 404), or Telegram polling has failed for longer than that |
+| `degraded` | 200 | The oldest unfinished capture is older than `HEALTH_PENDING_THRESHOLD` or is waiting on a misconfiguration (401, 403, 404), or Telegram polling has failed for longer than that, or a microphone recorder has an alert outstanding |
 | `unhealthy` | 503 | The local store is unusable, or the worker loop has stopped |
 
 `degraded` returns 200 on purpose, so Docker does not restart the service because a dependency is
@@ -380,7 +583,7 @@ single non-loopback IP, or the `HEALTHCHECK` fails and the container shows as un
 | Item | Value |
 |---|---|
 | Volume | `/data`: a small SQLite file, plus audio and files (in `files/`) only while captures are queued. Must be writable by `65532:65532` |
-| Port | `8080/tcp`: health only |
+| Port | `8080/tcp`: health, and the microphone upload API when `MIC_UPLOAD_TOKEN` is set |
 
 ## Development
 
@@ -399,11 +602,12 @@ Before any commit the gate must pass:
 | `golangci-lint fmt --diff` | no output |
 | `task test:coverage` | tests pass with `-race`, total coverage at or above 80% |
 | `task build` | `bin/voicenotes` builds with `CGO_ENABLED=0` |
+| `task build:mic` | `bin/voicenotes-mic` builds with cgo (`CGO_ENABLED=1`) |
 
 Other tasks: `task format`, `task test`, `task run` (builds and runs, loading `.env` if present),
 `task clean` and `task changelog TAG=vX.Y.Z`. Commits follow Conventional Commits. The binding
-project rules are in `.specify/memory/constitution.md`; the feature specification is under
-`specs/001-voice-capture-notes/`.
+project rules are in `.specify/memory/constitution.md`; the feature specifications are under
+`specs/`.
 
 ### Releases
 
@@ -411,7 +615,9 @@ Releases are cut by pushing a `vX.Y.Z` tag. Write the release notes first with `
 TAG=vX.Y.Z` and commit them; `.github/scripts/extract-changelog.sh vX.Y.Z` previews the release
 body. The tag triggers `.github/workflows/release.yml`, which publishes the multi-arch image as
 `ghcr.io/toshik1978/voicenotes:<version>` (the tag without its `v`) and `:latest`, attaches a
-build provenance attestation and creates the GitHub release from the `CHANGELOG.md` section. A
+build provenance attestation and creates the GitHub release from the `CHANGELOG.md` section, with
+`voicenotes-mic_<version>_linux_amd64.tar.gz` and `..._linux_arm64.tar.gz` attached (see
+[Wireless microphone](#wireless-microphone)). A
 tag without a matching section fails before anything is pushed. Pushes to `main` only run CI.
 
 ## Contributing

@@ -75,12 +75,18 @@ type Ingester struct {
 	store Inserter
 	waker Waker
 
+	// recordings and notifyChat enable IngestRecording (WithRecordings).
+	recordings   RecordingInserter
+	notifyChatID int64
+
 	files FileAppender
 	quiet time.Duration
 	// fetch and held keep a batch's first item locally before its ack.
 	fetch Downloader
 	held  FileStore
 	log   *zap.Logger
+	// now is the service clock (default time.Now).
+	now func() time.Time
 }
 
 // IngesterOption configures optional ingest features.
@@ -91,6 +97,16 @@ type IngesterOption func(*Ingester)
 // fetched with fetch and written to held before its ack (Constitution VI).
 func WithFiles(files FileAppender, quiet time.Duration, fetch Downloader, held FileStore) IngesterOption {
 	return func(i *Ingester) { i.files, i.quiet, i.fetch, i.held = files, quiet, fetch, held }
+}
+
+// WithClock sets the service clock that makes a recording due (default
+// time.Now).
+func WithClock(now func() time.Time) IngesterOption {
+	return func(i *Ingester) {
+		if now != nil {
+			i.now = now
+		}
+	}
 }
 
 // WithLog sets the logger for ingest problems that cannot fail an ingest
@@ -112,7 +128,7 @@ func NewIngester(store Inserter, waker Waker, opts ...IngesterOption) (*Ingester
 		return nil, errors.New("pipeline: nil waker")
 	}
 
-	i := &Ingester{store: store, waker: waker, log: zap.NewNop()}
+	i := &Ingester{store: store, waker: waker, log: zap.NewNop(), now: time.Now}
 	for _, opt := range opts {
 		opt(i)
 	}
@@ -133,7 +149,15 @@ func NewIngester(store Inserter, waker Waker, opts ...IngesterOption) (*Ingester
 // the insert, so no scan can see the row without it, and it lives only in
 // memory: a restart drops it with nothing left to wait for.
 func (i *Ingester) Ingest(ctx context.Context, c capture.Capture, ack Ack) (capture.Capture, error) {
-	stored, err := i.insertAndAck(ctx, c, ack)
+	return i.ingest(ctx, c, ack, i.store.Insert)
+}
+
+// ingest is Ingest with the insert function chosen by the caller.
+func (i *Ingester) ingest(
+	ctx context.Context, c capture.Capture, ack Ack,
+	insert func(context.Context, *capture.Capture) error,
+) (capture.Capture, error) {
+	stored, err := i.insertAndAck(ctx, c, ack, insert)
 	if err != nil {
 		return capture.Capture{}, err
 	}
@@ -142,9 +166,12 @@ func (i *Ingester) Ingest(ctx context.Context, c capture.Capture, ack Ack) (capt
 	return stored, nil
 }
 
-func (i *Ingester) insertAndAck(ctx context.Context, c capture.Capture, ack Ack) (capture.Capture, error) {
+func (i *Ingester) insertAndAck(
+	ctx context.Context, c capture.Capture, ack Ack,
+	insert func(context.Context, *capture.Capture) error,
+) (capture.Capture, error) {
 	return i.storeAndAck(ctx, c, ack, func() (capture.Capture, bool, error) {
-		if err := i.store.Insert(ctx, &c); err != nil {
+		if err := insert(ctx, &c); err != nil {
 			return capture.Capture{}, false, fmt.Errorf("insert: %w", err)
 		}
 

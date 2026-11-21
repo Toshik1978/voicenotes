@@ -16,18 +16,20 @@ Before any commit, all of these must hold:
 | `golangci-lint fmt --diff` | no output |
 | `task test:coverage` | tests pass with `-race`, total coverage at or above 80% |
 | `task build` | `bin/voicenotes` builds with `CGO_ENABLED=0` |
+| `task build:mic` | `bin/voicenotes-mic` builds with cgo (`CGO_ENABLED=1`) |
 
 Other tasks: `task setup` (download modules), `task format` (apply formatters
 and autofixes), `task test` (plain verbose run), `task run` (builds, loads
-`.env` if present and runs the binary), `task clean`, and `task changelog
-TAG=vX.Y.Z` (prepend the generated section to `CHANGELOG.md`).
+`.env` if present and runs the binary), `task clean`, `task changelog
+TAG=vX.Y.Z` (prepend the generated section to `CHANGELOG.md`), and `task release:snapshot`
+(build the recorder release archives into `dist/` with GoReleaser, publishing nothing).
 
 Do not bypass hooks with `--no-verify`.
 
 ### The coverage scope
 
 `COVERPKG` in `Taskfile.yml` and `-coverpkg` in `.github/workflows/ci.yml` must
-stay identical: `internal/{config,capture,pipeline,language,enrich,render,digest,health}`.
+stay identical: `internal/{config,capture,pipeline,language,enrich,render,digest,health,mic,recorder,micapi}`.
 They hold the pure decision logic. I/O adapters that only run against real
 external services are outside the scope, though their tests still run. Packages
 named there may not exist yet; Go only warns for a pattern that matches
@@ -45,14 +47,18 @@ command wires all three stages:
 | `pre-commit` | `golangci-lint fmt --diff` |
 | `pre-push` | `task lint` |
 
-CI (`ci.yml`) runs lint, the tests with the 80% coverage gate, and a
-`CGO_ENABLED=0` build; it never publishes. On pushes to `main` it updates the
-Tests and Coverage README badges in a public gist (repository secrets
-`GIST_ID` and `GIST_SECRET_TOKEN`, a token with the `gist` scope); on pull
+CI (`ci.yml`) runs lint, the tests with the 80% coverage gate, a
+`CGO_ENABLED=0` build, and a `build-mic` job that builds the cgo recorder
+natively on `ubuntu-24.04` and `ubuntu-24.04-arm`, and a `release-snapshot` job that builds the
+recorder release archives with GoReleaser; it never publishes. On
+pushes to `main` it updates the Tests and Coverage README badges in a public
+gist (repository secrets `GIST_ID` and `GIST_SECRET_TOKEN`, a token with the `gist` scope); on pull
 requests it posts a sticky coverage comment. `release.yml` runs only on `v*` tags:
 it builds the release body from `CHANGELOG.md` via
 `.github/scripts/extract-changelog.sh`, pushes the multi-arch image as
-`<version>` and `latest`, and creates the GitHub release. `commit-lint.yml` re-runs the commit-msg hook over the
+`<version>` and `latest`, and creates the GitHub release with GoReleaser (`.goreleaser.yaml`), which
+attaches the `voicenotes-mic` archives for linux/amd64 and linux/arm64 (arm64 cross-compiled with
+`gcc-aarch64-linux-gnu`) and their checksums. `commit-lint.yml` re-runs the commit-msg hook over the
 pushed or PR range and must never gain a path filter.
 
 ## Commits
@@ -77,20 +83,26 @@ explicitly asks.** Scan unpushed changes for private data before pushing.
   pass.
 - Decision logic is pure (no I/O) and lives in packages inside the coverage
   scope; I/O sits in thin adapters behind small interfaces.
-- Builds are static and CGO-free; the Docker image is distroless.
+- The service (`voicenotes`) is static and CGO-free; its Docker image is
+  distroless. Only the recorder binary (`voicenotes-mic`) may use cgo, and only
+  in packages the service never imports (constitution IV).
 - Validate configuration at startup and name the offending setting, never its
   value. Secrets come only from the environment.
 - Never lose a capture: persist durably before acknowledging, keep every
   pipeline step idempotent, degrade to a placeholder note rather than drop.
+  The one exception: a successful transcript with no speech creates no note;
+  its audio is deleted only when the source keeps the original (Telegram) or
+  after a configured hold (microphone recordings).
 
 ## Dependencies
 
-The approved direct dependencies are exactly four:
+The approved direct dependencies are exactly five:
 
 - `gopkg.in/telebot.v4` (Telegram, long polling)
 - `go.uber.org/zap` (logging)
 - `github.com/caarlos0/env/v11` (environment parsing)
 - `modernc.org/sqlite` (CGO-free local state)
+- `github.com/gen2brain/malgo` (audio capture; cgo; used only by `voicenotes-mic`)
 
 Adding any other, or promoting an indirect one, needs the maintainer's explicit approval:
 state the package, what it solves and why the standard library is

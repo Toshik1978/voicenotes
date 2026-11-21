@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -22,6 +23,7 @@ import (
 	"github.com/Toshik1978/voicenotes/internal/enrich"
 	"github.com/Toshik1978/voicenotes/internal/health"
 	"github.com/Toshik1978/voicenotes/internal/memos"
+	"github.com/Toshik1978/voicenotes/internal/micapi"
 	"github.com/Toshik1978/voicenotes/internal/openai"
 	"github.com/Toshik1978/voicenotes/internal/pipeline"
 	"github.com/Toshik1978/voicenotes/internal/store/sqlite"
@@ -117,6 +119,11 @@ func build(cfg config.Config, log *zap.Logger, started time.Time) (*service, err
 	if err := os.MkdirAll(filesDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
+	// Microphone audio with no speech waits here for MIC_NOSPEECH_HOLD.
+	heldDir := filepath.Join(cfg.DataDir, pipeline.NoSpeechDir)
+	if err := os.MkdirAll(heldDir, 0o700); err != nil {
+		return nil, fmt.Errorf("create nospeech dir: %w", err)
+	}
 	db, err := sqlite.Open(cfg.DataDir)
 	if err != nil {
 		return nil, fmt.Errorf("open store: %w", err)
@@ -188,22 +195,72 @@ func wire(
 	if err != nil {
 		return nil, err
 	}
-	collector := health.NewCollector(health.CollectorConfig{
-		Queue: healthQueue{db: db}, Worker: bothLanes{mainWorker, docsWorker}, LastPoll: tg.LastPoll,
-		Clock: time.Now, Started: started, Threshold: cfg.HealthPendingThreshold,
-	})
+	collector := newCollector(cfg, db, bothLanes{mainWorker, docsWorker}, tg.LastPoll, started)
 	mux := http.NewServeMux()
 	mux.Handle("/healthz", health.Handler(collector))
+	micHandler := mountMic(mux, cfg, log, db, ingester, tg, filesDir)
+	// The sibling of filesDir, where DirFiles.Hold puts no-speech audio.
+	heldDir := filepath.Join(filepath.Dir(filesDir), pipeline.NoSpeechDir)
+	purger := purgerFor(cfg, db, tg, heldDir, log)
 
 	goroutines := append([]func(context.Context){
 		func(ctx context.Context) { tg.Run(ctx, handler) },
 		mainWorker.Run,
 		docsWorker.Run,
-		func(ctx context.Context) { serveHTTP(ctx, ln, mux, log) },
-		func(ctx context.Context) { pipeline.PurgeLoop(ctx, db, pipeline.PurgeInterval, time.Now, log) },
+		func(ctx context.Context) { serveAndDrain(ctx, ln, mux, micHandler, log) },
+		func(ctx context.Context) { pipeline.PurgeLoop(ctx, purger, pipeline.PurgeInterval, time.Now, log) },
 	}, digestRun...)
+	goroutines = append(goroutines, replyLoopRun(purger, log)...)
+	goroutines = append(goroutines, micAlertRun(cfg, log, db, tg)...)
 
 	return &service{goroutines: goroutines}, nil
+}
+
+// newCollector builds the health source. Recorders are reported only when
+// the microphone API is enabled.
+func newCollector(
+	cfg config.Config, db *sqlite.DB, worker health.Worker, lastPoll func() time.Time, started time.Time,
+) *health.Collector {
+	cc := health.CollectorConfig{
+		Queue: healthQueue{db: db}, Worker: worker, LastPoll: lastPoll,
+		Clock: time.Now, Started: started, Threshold: cfg.HealthPendingThreshold,
+	}
+	if cfg.MicUploadToken != "" {
+		cc.Recorders = healthRecorders{db: db}
+	}
+
+	return health.NewCollector(cc)
+}
+
+// serveAndDrain serves HTTP until ctx is cancelled, then lets the microphone
+// handler's in-flight start notices finish before the store closes.
+func serveAndDrain(ctx context.Context, ln net.Listener, mux http.Handler, mic *micapi.Handler, log *zap.Logger) {
+	serveHTTP(ctx, ln, mux, log)
+	if mic != nil {
+		mic.Wait()
+	}
+}
+
+// mountMic mounts the microphone API under /mic/v1/ when MIC_UPLOAD_TOKEN is
+// set and returns its handler; without a token nothing is mounted, so the
+// path answers 404, and it returns nil. No middleware wraps the mux, so the
+// Authorization header is never logged. opts are extra handler options
+// (tests inject a clock).
+func mountMic(
+	mux *http.ServeMux, cfg config.Config, log *zap.Logger, db *sqlite.DB,
+	ingest micapi.RecordingIngester, replier pipeline.Replier, filesDir string, opts ...micapi.Option,
+) *micapi.Handler {
+	if cfg.MicUploadToken == "" {
+		return nil
+	}
+	opts = append([]micapi.Option{micapi.WithLogger(log)}, opts...)
+	h := micapi.NewHandler(
+		micapi.Config{Token: cfg.MicUploadToken, MaxBytes: cfg.MicUploadMaxBytes, FilesDir: filesDir},
+		ingest, micapi.NewStarts(db, replier, cfg.MicNotifyChatID), db, opts...,
+	)
+	mux.Handle("/mic/v1/", h)
+
+	return h
 }
 
 // pipelineParts is the queue side of the service: the two lane workers and
@@ -237,8 +294,13 @@ func newPipeline(cfg config.Config, log *zap.Logger, db *sqlite.DB, deps pipelin
 	mainWorker.SetQueueNotifier(notifier)
 	docsWorker.SetQueueNotifier(notifier)
 
-	ingester, err := pipeline.NewIngester(db, wakeAll{mainWorker, docsWorker},
-		pipeline.WithFiles(db, cfg.BatchQuietPeriod, deps.Downloader, deps.Files), pipeline.WithLog(log))
+	opts := []pipeline.IngesterOption{
+		pipeline.WithFiles(db, cfg.BatchQuietPeriod, deps.Downloader, deps.Files), pipeline.WithLog(log),
+	}
+	if cfg.MicUploadToken != "" {
+		opts = append(opts, pipeline.WithRecordings(db, cfg.MicNotifyChatID))
+	}
+	ingester, err := pipeline.NewIngester(db, wakeAll{mainWorker, docsWorker}, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("ingester: %w", err)
 	}
@@ -386,4 +448,30 @@ func (w wakeAll) HoldAck(c capture.Capture) (release func()) {
 			r()
 		}
 	}
+}
+
+// micAlertRun returns the recorder alert loop, or nothing without
+// MIC_UPLOAD_TOKEN.
+func micAlertRun(cfg config.Config, log *zap.Logger, db *sqlite.DB, replier pipeline.Replier) []func(context.Context) {
+	if cfg.MicUploadToken == "" {
+		return nil
+	}
+	loop := micapi.NewAlertLoop(alertStore{db: db}, replier, cfg.MicNotifyChatID, cfg.MicSilenceAlert, cfg.Location)
+
+	return []func(context.Context){func(ctx context.Context) {
+		loop.Run(ctx, func(err error) { log.Warn("recorder alerts", zap.Error(err)) })
+	}}
+}
+
+// replyLoopRun runs the hourly start-reply cleanup when the purger has one
+// (microphone enabled).
+func replyLoopRun(p pipeline.Purger, log *zap.Logger) []func(context.Context) {
+	rp, ok := p.(pipeline.ReplyPurger)
+	if !ok {
+		return nil
+	}
+
+	return []func(context.Context){func(ctx context.Context) {
+		pipeline.ReplyLoop(ctx, rp, pipeline.StartReplyInterval, time.Now, log)
+	}}
 }

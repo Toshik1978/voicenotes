@@ -21,6 +21,9 @@ const (
 
 func (k Kind) String() string { return string(k) }
 
+// SourceMic is the Source of a capture recorded by a microphone recorder.
+const SourceMic = "mic"
+
 // Step is the next pipeline step to run for a capture.
 type Step string
 
@@ -119,6 +122,10 @@ type Capture struct {
 	TaskCount int
 	// ReplyMessageID is the reply to edit; 0 until a reply has been sent.
 	ReplyMessageID int64
+	// NoSpeech is true when an audio capture's transcript was empty after a
+	// successful transcription. Such a capture creates no note: an OK outcome
+	// at extract skips enrich and write_note (Policy.Next).
+	NoSpeech bool
 
 	Kind       Kind
 	ReceivedAt time.Time
