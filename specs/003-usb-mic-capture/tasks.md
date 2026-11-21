@@ -314,7 +314,7 @@ through the unchanged pipeline, and the recorder loop runs against fakes.
 
 ## Phase 7: Polish & Cross-Cutting Concerns
 
-- [ ] T029 [P] Document the feature in `README.md` and `.env.example`, using anonymised values only (`voicenotes.example.org`, `FAKE-…` tokens, chat `-1001234567890`). Cover:
+- [x] T029 [P] Document the feature in `README.md` and `.env.example`, using anonymised values only (`voicenotes.example.org`, `FAKE-…` tokens, chat `-1001234567890`). Cover:
   - what the receiver must do
   - the hardware check (quickstart.md §1)
   - installing `voicenotes-mic` from the release tarball with `libasound2t64`, the system user in the `audio` and `input` groups, and the systemd unit
