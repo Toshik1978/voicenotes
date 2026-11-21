@@ -12,6 +12,11 @@ on:
     tags:
       - 'v*'
 
+concurrency:
+  group: release-${{ github.ref }}
+  # Never cancel midway: a half-finished run can leave a partial asset set.
+  cancel-in-progress: false
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
@@ -30,7 +35,9 @@ jobs:
 
   release:
     needs: ci
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest (26.04): the recorder links the runner's glibc, and
+    # building on 24.04 (2.39) keeps the binaries running on 24.04 and later.
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
       packages: write
@@ -39,15 +46,21 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          # GoReleaser needs the tags.
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Lowercase image name
         run: echo "IMAGE_NAME=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
 
       # Runs before anything is pushed, so a tag without release notes fails
-      # the job while it is still a no-op.
+      # the job while it is still a no-op. Written outside the checkout:
+      # GoReleaser refuses a dirty tree.
       - name: Build release body from CHANGELOG
         run: |
-          bash .github/scripts/extract-changelog.sh "$GITHUB_REF_NAME" > release-body.md
+          body="$RUNNER_TEMP/release-body.md"
+          bash .github/scripts/extract-changelog.sh "$GITHUB_REF_NAME" > "$body"
           {
             echo
             # No '---' here: the extracted section already ends with the
@@ -59,8 +72,8 @@ jobs:
             echo '```bash'
             echo "docker pull ${REGISTRY}/${IMAGE_NAME}:${GITHUB_REF_NAME#v}"
             echo '```'
-          } >> release-body.md
-          cat release-body.md
+          } >> "$body"
+          cat "$body"
 
       # The Dockerfile's VERSION, COMMIT and BUILDSTAMP build args feed the
       # binary's -ldflags (.git is not in the build context). VERSION is the
@@ -122,32 +135,11 @@ jobs:
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ github.ref_name }}
-          body_path: release-body.md
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-  # The recorder links malgo (cgo), so each tarball is built natively on its own
-  # architecture. Building on 24.04 (glibc 2.39) runs on Ubuntu 26.04.
-  build-mic:
-    name: build-mic (${{ matrix.arch }})
-    needs: ci
-    runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-24.04
-            arch: amd64
-          - runner: ubuntu-24.04-arm
-            arch: arm64
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
+      # GoReleaser builds the recorder archives (.goreleaser.yaml) and creates
+      # the GitHub release with them and the notes. malgo is cgo: amd64 builds
+      # with the runner's gcc, arm64 with the cross-compiler.
+      - name: Install the arm64 C cross-compiler
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu
 
       - name: Setup Golang
         uses: actions/setup-go@v7
@@ -156,44 +148,35 @@ jobs:
           cache: true
           check-latest: true
 
-      - name: Build tarball
-        env:
-          ARCH: ${{ matrix.arch }}
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          name="voicenotes-mic_${version}_linux_${ARCH}"
-          mkdir -p "dist/${name}"
-          CGO_ENABLED=1 go build \
-            -ldflags "-X main.Version=${version} -X main.Commit=${GITHUB_SHA::7} -X main.Buildstamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            -o "dist/${name}/voicenotes-mic" ./cmd/voicenotes-mic
-          cp LICENSE deploy/voicenotes-mic.service deploy/voicenotes-mic.env.example "dist/${name}/"
-          tar -C dist -czf "${name}.tar.gz" "${name}"
-          tar -tzf "${name}.tar.gz"
-
-      - name: Upload tarball
-        uses: actions/upload-artifact@v4
+      - name: Publish the release with GoReleaser
+        uses: goreleaser/goreleaser-action@v7
         with:
-          name: voicenotes-mic-${{ matrix.arch }}
-          path: voicenotes-mic_*.tar.gz
-          if-no-files-found: error
+          distribution: goreleaser
+          version: "~> v2"
+          # --release-notes is read by the changelog pipe, which is left
+          # enabled for that reason. See `release:` in .goreleaser.yaml.
+          args: release --clean --release-notes=${{ runner.temp }}/release-body.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # Attaches the tarballs to the release the release job created. The body is
-  # not passed, so the existing release notes are left alone.
-  attach-mic:
-    needs: [release, build-mic]
+  # `changelog: disable` would make GoReleaser ignore --release-notes and
+  # publish an empty body while every step reports success. Only reading the
+  # published release back catches it.
+  verify:
+    name: Check the published release has notes
+    needs: release
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     steps:
-      - name: Download tarballs
-        uses: actions/download-artifact@v4
-        with:
-          pattern: voicenotes-mic-*
-          merge-multiple: true
-
-      - name: Attach tarballs to the GitHub release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ github.ref_name }}
-          files: voicenotes-mic_*.tar.gz
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Refuse an empty release body
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          body=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json body --jq .body)
+          if [ -z "$(printf '%s' "$body" | tr -d '[:space:]')" ]; then
+            echo "::error::$GITHUB_REF_NAME was published with an empty body; check .goreleaser.yaml"
+            exit 1
+          fi
+          echo "release body: $(printf '%s' "$body" | wc -c) bytes"

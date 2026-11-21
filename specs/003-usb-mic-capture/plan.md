@@ -102,8 +102,9 @@ recorder only.
 **Target Platform**:
 
 - **Service**: Linux container, distroless, `CGO_ENABLED=0`, amd64 and arm64 (unchanged).
-- **Recorder**: native Linux binaries for amd64 and arm64, built with cgo on `ubuntu-24.04` and
-  `ubuntu-24.04-arm` runners (glibc 2.39). They run on Ubuntu 26.04.
+- **Recorder**: native Linux binaries for amd64 and arm64, built with cgo. CI builds them natively
+  on `ubuntu-24.04` and `ubuntu-24.04-arm`; the release builds both with GoReleaser on Ubuntu 24.04
+  (glibc 2.39), cross-compiling arm64 with `gcc-aarch64-linux-gnu`. They run on Ubuntu 26.04.
 
 **Project Type**: a long-running service plus a small host daemon, from one module.
 
@@ -241,9 +242,12 @@ audio" is superseded by FR-210a, allowed by constitution v1.1.0.
   - The `-coverpkg` update.
   - A `build-mic` matrix on `ubuntu-24.04` and `ubuntu-24.04-arm` running `task build:mic`.
   - Lint and test jobs need gcc, which the runners already have.
-- **`release.yml`**: a matrix job builds `voicenotes-mic_<version>_linux_{amd64,arm64}.tar.gz`
-  (binary, `LICENSE`, `deploy/voicenotes-mic.service`, `deploy/voicenotes-mic.env.example`) and
-  attaches them to the GitHub release. The images are unchanged.
+  - A `release-snapshot` job builds the release archives with GoReleaser, publishing nothing.
+- **`.goreleaser.yaml`** and **`release.yml`**: GoReleaser builds
+  `voicenotes-mic_<version>_linux_{amd64,arm64}.tar.gz` (binary, `LICENSE`,
+  `deploy/voicenotes-mic.service`, `deploy/voicenotes-mic.env.example`) and a checksums file,
+  cross-compiling arm64 with `gcc-aarch64-linux-gnu`, and creates the GitHub release with them and
+  the notes. The images are unchanged.
 - **`deploy/voicenotes-mic.service`**: `User=voicenotes-mic`, `SupplementaryGroups=audio input`,
   `StateDirectory=voicenotes-mic`, `EnvironmentFile=/usr/local/etc/voicenotes-mic.env`, `Restart=always`.
 - **`.claude/CLAUDE.md`**: the gate table gains `task build:mic`, and the CI description and
