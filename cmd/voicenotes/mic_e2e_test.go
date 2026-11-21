@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 
 	"github.com/Toshik1978/voicenotes/internal/health"
 	"github.com/Toshik1978/voicenotes/internal/mic"
+	"github.com/Toshik1978/voicenotes/internal/micapi"
 	"github.com/Toshik1978/voicenotes/internal/pipeline"
 	micrec "github.com/Toshik1978/voicenotes/internal/recorder"
 	"github.com/Toshik1978/voicenotes/internal/store/sqlite"
@@ -404,11 +407,46 @@ type micE2E struct {
 	spoolDir string
 	srv      *httptest.Server
 	net      *micNet
+	svc      *micServiceClock
+	alerts   *micapi.AlertLoop
+}
+
+// micSilence is MIC_SILENCE_ALERT in the alert scenarios.
+const micSilence = 15 * time.Minute
+
+// micServiceClock is the service's clock: it stamps check-ins and drives
+// the alert loop, so a scenario can let "no check-ins" pass without waiting.
+type micServiceClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *micServiceClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.now
+}
+
+func (c *micServiceClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
 }
 
 // micSetup varies how the recorder is set up.
 type micSetup struct {
 	token string // the recorder's upload token; empty: the service's
+	// audio and discovery replace the fakes that always work.
+	audio     micrec.AudioSource
+	discovery micrec.Discovery
+	// noReceiver: no receiver is found at start, so there is no session to
+	// wait for.
+	noReceiver bool
+	// prepare lays out the recorder's spool before the recorder starts.
+	prepare func(t *testing.T, dir string)
+	// spoolMinFree is MIC_SPOOL_MIN_FREE.
+	spoolMinFree int64
 }
 
 // startMicE2E wires the service (pipeline and microphone API, as wire does)
@@ -457,19 +495,25 @@ func startMicE2EWith(t *testing.T, setup micSetup) *micE2E {
 		workers.Go(func() { w.Run(t.Context()) })
 	}
 	mux := http.NewServeMux()
-	micHandler := mountMic(mux, cfg, zap.NewNop(), db, p.ingester, m.tg, filesDir)
+	m.svc = &micServiceClock{now: time.Date(2026, 11, 19, 8, 0, 0, 0, time.UTC)}
+	micHandler := mountMic(mux, cfg, zap.NewNop(), db, p.ingester, m.tg, filesDir, micapi.WithClock(m.svc.Now))
+	m.alerts = micapi.NewAlertLoop(alertStore{db: db}, m.tg, micNotifyChat, micSilence, time.UTC)
+	m.alerts.SetClock(m.svc.Now)
 	t.Cleanup(micHandler.Wait)
 	srv := httptest.NewServer(m.uploads.wrap(mux))
 	t.Cleanup(srv.Close)
 
 	m.srv = srv
 	m.net = &micNet{next: srv.Client().Transport}
-	m.startRecorder(t, srv, cmp.Or(setup.token, micTestToken))
+	if setup.prepare != nil {
+		setup.prepare(t, m.spoolDir)
+	}
+	m.startRecorder(t, srv, cmp.Or(setup.token, micTestToken), setup)
 
 	return m
 }
 
-func (m *micE2E) startRecorder(t *testing.T, srv *httptest.Server, token string) {
+func (m *micE2E) startRecorder(t *testing.T, srv *httptest.Server, token string, setup micSetup) {
 	t.Helper()
 	spool, err := micrec.NewDirSpool(m.spoolDir, m.clock.Now)
 	if err != nil {
@@ -480,13 +524,21 @@ func (m *micE2E) startRecorder(t *testing.T, srv *httptest.Server, token string)
 		t.Fatal(err)
 	}
 	ids := &micIDs{next: 4100}
+	var audio micrec.AudioSource = micAudio{}
+	if setup.audio != nil {
+		audio = setup.audio
+	}
+	var discovery micrec.Discovery = micDiscovery{}
+	if setup.discovery != nil {
+		discovery = setup.discovery
+	}
 	rec, err := micrec.New(micrec.Deps{
-		Keys: m.keys, Audio: micAudio{}, Discovery: micDiscovery{}, Spool: spool,
+		Keys: m.keys, Audio: audio, Discovery: discovery, Spool: spool,
 		Handoff: client, Notifier: client, CheckIn: client, Log: zap.NewNop(),
 	}, micrec.Options{
 		Clock: m.clock, NewID: ids.newID, Recorder: micRecorderName,
 		Debounce: micDebounce, MinLength: micMinLength, MaxLength: micMaxLength,
-		CheckinInterval: time.Minute, RetryMaxInterval: 5 * time.Minute,
+		CheckinInterval: time.Minute, RetryMaxInterval: 5 * time.Minute, SpoolMinFree: setup.spoolMinFree,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -499,6 +551,11 @@ func (m *micE2E) startRecorder(t *testing.T, srv *httptest.Server, token string)
 		_ = rec.Run(t.Context())
 	}()
 	t.Cleanup(func() { <-done })
+
+	if setup.noReceiver {
+		waitFor(t, "the recorder to run", func() bool { return rec.Status().Running })
+		return
+	}
 
 	// The session's one-second ticker exists once the receiver is open.
 	waitFor(t, "the receiver session", func() bool {
@@ -960,4 +1017,283 @@ func TestMicProxyRejectedRecordingIsKeptSkippedAndReported(t *testing.T) {
 	if rep.Rejected != 1 || rep.Status != health.StatusDegraded {
 		t.Errorf("health = %+v, want degraded with one rejected recording", rep)
 	}
+}
+
+// ---------------------------------------------------------------- interruptions and alerts
+
+// micRecoveredID is the recording a killed recorder left in its spool.
+const micRecoveredID = int64(4050)
+
+// micLostAudio is the fixture capture that can report the device lost.
+type micLostAudio struct{ lost chan error }
+
+func (a micLostAudio) Open(rcv mic.Receiver, q *micrec.FrameQueue) (micrec.AudioStream, error) {
+	s, err := micAudio{}.Open(rcv, q)
+	s.Lost = a.lost
+
+	return s, err
+}
+
+// micSwitchDiscovery finds the receiver only while present is set.
+type micSwitchDiscovery struct{ present atomic.Bool }
+
+func (d *micSwitchDiscovery) Discover() (mic.Receiver, bool, error) {
+	if !d.present.Load() {
+		return mic.Receiver{}, false, nil
+	}
+
+	return mic.Receiver{Card: 2, InputPath: micInputPath}, true, nil
+}
+
+// alertTexts returns the recorder alerts sent to the notify chat, in order.
+func (m *micE2E) alertTexts() []string {
+	var out []string
+	for _, e := range m.tg.log() {
+		if e.op == "send" && e.chat == micNotifyChat && strings.HasPrefix(e.text, "🎙 "+micRecorderName+": ") {
+			out = append(out, e.text)
+		}
+	}
+
+	return out
+}
+
+// passAlerts runs the alert loop once.
+func (m *micE2E) passAlerts(t *testing.T) {
+	t.Helper()
+	if err := m.alerts.Pass(t.Context()); err != nil {
+		t.Fatalf("alert pass: %v", err)
+	}
+}
+
+// recorderRow returns the service's row of the recorder.
+func (m *micE2E) recorderRow(t *testing.T) (sqlite.Recorder, bool) {
+	t.Helper()
+	rows, err := m.db.Recorders(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rows {
+		if r.Name == micRecorderName {
+			return r, true
+		}
+	}
+
+	return sqlite.Recorder{}, false
+}
+
+// checkInUntil makes the recorder check in until its row on the service
+// satisfies cond.
+func (m *micE2E) checkInUntil(t *testing.T, what string, cond func(sqlite.Recorder) bool) {
+	t.Helper()
+	waitFor(t, what, func() bool {
+		if r, ok := m.recorderRow(t); ok && cond(r) {
+			return true
+		}
+		m.clock.tick(time.Minute)
+
+		return false
+	})
+}
+
+// wantAlerts checks the alert messages sent so far, by their text.
+func (m *micE2E) wantAlerts(t *testing.T, want ...string) {
+	t.Helper()
+	got := m.alertTexts()
+	if len(got) != len(want) {
+		t.Fatalf("alerts = %q, want %d: %q", got, len(want), want)
+	}
+	for i := range want {
+		if !strings.Contains(got[i], want[i]) {
+			t.Errorf("alert %d = %q, want it to contain %q", i, got[i], want[i])
+		}
+	}
+}
+
+// Scenario 3.1: the recorder was killed mid-recording after 3 s of audio
+// were fsynced, a torn frame at the tail. At the next start the spool is
+// recovered and the service saves a note with at least that audio.
+func TestMicRecoversAKilledRecordingIntoANote(t *testing.T) {
+	const seconds = 3
+	m := startMicE2EWith(t, micSetup{prepare: func(t *testing.T, dir string) {
+		t.Helper()
+		sp, err := micrec.NewDirSpool(dir, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w, err := sp.Begin(micrec.Recording{ID: micRecoveredID, Recorder: micRecorderName, StartedAt: micFirstTap()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for range seconds {
+			if _, err = w.Write(micAudioFixture()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err = w.Close(); err != nil { // fsynced; the process dies without Finish
+			t.Fatal(err)
+		}
+		part, err := os.OpenFile(filepath.Join(dir, "4050.part.wav"), os.O_WRONLY|os.O_APPEND, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = part.Write([]byte{0x7f}); err != nil { // half a frame, torn by the kill
+			t.Fatal(err)
+		}
+		if err = part.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}})
+
+	waitFor(t, "the recovered recording to be saved", func() bool {
+		n, err := m.db.CountUnfinished(t.Context())
+		notes, _, _ := m.world.snapshot()
+		return err == nil && n == 0 && len(notes) == 1
+	})
+
+	notes, _, _ := m.world.snapshot()
+	attached := m.world.attachedData()
+	if len(attached) != 1 {
+		t.Fatalf("%d attachments, want one", len(attached))
+	}
+	want := string(mic.Header(seconds*micAudioBytes)) + strings.Repeat(string(micAudioFixture()), seconds)
+	if attached[0] != want {
+		t.Errorf("attached audio is %d bytes, want the %d-byte WAV of the fsynced audio", len(attached[0]), len(want))
+	}
+	if !notes[0].ReceivedAt.Equal(micFirstTap()) || !strings.Contains(notes[0].Content, micSaid) {
+		t.Errorf("note = %+v, want it timed at the recording's start with its text", notes[0])
+	}
+	ups := m.uploads.all()
+	if len(ups) != 1 || ups[0].endReason != string(mic.EndInterrupted) || ups[0].path != "/mic/v1/recordings/4050" {
+		t.Errorf("uploads = %+v, want recording 4050 ended as interrupted", ups)
+	}
+	evs := m.tg.log()
+	if len(evs) != 1 || evs[0].op != "send" || !strings.HasPrefix(evs[0].text, "✓ saved · 1 task · ") {
+		t.Errorf("Telegram calls = %+v, want the outcome as one new message", evs)
+	}
+	checkSpoolEmpty(t, m)
+}
+
+// Scenario 3.2: the receiver disappears mid-recording. The note holds what
+// was captured up to there and the recording ends as receiver_lost.
+func TestMicDeviceLostMidRecordingEndsTheNoteThere(t *testing.T) {
+	lost := make(chan error, 1)
+	m := startMicE2EWith(t, micSetup{audio: micLostAudio{lost: lost}})
+
+	start := m.startRecording(t, micFirstTap(), 4101)
+	m.clock.set(micFirstTap().Add(5 * time.Second))
+
+	lost <- errors.Join(micrec.ErrDeviceLost, errors.New("card 2 is gone"))
+	edit := m.waitForSaved(t, start)
+
+	notes, _, _ := m.world.snapshot()
+	attached := m.world.attachedData()
+	if len(notes) != 1 || len(attached) != 1 {
+		t.Fatalf("%d notes, %d attachments; want one note with its audio", len(notes), len(attached))
+	}
+	checkSaved(t, edit, notes[0], attached[0])
+	if ups := m.uploads.all(); len(ups) != 1 || ups[0].endReason != string(mic.EndReceiverLost) {
+		t.Errorf("uploads = %+v, want one ended as receiver_lost", ups)
+	}
+	checkSpoolEmpty(t, m)
+}
+
+// Scenario 3.3 and SC-202: no receiver degrades the recorder's health, and
+// after its check-in the service sends one "receiver not connected"; when
+// the receiver is back, one "receiver connected".
+func TestMicMissingReceiverAlertsOnceAndRecovers(t *testing.T) {
+	disc := &micSwitchDiscovery{}
+	m := startMicE2EWith(t, micSetup{discovery: disc, noReceiver: true})
+
+	rep := micrec.ComputeHealth(m.rec.Status(), m.clock.Now(), time.Hour)
+	if rep.Status != health.StatusDegraded || rep.Receiver != "missing" {
+		t.Errorf("health = %+v, want degraded with the receiver missing", rep)
+	}
+
+	waitFor(t, "the first check-in", func() bool {
+		r, ok := m.recorderRow(t)
+		return ok && !r.ReceiverPresent
+	})
+	m.passAlerts(t)
+	m.passAlerts(t)
+	m.wantAlerts(t, "receiver not connected")
+
+	disc.present.Store(true)
+	m.advanceUntil(t, "the receiver to be found", func() bool { return m.rec.Status().ReceiverPresent })
+	if rep := micrec.ComputeHealth(m.rec.Status(), m.clock.Now(), time.Hour); rep.Status != health.StatusOK {
+		t.Errorf("health = %+v, want ok with the receiver back", rep)
+	}
+	m.checkInUntil(t, "a check-in with the receiver", func(r sqlite.Recorder) bool { return r.ReceiverPresent })
+	m.passAlerts(t)
+	m.passAlerts(t)
+	m.wantAlerts(t, "receiver not connected", "receiver connected")
+}
+
+// SC-209 (storage): a check-in with storage_full gives one alert, and a tap
+// is refused: no recording, no file, no notice.
+func TestMicStorageFullAlertsOnceAndRefusesTaps(t *testing.T) {
+	m := startMicE2EWith(t, micSetup{spoolMinFree: math.MaxInt64})
+
+	m.checkInUntil(t, "a check-in with storage_full", func(r sqlite.Recorder) bool { return r.StorageFull })
+	m.passAlerts(t)
+	m.passAlerts(t)
+	m.wantAlerts(t, "storage full")
+
+	// The second tap is read only after the first was handled.
+	m.tapAt(t, micFirstTap())
+	m.tapAt(t, micFirstTap().Add(5*time.Second))
+
+	if m.rec.Status().Recording {
+		t.Error("recording although storage is full")
+	}
+	if entries, err := os.ReadDir(m.spoolDir); err != nil || len(entries) != 0 {
+		t.Errorf("spool holds %v (%v), want nothing for a refused tap", entries, err)
+	}
+	if ups := m.uploads.all(); len(ups) != 0 {
+		t.Errorf("uploads = %+v, want none", ups)
+	}
+	if rep := micrec.ComputeHealth(m.rec.Status(), m.clock.Now(), time.Hour); rep.Storage != "full" ||
+		rep.Status != health.StatusDegraded {
+		t.Errorf("health = %+v, want degraded with storage full", rep)
+	}
+	m.wantAlerts(t, "storage full")
+	for _, e := range m.tg.log() {
+		if e.text == "🎙 recording…" {
+			t.Errorf("unexpected start notice %+v", e)
+		}
+	}
+}
+
+// SC-209 (silence): no check-ins for MIC_SILENCE_ALERT give one "not heard
+// from since"; when they resume, one "back online".
+func TestMicSilenceAlertsOnceAndRecovers(t *testing.T) {
+	m := startMicE2E(t)
+
+	m.checkInUntil(t, "the first check-in", func(sqlite.Recorder) bool { return true })
+	m.passAlerts(t)
+	m.wantAlerts(t)
+
+	m.net.setRule(func(r *http.Request) micFault {
+		if r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/mic/v1/recorders/") {
+			return faultDown
+		}
+
+		return faultNone
+	})
+	m.clock.tick(time.Minute) // a check-in that never arrives
+	m.svc.advance(micSilence - time.Minute)
+	m.passAlerts(t)
+	m.wantAlerts(t) // not yet silent for MIC_SILENCE_ALERT
+
+	m.svc.advance(2 * time.Minute)
+	m.passAlerts(t)
+	m.passAlerts(t)
+	m.wantAlerts(t, "not heard from since 08:00")
+
+	m.net.setRule(nil)
+	m.checkInUntil(t, "a check-in after the silence", func(r sqlite.Recorder) bool {
+		return r.LastSeen.Equal(m.svc.Now())
+	})
+	m.passAlerts(t)
+	m.passAlerts(t)
+	m.wantAlerts(t, "not heard from since 08:00", "back online")
 }

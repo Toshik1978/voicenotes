@@ -190,10 +190,7 @@ func wire(
 	if err != nil {
 		return nil, err
 	}
-	collector := health.NewCollector(health.CollectorConfig{
-		Queue: healthQueue{db: db}, Worker: bothLanes{mainWorker, docsWorker}, LastPoll: tg.LastPoll,
-		Clock: time.Now, Started: started, Threshold: cfg.HealthPendingThreshold,
-	})
+	collector := newCollector(cfg, db, bothLanes{mainWorker, docsWorker}, tg.LastPoll, started)
 	mux := http.NewServeMux()
 	mux.Handle("/healthz", health.Handler(collector))
 	micHandler := mountMic(mux, cfg, log, db, ingester, tg, filesDir)
@@ -206,8 +203,25 @@ func wire(
 		func(ctx context.Context) { serveAndDrain(ctx, ln, mux, micHandler, log) },
 		func(ctx context.Context) { pipeline.PurgeLoop(ctx, purger, pipeline.PurgeInterval, time.Now, log) },
 	}, digestRun...)
+	goroutines = append(goroutines, micAlertRun(cfg, log, db, tg)...)
 
 	return &service{goroutines: goroutines}, nil
+}
+
+// newCollector builds the health source. Recorders are reported only when
+// the microphone API is enabled.
+func newCollector(
+	cfg config.Config, db *sqlite.DB, worker health.Worker, lastPoll func() time.Time, started time.Time,
+) *health.Collector {
+	cc := health.CollectorConfig{
+		Queue: healthQueue{db: db}, Worker: worker, LastPoll: lastPoll,
+		Clock: time.Now, Started: started, Threshold: cfg.HealthPendingThreshold,
+	}
+	if cfg.MicUploadToken != "" {
+		cc.Recorders = healthRecorders{db: db}
+	}
+
+	return health.NewCollector(cc)
 }
 
 // serveAndDrain serves HTTP until ctx is cancelled, then lets the microphone
@@ -222,17 +236,19 @@ func serveAndDrain(ctx context.Context, ln net.Listener, mux http.Handler, mic *
 // mountMic mounts the microphone API under /mic/v1/ when MIC_UPLOAD_TOKEN is
 // set and returns its handler; without a token nothing is mounted, so the
 // path answers 404, and it returns nil. No middleware wraps the mux, so the
-// Authorization header is never logged.
+// Authorization header is never logged. opts are extra handler options
+// (tests inject a clock).
 func mountMic(
 	mux *http.ServeMux, cfg config.Config, log *zap.Logger, db *sqlite.DB,
-	ingest micapi.RecordingIngester, replier pipeline.Replier, filesDir string,
+	ingest micapi.RecordingIngester, replier pipeline.Replier, filesDir string, opts ...micapi.Option,
 ) *micapi.Handler {
 	if cfg.MicUploadToken == "" {
 		return nil
 	}
+	opts = append([]micapi.Option{micapi.WithLogger(log)}, opts...)
 	h := micapi.NewHandler(
 		micapi.Config{Token: cfg.MicUploadToken, MaxBytes: cfg.MicUploadMaxBytes, FilesDir: filesDir},
-		ingest, micapi.NewStarts(db, replier, cfg.MicNotifyChatID), db, micapi.WithLogger(log),
+		ingest, micapi.NewStarts(db, replier, cfg.MicNotifyChatID), db, opts...,
 	)
 	mux.Handle("/mic/v1/", h)
 
@@ -424,4 +440,17 @@ func (w wakeAll) HoldAck(c capture.Capture) (release func()) {
 			r()
 		}
 	}
+}
+
+// micAlertRun returns the recorder alert loop, or nothing without
+// MIC_UPLOAD_TOKEN.
+func micAlertRun(cfg config.Config, log *zap.Logger, db *sqlite.DB, replier pipeline.Replier) []func(context.Context) {
+	if cfg.MicUploadToken == "" {
+		return nil
+	}
+	loop := micapi.NewAlertLoop(alertStore{db: db}, replier, cfg.MicNotifyChatID, cfg.MicSilenceAlert, cfg.Location)
+
+	return []func(context.Context){func(ctx context.Context) {
+		loop.Run(ctx, func(err error) { log.Warn("recorder alerts", zap.Error(err)) })
+	}}
 }

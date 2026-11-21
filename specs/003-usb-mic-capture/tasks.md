@@ -268,20 +268,20 @@ through the unchanged pipeline, and the recorder loop runs against fakes.
 
 **Independent Test**: quickstart.md §3. Kill the recorder mid-recording, unplug the receiver, power the Pi off, fill its disk.
 
-- [ ] T022 [P] [US3] Implement `mic.Alerts` in `internal/mic/alerts.go`. Tests go in `internal/mic/alerts_test.go`.
+- [x] T022 [P] [US3] Implement `mic.Alerts` in `internal/mic/alerts.go`. Tests go in `internal/mic/alerts_test.go`.
   - `Eval(status, now, silence) → (newAlert, message?)`, per data-model.md "Recorder status".
   - Priority: `now − LastSeen > silence` → `silent`; else `StorageFull` → `storage_full`; else `!ReceiverPresent` → `missing_receiver`; else `ok`.
   - Emit only when the computed alert "differs from the stored `Alert`", and "never emit while the alert is unchanged".
   - Use exactly the texts in contracts/telegram-ux.md "Recorder alerts". `HH:MM` is in the configured `Location`.
-- [ ] T023 [US3] Implement `micapi.AlertLoop` in `internal/micapi/alerts.go`. Tests go in `internal/micapi/alerts_test.go`, with fake store, replier and clock.
+- [x] T023 [US3] Implement `micapi.AlertLoop` in `internal/micapi/alerts.go`. Tests go in `internal/micapi/alerts_test.go`, with fake store, replier and clock.
   - Every 30 s, evaluate `mic.Alerts` for each `Recorders()` row.
   - Send each transition silently with `Replier.Send(notifyChat, 0, …)`, then call `SetRecorderAlert`. If the send fails, leave the stored alert unchanged so the next pass retries.
   - Wire it in `cmd/voicenotes/service.go` when `MIC_UPLOAD_TOKEN` is set.
-- [ ] T024 [US3] Report recorder alerts in the service health.
+- [x] T024 [US3] Report recorder alerts in the service health.
   - `internal/health/health.go`: add `Input.RecorderAlerts`. Any outstanding alert makes the status degraded. The report gains `recorders: [{name, alert, last_seen}]`.
   - Add a `Recorders` source in `internal/health/source.go` and the shim in `cmd/voicenotes/adapters.go`.
   - Tests go in `internal/health/health_test.go` and `source_test.go`.
-- [ ] T025 [US3] Add an end-to-end interruption and alert test in `cmd/voicenotes/mic_e2e_test.go`, covering acceptance scenarios 3.1–3.3 and SC-202, SC-209:
+- [x] T025 [US3] Add an end-to-end interruption and alert test in `cmd/voicenotes/mic_e2e_test.go`, covering acceptance scenarios 3.1–3.3 and SC-202, SC-209:
   - A spool with a `.part.wav` (a simulated kill after N s of fixture audio) is recovered at start into a note containing at least the audio that was fsynced.
   - Fake audio reporting `ErrDeviceLost` mid-recording gives a note that ends there, with reason `receiver_lost`.
   - No receiver: recorder health is degraded, and after its check-in the service sends one `receiver not connected` alert. Reconnecting sends one `receiver connected`.

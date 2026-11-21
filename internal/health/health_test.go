@@ -128,6 +128,46 @@ func TestComputeBody(t *testing.T) {
 	}
 }
 
+func TestComputeRecorders(t *testing.T) {
+	seen := time.Date(2026, 10, 30, 2, 55, 0, 0, time.UTC)
+	tests := []struct {
+		name   string
+		rows   []RecorderAlert
+		status Status
+	}{
+		{"none", nil, StatusOK},
+		{"all ok", []RecorderAlert{{Name: "bed", Alert: "ok", LastSeen: seen}}, StatusOK},
+		{"empty alert is ok", []RecorderAlert{{Name: "bed", LastSeen: seen}}, StatusOK},
+		{"one outstanding", []RecorderAlert{
+			{Name: "a", Alert: "ok", LastSeen: seen}, {Name: "bed", Alert: "storage_full", LastSeen: seen},
+		}, StatusDegraded},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := healthy()
+			in.RecorderAlerts = tt.rows
+			if got := Compute(in).Status; got != tt.status {
+				t.Errorf("status = %s, want %s", got, tt.status)
+			}
+		})
+	}
+}
+
+func TestComputeBodyRecorders(t *testing.T) {
+	in := healthy()
+	in.RecorderAlerts = []RecorderAlert{
+		{Name: "bed", Alert: "silent", LastSeen: time.Date(2026, 10, 30, 2, 55, 0, 0, time.UTC)},
+	}
+	b, err := json.Marshal(Compute(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"status":"degraded","pending":0,"oldest_pending_age":"0s","last_poll_ok":"2026-10-30T02:59:00Z","recorders":[{"name":"bed","alert":"silent","last_seen":"2026-10-30T02:55:00Z"}]}`
+	if string(b) != want {
+		t.Fatalf("body = %s\nwant   %s", b, want)
+	}
+}
+
 func TestComputeBodyOmitsUnknown(t *testing.T) {
 	in := healthy()
 	in.LastPollOK = time.Time{}
