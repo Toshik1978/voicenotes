@@ -23,8 +23,6 @@ type LLMSummarizer struct {
 	timeout time.Duration
 }
 
-var _ Summarizer = (*LLMSummarizer)(nil)
-
 // NewLLMSummarizer bounds each call by timeout (LLM_TIMEOUT).
 func NewLLMSummarizer(chat Chat, timeout time.Duration) *LLMSummarizer {
 	return &LLMSummarizer{chat: chat, timeout: timeout}

@@ -25,8 +25,6 @@ import (
 // Capture implements [recorder.AudioSource].
 type Capture struct{}
 
-var _ recorder.AudioSource = (*Capture)(nil)
-
 // New returns the audio source.
 func New() *Capture { return &Capture{} }
 

@@ -20,8 +20,6 @@ const eviocgrab = 0x40044590
 // Keys opens evdev devices; it implements [recorder.KeySource].
 type Keys struct{}
 
-var _ recorder.KeySource = Keys{}
-
 // Open opens the input device at path read-only and tries to grab it, so the
 // key neither changes the host volume nor reaches other programs. A failed
 // grab is not an error: the stream is returned with Grabbed false and a
