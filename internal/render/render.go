@@ -3,7 +3,7 @@
 //
 // Layout (FR-022), sections separated by a blank line:
 //
-//	main text (transcript, or a placeholder naming the failure)
+//	main text (transcript, or a placeholder naming the failure; omitted when empty)
 //	checklist ("- [ ] item" lines, when there are action items)
 //	original quote ("*Original (xx):*" then "> " lines, when translated)
 //	tags line (inbox tag, todo tag with action items, suggested tags)
@@ -15,16 +15,13 @@ package render
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"unicode/utf8"
 )
 
-const (
-	// NoSpeech is the main text for an empty transcript.
-	NoSpeech = "(no speech recognized)"
-	// truncatedMark is appended to shortened text.
-	truncatedMark = " (truncated)"
-)
+// truncatedMark is appended to shortened text.
+const truncatedMark = " (truncated)"
 
 // Input is everything the renderer needs. Zero-valued optional fields render
 // nothing, so later pipeline steps only fill more of them in.
@@ -103,6 +100,9 @@ func fit(in Input, main string, limit int, head func(string) []string) string {
 			parts = append(parts, quoteBlock(in.OriginalLang, q))
 		}
 
+		// An empty main text (no transcript) leaves no blank section.
+		parts = slices.DeleteFunc(parts, func(p string) bool { return p == "" })
+
 		return strings.Join(append(parts, tags), "\n\n")
 	}
 
@@ -137,11 +137,8 @@ func mainText(in Input) string {
 	if in.Failure != "" {
 		return "(not transcribed: " + in.Failure + ")"
 	}
-	if t := strings.TrimSpace(in.Text); t != "" {
-		return t
-	}
 
-	return NoSpeech
+	return strings.TrimSpace(in.Text)
 }
 
 func checklist(items []string) string {

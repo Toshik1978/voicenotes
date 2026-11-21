@@ -237,6 +237,23 @@ func TestBuildSweepsAgedOrphanAudio(t *testing.T) {
 	}
 }
 
+func TestBuildCreatesNoSpeechDir(t *testing.T) {
+	dir := t.TempDir()
+	svc, err := build(buildConfig(t, dir), zap.NewNop(), time.Now())
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	t.Cleanup(func() { _ = svc.closeStore() })
+
+	info, err := os.Stat(filepath.Join(dir, "nospeech"))
+	if err != nil {
+		t.Fatalf("nospeech dir missing: %v", err)
+	}
+	if !info.IsDir() || info.Mode().Perm() != 0o700 {
+		t.Errorf("nospeech mode = %v, want drwx------", info.Mode())
+	}
+}
+
 type fakeWaker struct {
 	wakes, holds, releases int
 }
@@ -643,11 +660,26 @@ func TestPurgerFor(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	if _, ok := purgerFor(config.Config{}, db, nopReplier{}, zap.NewNop()).(pipeline.ReplyPurger); ok {
+	heldDir := filepath.Join(t.TempDir(), "nospeech")
+	plain := purgerFor(config.Config{}, db, nopReplier{}, heldDir, zap.NewNop())
+	if _, ok := plain.(pipeline.ReplyPurger); ok {
 		t.Error("purger without a token must not purge start replies")
 	}
-	cfg := config.Config{MicUploadToken: micTestToken}
-	rp, ok := purgerFor(cfg, db, nopReplier{}, zap.NewNop()).(pipeline.ReplyPurger)
+	// Held audio is purged even with the microphone off, so recordings held
+	// before it was disabled still go once their hold passes.
+	if _, ok := plain.(pipeline.HeldPurger); !ok {
+		t.Error("purger without a token must purge held audio")
+	}
+	cfg := config.Config{MicUploadToken: micTestToken, MicNoSpeechHold: time.Hour}
+	withMic := purgerFor(cfg, db, nopReplier{}, heldDir, zap.NewNop())
+	hp, ok := withMic.(pipeline.HeldPurger)
+	if !ok {
+		t.Fatal("purger with a token must purge held audio")
+	}
+	if _, err = hp.PurgeHeld(t.Context(), time.Now()); err != nil {
+		t.Fatalf("PurgeHeld: %v", err)
+	}
+	rp, ok := withMic.(pipeline.ReplyPurger)
 	if !ok {
 		t.Fatal("purger with a token must purge start replies")
 	}

@@ -17,7 +17,8 @@ func TestRender(t *testing.T) {
 	}{
 		{"transcript", func(i Input) Input { i.Text = "Buy milk."; return i }, "Buy milk.\n\n#inbox"},
 		{"trims transcript", func(i Input) Input { i.Text = "  hi \n"; return i }, "hi\n\n#inbox"},
-		{"empty transcript", func(i Input) Input { return i }, "(no speech recognized)\n\n#inbox"},
+		{"empty transcript has no placeholder", func(i Input) Input { return i }, "#inbox"},
+		{"blank transcript has no placeholder", func(i Input) Input { i.Text = " \n "; return i }, "#inbox"},
 		{
 			"failure",
 			func(i Input) Input { i.Text = "ignored"; i.Failure = "speech-to-text rejected the audio"; return i },

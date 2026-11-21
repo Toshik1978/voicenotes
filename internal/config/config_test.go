@@ -47,6 +47,8 @@ func TestParseDefaults(t *testing.T) {
 		{"AllowedUsers len", len(c.AllowedUsers), 2},
 		{"STTResponseFormat", c.STTResponseFormat, "verbose_json"},
 		{"STTTimeout", c.STTTimeout, 120 * time.Second},
+		{"STTNoSpeechThreshold", c.STTNoSpeechThreshold, 0.0},
+		{"STTVAD", c.STTVAD, false},
 		{"SourceLanguages", len(c.SourceLanguages), 0},
 		{"TargetLanguage", c.TargetLanguage, "en"},
 		{"LLMEnabled", c.LLMEnabled, false},
@@ -97,6 +99,8 @@ func TestParseOverridesAndDerived(t *testing.T) {
 		"TZ", "Europe/Berlin",
 		"DIGEST_TIME", "06:05",
 		"STT_RESPONSE_FORMAT", "json",
+		"STT_NO_SPEECH_THRESHOLD", "0.8",
+		"STT_VAD", "true",
 		"LOG_LEVEL", "debug",
 	))
 	if err != nil {
@@ -116,6 +120,9 @@ func TestParseOverridesAndDerived(t *testing.T) {
 	}
 	if c.Location.String() != "Europe/Berlin" {
 		t.Errorf("Location = %v", c.Location)
+	}
+	if c.STTNoSpeechThreshold != 0.8 || !c.STTVAD {
+		t.Errorf("no speech = %v %v", c.STTNoSpeechThreshold, c.STTVAD)
 	}
 	if c.STTResponseFormat != "json" || c.LogLevel != "debug" {
 		t.Errorf("format/level = %q %q", c.STTResponseFormat, c.LogLevel)
@@ -164,6 +171,11 @@ func TestParseErrors(t *testing.T) {
 		{"missing stt model", with("STT_MODEL", "-"), "config: STT_MODEL: "},
 		{"bad stt format", with("STT_RESPONSE_FORMAT", "xml"), "config: STT_RESPONSE_FORMAT: "},
 		{"bad stt timeout", with("STT_TIMEOUT", "soon"), "config: STT_TIMEOUT: "},
+		{"bad no-speech threshold", with("STT_NO_SPEECH_THRESHOLD", "high"), "config: STT_NO_SPEECH_THRESHOLD: "},
+		{"negative no-speech threshold", with("STT_NO_SPEECH_THRESHOLD", "-0.1"), "config: STT_NO_SPEECH_THRESHOLD: "},
+		{"no-speech threshold above 1", with("STT_NO_SPEECH_THRESHOLD", "1.5"), "config: STT_NO_SPEECH_THRESHOLD: "},
+		{"no-speech threshold NaN", with("STT_NO_SPEECH_THRESHOLD", "NaN"), "config: STT_NO_SPEECH_THRESHOLD: "},
+		{"bad vad flag", with("STT_VAD", "maybe"), "config: STT_VAD: "},
 		{"bad source language", with("SOURCE_LANGUAGES", "ru,english"), "config: SOURCE_LANGUAGES: "},
 		{"bad target language", with("TARGET_LANGUAGE", "EN"), "config: TARGET_LANGUAGE: "},
 		{"llm without model", with("LLM_BASE_URL", "http://llm.example.org/v1"), "config: LLM_MODEL: "},
@@ -214,30 +226,32 @@ func TestParseReportsAllProblems(t *testing.T) {
 
 func TestErrorsNeverContainValues(t *testing.T) {
 	bad := map[string]string{
-		"TELEGRAM_BOT_TOKEN":     secretValue,
-		"TELEGRAM_ALLOWED_USERS": secretValue,
-		"STT_BASE_URL":           secretValue,
-		"STT_API_KEY":            secretValue,
-		"STT_MODEL":              "m",
-		"STT_RESPONSE_FORMAT":    secretValue,
-		"STT_TIMEOUT":            secretValue,
-		"SOURCE_LANGUAGES":       secretValue,
-		"TARGET_LANGUAGE":        secretValue,
-		"LLM_BASE_URL":           secretValue,
-		"LLM_API_KEY":            secretValue,
-		"LLM_TIDY":               secretValue,
-		"LLM_MAX_TAGS":           secretValue,
-		"LLM_TEMPERATURE":        secretValue,
-		"MEMOS_URL":              secretValue,
-		"MEMOS_TOKEN":            secretValue,
-		"MEMOS_PUBLIC_URL":       secretValue,
-		"MEMOS_API_PREFIX":       secretValue,
-		"MEMOS_CONTENT_LIMIT":    secretValue,
-		"DIGEST_CHAT_ID":         secretValue,
-		"DIGEST_TIME":            secretValue,
-		"TZ":                     secretValue,
-		"DIGEST_MAX_NOTES":       secretValue,
-		"LOG_LEVEL":              secretValue,
+		"TELEGRAM_BOT_TOKEN":      secretValue,
+		"TELEGRAM_ALLOWED_USERS":  secretValue,
+		"STT_BASE_URL":            secretValue,
+		"STT_API_KEY":             secretValue,
+		"STT_MODEL":               "m",
+		"STT_RESPONSE_FORMAT":     secretValue,
+		"STT_TIMEOUT":             secretValue,
+		"STT_NO_SPEECH_THRESHOLD": secretValue,
+		"STT_VAD":                 secretValue,
+		"SOURCE_LANGUAGES":        secretValue,
+		"TARGET_LANGUAGE":         secretValue,
+		"LLM_BASE_URL":            secretValue,
+		"LLM_API_KEY":             secretValue,
+		"LLM_TIDY":                secretValue,
+		"LLM_MAX_TAGS":            secretValue,
+		"LLM_TEMPERATURE":         secretValue,
+		"MEMOS_URL":               secretValue,
+		"MEMOS_TOKEN":             secretValue,
+		"MEMOS_PUBLIC_URL":        secretValue,
+		"MEMOS_API_PREFIX":        secretValue,
+		"MEMOS_CONTENT_LIMIT":     secretValue,
+		"DIGEST_CHAT_ID":          secretValue,
+		"DIGEST_TIME":             secretValue,
+		"TZ":                      secretValue,
+		"DIGEST_MAX_NOTES":        secretValue,
+		"LOG_LEVEL":               secretValue,
 	}
 	_, err := Parse(bad)
 	if err == nil {

@@ -214,7 +214,9 @@ audio" is superseded by FR-210a, allowed by constitution v1.1.0.
 - **No speech**:
   - `capture.NoSpeech` plus a `Policy.Next` rule: extract OK with no speech goes to
     `finalize_reply`.
-  - `extract` sets the flag, and `replyText` gains its text.
+  - `extract` sets the flag: no speech region from speaches' voice activity detector
+    (`STT_VAD`), or an empty transcript, or every segment at or above
+    `STT_NO_SPEECH_THRESHOLD`. `replyText` gains its text.
   - `cleanup` moves microphone audio to `nospeech/`.
   - `PurgeLoop` purges `nospeech/` and stale `mic_replies`.
   - `render.NoSpeech` is removed.

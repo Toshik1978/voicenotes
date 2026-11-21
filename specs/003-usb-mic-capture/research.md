@@ -171,8 +171,19 @@ recorder binary (constitution v2.0.0). Each lists the decision, why, and what el
 ## R11. No speech, no note (FR-210a, FR-210b; constitution v1.1.0+ VI)
 
 - **Decision**:
-  - `extract` sets `Capture.NoSpeech` when a successful transcription of an audio capture is empty
-    after trimming.
+  - `extract` sets `Capture.NoSpeech` for an audio capture with no speech. With `STT_VAD`, it first
+    asks speaches' voice activity detector (`/v1/audio/speech/timestamps`, Silero VAD). No speech
+    region means no speech, and Whisper is not called. Any region means the transcript stands.
+    Otherwise, a successful transcription that is empty after trimming is no speech, as is one
+    whose every `verbose_json` segment reaches `STT_NO_SPEECH_THRESHOLD` (default 0, off).
+  - Why a detector: Whisper invents text for silence instead of returning nothing. On the real
+    kit, speaches with faster-whisper returned "Thank you", "Teksting av Nicolai Winther" or a
+    cake recipe for 5 s of silence. speaches runs the same VAD inside transcription, but
+    faster-whisper transcribes a clip under 30 s whole when it has no speech region.
+  - Why not the score alone: `no_speech_prob` was 0.81-0.88 for silence and 0.06 for a sentence,
+    but 0.61 and 0.64 for the single words "three" and "two". No threshold separates these
+    safely. The detector got all six samples right, from WAV and from Ogg/Opus.
+  - A failed detector call transcribes anyway: a wasted call is cheaper than a dropped capture.
   - `Policy.Next` sends OK with `NoSpeech` to `finalize_reply`, which replies "🔇 no speech heard —
     not saved".
   - `cleanup` removes files for Telegram captures. For `source = "mic"` it moves them to
@@ -181,7 +192,11 @@ recorder binary (constitution v2.0.0). Each lists the decision, why, and what el
   - `render.NoSpeech` is removed.
   - A failed transcription keeps the placeholder-note path.
 - **Rationale**: a pure policy change in gated packages, permitted by the amended Principle VI.
-- **Alternatives**: deciding at `write_note`; a separate voice-activity model.
+- **Alternatives**: deciding at `write_note`; the score alone (see above); Whisper's own skip rule
+  (`no_speech_prob` > 0.6 and `avg_logprob` < -1), which misses digital silence, whose
+  hallucination is confident (-0.30); a VAD inside the service, which needs an Ogg/Opus decoder
+  dependency and a model; a level gate in the recorder, which covers only the microphone and
+  passes a cough or a door.
 
 ## R12. Recorder status and alerts (FR-227, FR-227a)
 

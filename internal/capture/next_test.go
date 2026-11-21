@@ -188,3 +188,37 @@ func TestProgressOutcome(t *testing.T) {
 		t.Errorf("%+v", o)
 	}
 }
+
+func TestNextNoSpeechSkipsEnrichAndWriteNote(t *testing.T) {
+	c := at(StepExtract)
+	c.NoSpeech = true
+	c.Status, c.WaitingOn, c.Attempts = StatusWaiting, WaitingSTT, 2
+	got := policy().Next(c, OK(), now0())
+	if got.Step != StepFinalizeReply || got.Status != StatusPending || got.Attempts != 0 ||
+		got.WaitingOn != "" || !got.NextAttemptAt.Equal(now0()) || !got.NoSpeech {
+		t.Errorf("no-speech ok at extract: %+v", got)
+	}
+}
+
+func TestNextNoSpeechOtherTransitionsUnchanged(t *testing.T) {
+	// A capture without NoSpeech still goes extract -> enrich.
+	if got := policy().Next(at(StepExtract), OK(), now0()); got.Step != StepEnrich {
+		t.Errorf("speech extract: %+v", got)
+	}
+	// NoSpeech only changes OK at extract.
+	for _, s := range []Step{StepFinalizeReply, StepCleanup} {
+		c := at(s)
+		c.NoSpeech = true
+		want := policy().Next(at(s), OK(), now0()).Step
+		if got := policy().Next(c, OK(), now0()); got.Step != want {
+			t.Errorf("%s: got %s want %s", s, got.Step, want)
+		}
+	}
+	// A permanent failure at extract still yields a placeholder note.
+	c := at(StepExtract)
+	c.NoSpeech = true
+	got := policy().Next(c, Permanent("bad audio"), now0())
+	if got.Step != StepWriteNote || got.Failure != "bad audio" {
+		t.Errorf("permanent: %+v", got)
+	}
+}

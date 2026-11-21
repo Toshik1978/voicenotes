@@ -46,9 +46,12 @@ type TranscribeRequest struct {
 }
 
 // TranscribeResult is the transcript and the language the service reported.
+// NoSpeechProbs is each segment's no-speech probability, or nil when the
+// service did not report one for every segment.
 type TranscribeResult struct {
-	Text     string
-	Language string
+	Text          string
+	Language      string
+	NoSpeechProbs []float64
 }
 
 // Transcriber turns audio into text.
@@ -86,12 +89,14 @@ type Downloader interface {
 
 // FileStore holds capture files by name, relative to the files directory.
 // Write is durable and replaces an existing file; Remove of a missing file
-// is not an error.
+// is not an error. Hold durably moves a file into the no-speech hold area as
+// heldName; a missing file is not an error there either.
 type FileStore interface {
 	Write(name string, data []byte) error
 	Read(name string) ([]byte, error)
 	Exists(name string) (bool, error)
 	Remove(name string) error
+	Hold(name, heldName string) error
 }
 
 // Enricher is the chat call of the optional LLM step. It is nil when the LLM
@@ -122,10 +127,17 @@ type Describer interface {
 	Describe(ctx context.Context, image []byte, mime string) (string, capture.Outcome)
 }
 
-// Deps are the collaborators of the step handlers. All but Enricher,
+// VoiceDetector reports whether audio holds any speech. It is nil unless
+// STT_VAD; the wiring passes the speech-to-text client.
+type VoiceDetector interface {
+	HasSpeech(ctx context.Context, r TranscribeRequest) (bool, capture.Outcome)
+}
+
+// Deps are the collaborators of the step handlers. All but Voice, Enricher,
 // Extractor, Describer and Log are required.
 type Deps struct {
 	Transcriber Transcriber
+	Voice       VoiceDetector
 	Notes       NotesWriter
 	Replier     Replier
 	Downloader  Downloader
@@ -142,6 +154,9 @@ type StepsConfig struct {
 	TodoTag         string
 	NoteLimit       int
 	SourceLanguages []string
+	// NoSpeechThreshold marks a transcript as no speech when every segment's
+	// no-speech probability reaches it (FR-210a); 0 turns the check off.
+	NoSpeechThreshold float64
 	// Location decides the local date in attachment names; nil means UTC.
 	Location *time.Location
 	// Enrich selects the LLM functions and validation limits; it is used only
@@ -309,7 +324,8 @@ func (s *stepRunner) downloadFile(ctx context.Context, c *capture.Capture, i int
 // one is wired, and a photo it barely read (or every photo, without a reader)
 // then goes to the vision model when one is wired. Files no reader can take
 // are skipped; videos always are. Once none remain, an audio capture takes its
-// file's text and language, so enrich and render see a voice note as before.
+// file's text and language, so enrich and render see a voice note as before;
+// a transcript that is empty once trimmed marks it NoSpeech (FR-210a).
 func (s *stepRunner) extract(ctx context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
 	c.Files = slices.Clone(c.Files)
 	skipUnreadFiles(c.Files, s.d.Extractor != nil, s.d.Describer != nil)
@@ -324,6 +340,9 @@ func (s *stepRunner) extract(ctx context.Context, c capture.Capture) (capture.Ca
 	if c.Kind == capture.KindAudio {
 		if i := slices.IndexFunc(c.Files, func(f capture.File) bool { return f.Kind == capture.FileAudio }); i >= 0 {
 			c.Text, c.Language = c.Files[i].Text, c.Files[i].Language
+			// Only a successful transcript can be "no speech"; a failed
+			// file still yields a placeholder note.
+			c.NoSpeech = c.Files[i].State == capture.FileDone && strings.TrimSpace(c.Text) == ""
 		}
 	}
 
@@ -406,6 +425,12 @@ func (s *stepRunner) transcribeFile(ctx context.Context, c *capture.Capture, i i
 	if isForced {
 		req.Language = forced
 	}
+	if s.noVoice(ctx, *c, req) {
+		// The detector heard no speech: Whisper would only invent some (FR-210a).
+		f.Text, f.TextSource, f.Language, f.State = "", capture.TextSTT, "", capture.FileDone
+
+		return capture.OK()
+	}
 	res, out := s.d.Transcriber.Transcribe(ctx, req)
 	// A reported language outside the configured sources is retried once with
 	// the first source. The step's result is persisted only after it returns,
@@ -422,17 +447,57 @@ func (s *stepRunner) transcribeFile(ctx context.Context, c *capture.Capture, i i
 
 		return out
 	}
+	s.keepTranscript(f, res, req.Language, s.d.Voice == nil)
+
+	return capture.OK()
+}
+
+// keepTranscript stores a successful transcription on f. requested is the
+// language the call forced, if any. score applies the no-speech threshold; it
+// is off once a voice detector has heard speech, because a one-word note
+// scores as high as 0.64.
+func (s *stepRunner) keepTranscript(f *capture.File, res TranscribeResult, requested string, score bool) {
+	if score && silent(res.NoSpeechProbs, s.cfg.NoSpeechThreshold) {
+		// Whisper invents text for silence ("Thank you"); its own score says
+		// no segment is speech, so the transcript is empty (FR-210a).
+		res.Text = ""
+	}
 	f.Text, f.TextSource, f.Language, f.State = res.Text, capture.TextSTT, "", capture.FileDone
 	reported := res.Language
 	if strings.TrimSpace(reported) == "" {
 		// Nothing reported (json format): a forced language is still known.
-		reported = req.Language
+		reported = requested
 	}
 	if iso, ok := language.Normalize(reported); ok {
 		f.Language = iso
 	}
+}
 
-	return capture.OK()
+// noVoice reports whether the voice detector, when there is one, found no
+// speech. A failed check counts as speech: transcribing costs a call, while a
+// wrong "no speech" would drop the capture.
+func (s *stepRunner) noVoice(ctx context.Context, c capture.Capture, req TranscribeRequest) bool {
+	if s.d.Voice == nil {
+		return false
+	}
+	speech, out := s.d.Voice.HasSpeech(ctx, req)
+	if out.Class != capture.ClassOK {
+		s.log(c, "voice detection failed, transcribing anyway", errors.New(out.Reason))
+
+		return false
+	}
+
+	return !speech
+}
+
+// silent reports whether every segment's no-speech probability reaches the
+// threshold. No segments, or no threshold, is never silent.
+func silent(probs []float64, threshold float64) bool {
+	if threshold <= 0 || len(probs) == 0 {
+		return false
+	}
+
+	return !slices.ContainsFunc(probs, func(p float64) bool { return p < threshold })
 }
 
 // enrich runs the optional LLM step. Without an Enricher it records
@@ -749,7 +814,9 @@ func QueuedText(on capture.WaitingOn) string {
 }
 
 // cleanup removes every local file and the content (FR-012); the identity
-// needed for dedupe stays. Policy.Next clears SendNewReply when
+// needed for dedupe stays. A microphone recording with no speech has no
+// other copy, so its files are moved to the hold area as <id>.wav
+// (localName) instead (FR-210b). Policy.Next clears SendNewReply when
 // finalize_reply fails permanently and the step advances, so the new reply it
 // asked for is delivered here, before anything is erased.
 func (s *stepRunner) cleanup(ctx context.Context, c capture.Capture) (capture.Capture, capture.Outcome) {
@@ -763,8 +830,14 @@ func (s *stepRunner) cleanup(ctx context.Context, c capture.Capture) (capture.Ca
 	for i := range c.Files {
 		f := &c.Files[i]
 		if f.LocalPath != "" {
-			if err := s.d.Files.Remove(f.LocalPath); err != nil {
-				s.log(c, "file remove failed", err)
+			var err error
+			if c.NoSpeech && c.Source == capture.SourceMic {
+				err = s.d.Files.Hold(f.LocalPath, localName(c.ID, *f))
+			} else {
+				err = s.d.Files.Remove(f.LocalPath)
+			}
+			if err != nil {
+				s.log(c, "file cleanup failed", err)
 
 				return c, capture.Temporary("file store: " + err.Error())
 			}
@@ -787,8 +860,14 @@ func holdsAudio(c capture.Capture) bool {
 	return holdsFile(c) && !c.MinimalNote
 }
 
+// textNoSpeech is the reply for a transcript with no speech (FR-210a).
+const textNoSpeech = "🔇 no speech heard — not saved"
+
 // replyText builds the final reply (contracts/telegram-ux.md), HTML-escaped.
 func replyText(c capture.Capture) string {
+	if c.NoSpeech {
+		return textNoSpeech
+	}
 	link := `<a href="` + html.EscapeString(c.NoteURL) + `">open</a>`
 	if c.Kind == capture.KindFiles {
 		return filesReplyText(c, link)
