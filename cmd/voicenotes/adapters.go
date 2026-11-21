@@ -163,8 +163,8 @@ func (s startReplies) TakeStartReply(
 	return s.db.TakeStartReply(ctx, recordingID) //nolint:wrapcheck // pass-through adapter
 }
 
-// heldPurger purges done captures through the store and held no-speech
-// audio through HeldAudio.
+// heldPurger purges done captures and forgets retired recorders through the
+// store, and purges held no-speech audio through HeldAudio.
 type heldPurger struct {
 	*sqlite.DB
 	pipeline.HeldAudio
@@ -176,10 +176,11 @@ type micPurger struct {
 	pipeline.StartReplyJanitor
 }
 
-// purgerFor returns the purge target of PurgeLoop: the store plus the held
-// audio in heldDir (purged even with the microphone off, so audio held before
-// it was disabled still goes) and, with the microphone enabled, the janitor
-// that marks stale start messages.
+// purgerFor returns the purge target of PurgeLoop: the store (done captures
+// and recorders not seen for pipeline.RecorderRetention) plus the held audio
+// in heldDir (both purged even with the microphone off, so what was left
+// before it was disabled still goes) and, with the microphone enabled, the
+// janitor that marks stale start messages.
 //
 //nolint:ireturn // the result is either implementation
 func purgerFor(
@@ -207,17 +208,21 @@ func (a alertStore) RecorderStatuses(ctx context.Context) ([]mic.RecorderStatus,
 	}
 	out := make([]mic.RecorderStatus, len(rows))
 	for i, r := range rows {
+		set, err := mic.ParseAlertSet(r.Alert)
+		if err != nil {
+			return nil, fmt.Errorf("recorder %q: %w", r.Name, err)
+		}
 		out[i] = mic.RecorderStatus{
 			Name: r.Name, LastSeen: r.LastSeen, ReceiverPresent: r.ReceiverPresent,
-			StorageFull: r.StorageFull, Alert: mic.Alert(r.Alert),
+			StorageFull: r.StorageFull, Outstanding: set,
 		}
 	}
 
 	return out, nil
 }
 
-func (a alertStore) SetRecorderAlert(ctx context.Context, name string, alert mic.Alert) error {
-	if err := a.db.SetRecorderAlert(ctx, name, string(alert)); err != nil {
+func (a alertStore) SetRecorderAlert(ctx context.Context, name string, alerts mic.AlertSet) error {
+	if err := a.db.SetRecorderAlert(ctx, name, alerts.String()); err != nil {
 		return fmt.Errorf("set recorder alert: %w", err)
 	}
 

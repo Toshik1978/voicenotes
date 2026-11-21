@@ -224,6 +224,7 @@ func wire(
 		func(ctx context.Context) { serveAndDrain(ctx, ln, mux, micHandler, log) },
 		func(ctx context.Context) { pipeline.PurgeLoop(ctx, purger, pipeline.PurgeInterval, time.Now, log) },
 	}, digestRun...)
+	goroutines = append(goroutines, replyLoopRun(purger, log)...)
 	goroutines = append(goroutines, micAlertRun(cfg, log, db, tg)...)
 
 	return &service{goroutines: goroutines}, nil
@@ -474,5 +475,18 @@ func micAlertRun(cfg config.Config, log *zap.Logger, db *sqlite.DB, replier pipe
 
 	return []func(context.Context){func(ctx context.Context) {
 		loop.Run(ctx, func(err error) { log.Warn("recorder alerts", zap.Error(err)) })
+	}}
+}
+
+// replyLoopRun runs the hourly start-reply cleanup when the purger has one
+// (microphone enabled).
+func replyLoopRun(p pipeline.Purger, log *zap.Logger) []func(context.Context) {
+	rp, ok := p.(pipeline.ReplyPurger)
+	if !ok {
+		return nil
+	}
+
+	return []func(context.Context){func(ctx context.Context) {
+		pipeline.ReplyLoop(ctx, rp, pipeline.StartReplyInterval, time.Now, log)
 	}}
 }

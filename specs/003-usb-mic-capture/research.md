@@ -140,8 +140,11 @@ recorder binary (constitution v2.0.0). Each lists the decision, why, and what el
   - The upload is an idempotent `PUT /mic/v1/recordings/{id}` with a WAV body and
     `X-Content-SHA256`. The service verifies length, hash and WAV header before inserting.
   - The start notice, discard notice and check-in are small JSON calls.
-  - The server gets `ReadTimeout` 2m and `WriteTimeout` 30s; the upload route wraps the body in
-    `http.MaxBytesReader(MIC_UPLOAD_MAX_BYTES)`.
+  - The server gets `ReadTimeout` 2m and `WriteTimeout` 2m30s (Go's `WriteTimeout` runs from the
+    end of the request headers through the response, so it is the read timeout plus a 30 s margin
+    for the reply). An upload extends both for its own request, sized from its length at no less
+    than 64 KiB/s plus 30 s (never under 2m), so a long recording over weak Wi-Fi still lands. The
+    upload route wraps the body in `http.MaxBytesReader(MIC_UPLOAD_MAX_BYTES)`.
   - The full contract is in [contracts/mic-http-api.md](contracts/mic-http-api.md).
   - Client retry uses `capture.Backoff`: exponential with jitter, capped at
     `MIC_RETRY_MAX_INTERVAL`, oldest recording first, without limit. Handling of 401, 413 and 415
@@ -201,10 +204,15 @@ recorder binary (constitution v2.0.0). Each lists the decision, why, and what el
 ## R12. Recorder status and alerts (FR-227, FR-227a)
 
 - **Decision**: a pure alert machine, `mic.Alerts`.
-  - Priority order: `silent` (no check-in for `MIC_SILENCE_ALERT`), then `storage_full`, then
-    `missing_receiver`, then `ok`.
-  - The outstanding alert is stored in `mic_recorders(name PK, last_seen, receiver_present,
-    storage_full, alert)`.
+  - Alerts are per condition: `silent` (no check-in for `MIC_SILENCE_ALERT`), `storage_full` and
+    `missing_receiver` are tracked separately as a set (`mic.AlertSet`). Each condition sends one
+    alert when it starts and one recovery when it clears, independently of the others, so a
+    receiver unplugged while storage is full still alerts. While a recorder is silent only the
+    silence is reported; on "back online" the other conditions are re-evaluated and whatever
+    changed meanwhile alerts or recovers. Each message is sent before its new set is stored, so a
+    crash repeats at most one message and loses none.
+  - The outstanding conditions are stored in `mic_recorders(name PK, last_seen, receiver_present,
+    storage_full, alert)`, as `ok` or the condition names joined by commas.
   - Every recorder checks in over HTTP every `MIC_CHECKIN_INTERVAL` (default 1m), including one on
     the service's host, so there is no in-process special case.
   - The service's `AlertLoop` evaluates every 30 s, sends transitions silently, and degrades

@@ -28,6 +28,10 @@ const (
 	statusCorrupt = "corrupt"
 )
 
+// ErrUnauthorized is wrapped by a check-in or notice error when the service
+// refused the credential (401).
+var ErrUnauthorized = errors.New("recorder: credential refused")
+
 // Client is the recorder's HTTP side: it implements [Handoff], [Notifier]
 // and [CheckIn] against the service's /mic/v1 API.
 type Client struct {
@@ -190,6 +194,14 @@ func (c *Client) Discarded(ctx context.Context, id int64) error {
 		noticeTimeout, nil, http.StatusNoContent)
 }
 
+// tapsRecord is what a check-in reports as receiver_present: the receiver is
+// there and the last start and finish worked. While audio cannot start or a
+// recording cannot be finished, the service's missing-receiver alert ("taps
+// won't record") is the one that fits.
+func (s Status) tapsRecord() bool {
+	return s.ReceiverPresent && !s.AudioError && !s.FinishError
+}
+
 // Send implements [CheckIn].
 func (c *Client) Send(ctx context.Context, s Status) error {
 	var oldest *string
@@ -204,7 +216,7 @@ func (c *Client) Send(ctx context.Context, s Status) error {
 		Pending         int     `json:"pending"`
 		ReceiverPresent bool    `json:"receiver_present"`
 		StorageFull     bool    `json:"storage_full"`
-	}{oldest, s.Pending, s.ReceiverPresent, s.StorageFull})
+	}{oldest, s.Pending, s.tapsRecord(), s.StorageFull})
 	if err != nil {
 		return fmt.Errorf("recorder: encode check-in: %w", err)
 	}
@@ -244,6 +256,10 @@ func (c *Client) simple(
 	}
 
 	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("%w: %w", ErrUnauthorized, statusError(op, resp.StatusCode, readReply(resp)))
+	}
 
 	if resp.StatusCode != want {
 		return statusError(op, resp.StatusCode, readReply(resp))

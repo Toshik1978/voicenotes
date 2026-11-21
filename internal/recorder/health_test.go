@@ -89,6 +89,27 @@ func TestComputeHealth(t *testing.T) {
 			},
 		},
 		{
+			name: "audio could not start a recording",
+			s:    Status{Running: true, ReceiverPresent: true, InputGrabbed: true, AudioError: true},
+			want: HealthReport{
+				Status:       health.StatusDegraded,
+				Receiver:     "connected",
+				InputGrabbed: true,
+				Storage:      "ok",
+				AudioError:   true,
+			},
+		},
+		{
+			name: "a recording could not be finished",
+			s:    Status{Running: true, ReceiverPresent: true, InputGrabbed: true, FinishError: true},
+			want: HealthReport{
+				Status:       health.StatusDegraded,
+				Receiver:     "connected",
+				InputGrabbed: true,
+				Storage:      "error",
+			},
+		},
+		{
 			name: "pending within the threshold",
 			s: Status{
 				Running: true, ReceiverPresent: true, InputGrabbed: true,
@@ -111,9 +132,9 @@ func TestComputeHealth(t *testing.T) {
 			},
 		},
 		{
-			name: "input not grabbed is reported but not degraded",
+			name: "input not grabbed while the receiver is present degrades",
 			s:    Status{Running: true, ReceiverPresent: true},
-			want: HealthReport{Status: health.StatusOK, Receiver: "connected", Storage: "ok"},
+			want: HealthReport{Status: health.StatusDegraded, Receiver: "connected", Storage: "ok"},
 		},
 		{
 			name: "recording",

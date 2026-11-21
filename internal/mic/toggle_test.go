@@ -142,7 +142,20 @@ func TestToggleInterrupted(t *testing.T) {
 		t.Fatalf("idle: %+v", got)
 	}
 	tg.Tap(t0, "")
-	if got := tg.Interrupt(t0.Add(time.Millisecond)); got != (Action{Kind: ActionStop, ID: 7, End: EndInterrupted}) {
+	if got := tg.Interrupt(t0.Add(minLen)); got != (Action{Kind: ActionStop, ID: 7, End: EndInterrupted}) {
+		t.Fatalf("interrupt: %+v", got)
+	}
+	if tg.Recording() {
+		t.Fatal("want idle")
+	}
+}
+
+// A recording interrupted below the minimum length is discarded like a short
+// tapped one (FR-209).
+func TestToggleInterruptedShortDiscards(t *testing.T) {
+	tg := newToggle(7)
+	tg.Tap(t0, "")
+	if got := tg.Interrupt(t0.Add(minLen - time.Millisecond)); got != (Action{Kind: ActionDiscard, ID: 7}) {
 		t.Fatalf("interrupt: %+v", got)
 	}
 	if tg.Recording() {

@@ -705,3 +705,50 @@ func TestOverHTTP(t *testing.T) {
 		t.Fatal("upload not ingested intact")
 	}
 }
+
+// A slow upload must outlast the server's own read and write timeouts: the
+// handler extends both deadlines for the request, sized from its length.
+func TestUploadOutlastsServerTimeouts(t *testing.T) {
+	e := newEnv(t)
+	srv := httptest.NewUnstartedServer(e.h)
+	srv.Config.ReadTimeout = 200 * time.Millisecond
+	srv.Config.WriteTimeout = 200 * time.Millisecond
+	srv.Start()
+	t.Cleanup(srv.Close)
+
+	body := wav(1600)
+	pr, pw := io.Pipe()
+	go func() {
+		const chunks = 4
+		step := len(body) / chunks
+		for i := range chunks {
+			end := (i + 1) * step
+			if i == chunks-1 {
+				end = len(body)
+			}
+			time.Sleep(150 * time.Millisecond)
+			if _, err := pw.Write(body[i*step : end]); err != nil {
+				return
+			}
+		}
+		_ = pw.Close()
+	}()
+	req := uploadReq("42", nil)
+	r, err := http.NewRequestWithContext(t.Context(), http.MethodPut, srv.URL+req.URL.Path, pr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Header = req.Header
+	r.Header.Set("X-Content-Sha256", sum(body))
+	r.ContentLength = int64(len(body))
+
+	resp, err := srv.Client().Do(r)
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status %d, body %s", resp.StatusCode, b)
+	}
+}

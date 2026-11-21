@@ -147,6 +147,33 @@ func unavailable(w http.ResponseWriter) {
 
 // upload stores a finished recording: stream to a temp file while hashing,
 // verify length, hash and WAV header, make it durable, then ingest it.
+// The server's own read timeout is sized for small requests. An upload may
+// take longer over a weak link, so its read deadline is sized from its length
+// at no less than minUploadRate, and the write deadline leaves uploadGrace to
+// answer after it.
+const (
+	minUploadRate   = 64 << 10 // bytes per second
+	minUploadWindow = 2 * time.Minute
+	uploadGrace     = 30 * time.Second
+)
+
+// uploadWindow is how long reading an upload of length bytes may take.
+func uploadWindow(length int64) time.Duration {
+	return max(minUploadWindow, time.Duration(length/minUploadRate)*time.Second+uploadGrace)
+}
+
+// extendDeadlines replaces the server's read and write deadlines for this
+// request. A writer without deadline support keeps the server's.
+func extendDeadlines(w http.ResponseWriter, length int64, log *zap.Logger) {
+	rc := http.NewResponseController(w)
+	read := time.Now().Add(uploadWindow(length))
+	for _, err := range []error{rc.SetReadDeadline(read), rc.SetWriteDeadline(read.Add(uploadGrace))} {
+		if err != nil && !errors.Is(err, http.ErrNotSupported) {
+			log.Warn("extending the upload deadline failed", zap.Error(err))
+		}
+	}
+}
+
 func (h *Handler) upload(w http.ResponseWriter, r *http.Request) {
 	id, rej := parseRecordingID(r.PathValue("id"))
 	if rej != nil {
@@ -161,6 +188,7 @@ func (h *Handler) upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log := h.log.With(zap.Int64("recording", id), zap.String("recorder", up.recorder))
+	extendDeadlines(w, up.length, log)
 
 	name, err := h.receive(w, r, id, up)
 	if errors.As(err, &rej) {
