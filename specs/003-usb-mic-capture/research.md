@@ -237,11 +237,14 @@ recorder binary (constitution v2.0.0). Each lists the decision, why, and what el
   - **Build**: `task build:mic` builds `bin/voicenotes-mic` with `CGO_ENABLED=1`. CI builds and
     tests it on the `ubuntu-24.04` and `ubuntu-24.04-arm` runners, natively with no
     cross-compiler.
-  - **Release**: `release.yml` adds a matrix job on those runners. It produces
+  - **Release**: `release.yml` runs GoReleaser (`.goreleaser.yaml`) on one Ubuntu 24.04 runner.
+    malgo links only libc, libdl, libpthread and libm (miniaudio loads ALSA with `dlopen`), so
+    arm64 cross-compiles with `gcc-aarch64-linux-gnu`. It produces
     `voicenotes-mic_<version>_linux_{amd64,arm64}.tar.gz` containing the binary, `LICENSE`, and
     `deploy/voicenotes-mic.service` (an example systemd unit with `User=voicenotes-mic`,
     `SupplementaryGroups=audio input`, `StateDirectory=voicenotes-mic` and
-    `EnvironmentFile=/etc/voicenotes-mic.env`), and attaches the tarballs to the GitHub release.
+    `EnvironmentFile=/usr/local/etc/voicenotes-mic.env`) plus the env example, and a checksums file, and
+    creates the GitHub release with them and the notes.
     The images are unchanged (amd64 and arm64). Building on 24.04 (glibc 2.39) runs on Ubuntu
     26.04.
   - **Health address**: the recorder serves `/healthz` on `MIC_HTTP_ADDR` (default

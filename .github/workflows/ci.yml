@@ -264,3 +264,34 @@ jobs:
       # task build:mic sets CGO_ENABLED=1.
       - name: Run build
         run: task build:mic
+
+  # Builds the recorder archives exactly as release.yml will (.goreleaser.yaml,
+  # arm64 cross-compiled), so a broken config or cross build fails here and
+  # not on a tag. Publishes nothing.
+  release-snapshot:
+    name: release-snapshot
+    # Same runner as release.yml: the glibc the archives link against.
+    runs-on: ubuntu-24.04
+    needs: [lint, test]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install the arm64 C cross-compiler
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+
+      - name: Setup Golang
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          check-latest: true
+
+      - name: Build the release archives
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --snapshot --clean --skip=publish

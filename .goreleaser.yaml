@@ -1,0 +1,66 @@
+version: 2
+
+# GoReleaser builds and publishes only the recorder, voicenotes-mic. The
+# service ships as the multi-arch Docker image that release.yml builds with
+# buildx; GoReleaser creates the GitHub release that carries the recorder
+# archives and the notes.
+
+project_name: voicenotes
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: voicenotes-mic
+    main: ./cmd/voicenotes-mic
+    binary: voicenotes-mic
+    # malgo is cgo. It links only libc, libdl, libpthread and libm; miniaudio
+    # loads ALSA with dlopen at run time, so cross-compiling arm64 needs only
+    # a C cross-compiler (gcc-aarch64-linux-gnu), not the target's ALSA.
+    # Built on Ubuntu 24.04 (glibc 2.39), the binaries run on 26.04.
+    env:
+      - CGO_ENABLED=1
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.Version={{ .Version }}
+      - -X main.Commit={{ .ShortCommit }}
+      - -X main.Buildstamp={{ .Date }}
+    goos: [linux]
+    goarch: [amd64, arm64]
+    overrides:
+      - goos: linux
+        goarch: arm64
+        env:
+          - CC=aarch64-linux-gnu-gcc
+
+archives:
+  - id: voicenotes-mic
+    ids: [voicenotes-mic]
+    formats: [tar.gz]
+    name_template: "voicenotes-mic_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    wrap_in_directory: true
+    files:
+      - LICENSE
+      - src: deploy/voicenotes-mic.service
+        strip_parent: true
+      - src: deploy/voicenotes-mic.env.example
+        strip_parent: true
+
+checksum:
+  name_template: "voicenotes-mic_{{ .Version }}_checksums.txt"
+
+# The changelog pipe stays enabled on purpose: `changelog: disable: true` also
+# makes GoReleaser ignore `--release-notes` and publish an empty body.
+# Enabled, it takes the body release.yml extracted from CHANGELOG.md and
+# generates nothing of its own.
+release:
+  # Pinned rather than inferred from `origin`: a rename, a move or a fork's
+  # tag push would otherwise publish to the wrong repository.
+  github:
+    owner: Toshik1978
+    name: voicenotes
+  draft: false
+  prerelease: auto
