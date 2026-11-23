@@ -9,6 +9,44 @@ Versions follow [semver](https://semver.org). Commits follow
 
 ---
 
+## v0.3.0 — 2026-11-23
+
+Highlights:
+
+- A wireless microphone captures without the phone: tap the DJI Mic Mini 2S transmitter's Linking button, talk, tap again, and the recording becomes an `#inbox` note with the WAV attached, timed at the first tap. A silent `🎙 recording…` message appears at the first tap and is edited to the outcome.
+- A new recorder binary, `voicenotes-mic`, runs as a systemd unit on whichever host has the receiver: the VoiceNotes host itself, or a small box such as a Raspberry Pi that uploads over the local network. Each release attaches it for linux/amd64 and linux/arm64, with checksums. The service stays static and CGO-free and gains `/mic/v1/` only when `MIC_UPLOAD_TOKEN` is set.
+- Nothing is lost when something breaks: recordings are spooled as they are made, recovered after a crash and uploaded with retries until the service has stored them. Alerts tell the owner when a receiver is missing, a recorder's storage is full or a recorder has not been heard from, and `/healthz` reports each recorder.
+- No speech, no note, from every source: a transcript with no speech creates no note and the reply says so (previously silence produced a placeholder note). Microphone audio is held in `$DATA_DIR/nospeech/` for `MIC_NOSPEECH_HOLD` (7 days). With speaches, set `STT_VAD=true`: Whisper invents text for silence, and the voice activity check stops it.
+- Upgrade: migration 004 runs on start. With no `MIC_*` setting, nothing changes except the no-speech rule.
+
+### Features
+
+- feat(mic): microphone settings, coverage scope and cgo fence ([44a59d0](https://github.com/Toshik1978/voicenotes/commit/44a59d07e6791ac8ade27209752160e414737987))
+- feat(mic): recording core, store, ingest, spool and recorder loop ([f7092b9](https://github.com/Toshik1978/voicenotes/commit/f7092b94dc0cfe98c37b894324691095e329c011))
+- feat(mic): tap, talk, tap — direct-mode recorder and service API ([0028174](https://github.com/Toshik1978/voicenotes/commit/00281745e610a0bb820b6682f9bb021b707d649f))
+- feat(mic): proxy mode — record near the bed, process on the server ([a88abb4](https://github.com/Toshik1978/voicenotes/commit/a88abb486deea68afbad417ade0eef4c8b535cf9))
+- feat(mic): nothing is lost when something breaks mid-recording ([7483626](https://github.com/Toshik1978/voicenotes/commit/74836268f6ae6453edd85a61e3bde23939543b16))
+- feat: no empty notes from silence, from any source ([54871fb](https://github.com/Toshik1978/voicenotes/commit/54871fb3a1314de1ceb239e38554212aa2db0df1))
+
+### Bug Fixes
+
+- fix(mic): converge with the spec and act on the final review ([7a14f83](https://github.com/Toshik1978/voicenotes/commit/7a14f8335a9a4fc74654f6deea3b285e3531d093))
+
+### Others
+
+- ci: group Dependabot security updates ([aa221ba](https://github.com/Toshik1978/voicenotes/commit/aa221ba158568cd9dbeb0fefbdade41c4e6e138e))
+- ci: run CI weekly ([f435bd5](https://github.com/Toshik1978/voicenotes/commit/f435bd50284d2d2af74dae9b157e7ee8cbafeea3))
+- ci: scan for known vulnerabilities with govulncheck ([26d7148](https://github.com/Toshik1978/voicenotes/commit/26d7148c6631ed8e6cf1a536bbef4d4abe64de35))
+- ci(dependabot): apply house defaults ([dcab04c](https://github.com/Toshik1978/voicenotes/commit/dcab04c35c4ebff0ed7c1971c3b1327ab92e378d))
+- ci: add pre-commit file guards, actionlint and gitleaks ([671404c](https://github.com/Toshik1978/voicenotes/commit/671404cf4f591567232881054e4543f877e650fe))
+- ci: scan history for secrets with gitleaks ([b1d4b71](https://github.com/Toshik1978/voicenotes/commit/b1d4b713f6f3cebd57144deec5813a5a6df077c4))
+- docs: amend constitution to v2.0.0 (no-speech exception, cgo-free service with cgo recorder) ([fddcd2f](https://github.com/Toshik1978/voicenotes/commit/fddcd2fc1d25f84246fa4787f6013b13a15483f2))
+- docs: document the wireless microphone feature ([4f081c1](https://github.com/Toshik1978/voicenotes/commit/4f081c11c2a4294342c0d9088571aee9abfd567b))
+- refactor: drop redundant compile-time interface assertions ([476861a](https://github.com/Toshik1978/voicenotes/commit/476861a5bc8a25eabff029d99bf5a90a64722394))
+- build(release): release the recorder with GoReleaser ([aceb669](https://github.com/Toshik1978/voicenotes/commit/aceb669d689a6359cee1b34430982625f80c1857))
+
+---
+
 ## v0.2.0 — 2026-11-01
 
 Highlights:
