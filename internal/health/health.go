@@ -67,9 +67,13 @@ type RecorderReport struct {
 	LastSeen string `json:"last_seen"`
 }
 
-// Report is the verdict plus the JSON body of GET /healthz.
+// Report is the verdict plus the JSON body of GET /healthz. ServiceStatus
+// is the verdict with recorder alerts left out; it is sent only when it
+// differs from Status, so a monitor that pages on backlogs need not page a
+// second time for a microphone outage (the service alerts on that itself).
 type Report struct {
 	Status           Status `json:"status"`
+	ServiceStatus    Status `json:"service_status,omitempty"`
 	Pending          int    `json:"pending"`
 	OldestPendingAge string `json:"oldest_pending_age"`
 	WaitingOn        string `json:"waiting_on,omitempty"`
@@ -77,6 +81,14 @@ type Report struct {
 	LastDigest       string `json:"last_digest,omitempty"`
 
 	Recorders []RecorderReport `json:"recorders,omitempty"`
+}
+
+// ServiceOnly returns the verdict with recorder alerts left out.
+func (r Report) ServiceOnly() Status {
+	if r.ServiceStatus != "" {
+		return r.ServiceStatus
+	}
+	return r.Status
 }
 
 // Compute derives the report from the snapshot.
@@ -92,22 +104,34 @@ func Compute(in Input) Report {
 		r.LastPollOK = in.LastPollOK.UTC().Format(time.RFC3339)
 	}
 
-	degraded := pollStale(in)
+	recorders := false
 	for _, rec := range in.RecorderAlerts {
 		r.Recorders = append(r.Recorders, RecorderReport{
 			Name: rec.Name, Alert: rec.Alert, LastSeen: rec.LastSeen.UTC().Format(time.RFC3339),
 		})
-		degraded = degraded || rec.outstanding()
+		recorders = recorders || rec.outstanding()
 	}
 
-	switch {
-	case !in.StoreOK || !in.WorkerAlive:
-		r.Status = StatusUnhealthy
-	case in.Pending > 0 && (in.Misconfig || in.OldestPendingAge > in.Threshold), degraded:
+	service := serviceStatus(in)
+	r.Status = service
+	if service == StatusOK && recorders {
 		r.Status = StatusDegraded
+		r.ServiceStatus = service
 	}
 
 	return r
+}
+
+// serviceStatus is the verdict from everything but the recorders.
+func serviceStatus(in Input) Status {
+	switch {
+	case !in.StoreOK || !in.WorkerAlive:
+		return StatusUnhealthy
+	case in.Pending > 0 && (in.Misconfig || in.OldestPendingAge > in.Threshold), pollStale(in):
+		return StatusDegraded
+	}
+
+	return StatusOK
 }
 
 // pollStale reports whether polling has failed for longer than the threshold.

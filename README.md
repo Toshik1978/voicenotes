@@ -243,7 +243,11 @@ reported; when it comes back, "back online" is followed by whatever has changed 
 
 The service's `/healthz` gains a `recorders` list (`name`, `alert`, `last_seen`; `alert` is `ok`
 or the outstanding conditions joined by commas, such as `missing_receiver,storage_full`) and
-reports `degraded` while any recorder has an alert outstanding. The recorder serves its own
+reports `degraded` while any recorder has an alert outstanding. When recorder alerts are the only
+reason, the body also carries `"service_status": "ok"`, the verdict without them. A monitor that
+should not page a second time for a microphone outage, which the service already reports in Telegram,
+runs `voicenotes health --strict --ignore-recorders`: it fails on everything `--strict` fails on
+except recorder alerts. The recorder serves its own
 `GET /healthz` on `MIC_HTTP_ADDR` (default `127.0.0.1:8081`, loopback only): `receiver`, `storage`,
 `pending`, `rejected` and so on; `degraded` for a missing receiver, full storage, a spool error
 (`storage: error`, also set when a finished recording could not be closed), a recording that could
@@ -349,7 +353,7 @@ Subcommands of the binary:
 | Command | Purpose |
 |---|---|
 | `voicenotes [run]` | Run the service (the default when no command is given) |
-| `voicenotes health [--strict]` | Query the local health endpoint (see [Health](#health)) |
+| `voicenotes health [--strict [--ignore-recorders]]` | Query the local health endpoint (see [Health](#health)) |
 | `voicenotes version` | Print version, commit and build time |
 
 ## Configuration
@@ -590,7 +594,9 @@ down. Monitors that alert on a backlog read `status` from the body.
 
 `voicenotes health` calls the endpoint on `127.0.0.1` at the port of `HTTP_ADDR` and exits `0` on
 HTTP 200 and `1` otherwise, printing the body. The image uses it as its `HEALTHCHECK`, since
-distroless has no curl or shell. `voicenotes health --strict` also exits `1` on `degraded`. So
+distroless has no curl or shell. `voicenotes health --strict` also exits `1` on `degraded`, and
+`--strict --ignore-recorders` does unless `service_status` is `ok` (`--ignore-recorders` alone is a
+usage error and exits `2`). So
 `HTTP_ADDR` must listen on loopback: use `:port` or `0.0.0.0:port` (or `127.0.0.1:port`), not a
 single non-loopback IP, or the `HEALTHCHECK` fails and the container shows as unhealthy.
 

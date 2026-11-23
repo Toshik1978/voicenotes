@@ -48,15 +48,38 @@ func (l bothLanes) StoreOK() bool {
 	return true
 }
 
-// runHealth implements `voicenotes health [--strict]`: it GETs the local
-// health endpoint (the distroless image has no curl), prints the body and
-// exits 0 on HTTP 200 and 1 otherwise. With --strict, degraded also exits 1.
+// strictness is how a degraded status counts in `voicenotes health`.
+type strictness int
+
+const (
+	lenient                 strictness = iota // degraded exits 0
+	strict                                    // degraded exits 1
+	strictIgnoringRecorders                   // degraded exits 1 unless only recorder alerts caused it
+)
+
+// runHealth implements `voicenotes health [--strict [--ignore-recorders]]`:
+// it GETs the local health endpoint (the distroless image has no curl),
+// prints the body and exits 0 on HTTP 200 and 1 otherwise. With --strict,
+// degraded also exits 1; --ignore-recorders leaves recorder alerts out of
+// that, since the service sends its own message for them.
 func runHealth(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("health", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	strict := fs.Bool("strict", false, "also exit 1 when the status is degraded")
+	isStrict := fs.Bool("strict", false, "also exit 1 when the status is degraded")
+	ignoreRecorders := fs.Bool("ignore-recorders", false,
+		"with --strict, do not fail when only microphone recorder alerts make the status degraded")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	mode := lenient
+	switch {
+	case *ignoreRecorders && !*isStrict:
+		_, _ = fmt.Fprintln(stderr, "health: --ignore-recorders needs --strict")
+		return 2
+	case *ignoreRecorders:
+		mode = strictIgnoringRecorders
+	case *isStrict:
+		mode = strict
 	}
 	url, err := healthURL(os.Getenv("HTTP_ADDR"))
 	if err != nil {
@@ -66,7 +89,7 @@ func runHealth(args []string, stdout, stderr io.Writer) int {
 	ctx, cancel := context.WithTimeout(context.Background(), healthCheckTimeout)
 	defer cancel()
 
-	return checkHealth(ctx, url, *strict, stdout, stderr)
+	return checkHealth(ctx, url, mode, stdout, stderr)
 }
 
 // healthURL turns HTTP_ADDR into the loopback URL of the health endpoint.
@@ -83,7 +106,7 @@ func healthURL(addr string) (string, error) {
 }
 
 // checkHealth GETs url, prints the body and returns the process exit code.
-func checkHealth(ctx context.Context, url string, strict bool, stdout, stderr io.Writer) int {
+func checkHealth(ctx context.Context, url string, mode strictness, stdout, stderr io.Writer) int {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody) //nolint:gosec // G704: loopback URL.
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, "health:", err)
@@ -105,13 +128,19 @@ func checkHealth(ctx context.Context, url string, strict bool, stdout, stderr io
 	if resp.StatusCode != http.StatusOK {
 		return 1
 	}
-	if strict {
-		var rep struct {
-			Status health.Status `json:"status"`
-		}
-		if err := json.Unmarshal(body, &rep); err != nil || rep.Status != health.StatusOK {
-			return 1
-		}
+	if mode == lenient {
+		return 0
+	}
+	var rep health.Report
+	if err := json.Unmarshal(body, &rep); err != nil {
+		return 1
+	}
+	status := rep.Status
+	if mode == strictIgnoringRecorders {
+		status = rep.ServiceOnly()
+	}
+	if status != health.StatusOK {
+		return 1
 	}
 
 	return 0

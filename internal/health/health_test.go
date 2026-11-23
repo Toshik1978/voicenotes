@@ -165,9 +165,45 @@ func TestComputeBodyRecorders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"status":"degraded","pending":0,"oldest_pending_age":"0s","last_poll_ok":"2026-10-30T02:59:00Z","recorders":[{"name":"bed","alert":"silent","last_seen":"2026-10-30T02:55:00Z"}]}`
+	want := `{"status":"degraded","service_status":"ok","pending":0,"oldest_pending_age":"0s","last_poll_ok":"2026-10-30T02:59:00Z","recorders":[{"name":"bed","alert":"silent","last_seen":"2026-10-30T02:55:00Z"}]}`
 	if string(b) != want {
 		t.Fatalf("body = %s\nwant   %s", b, want)
+	}
+}
+
+// ServiceStatus is the verdict with recorder alerts left out, so a monitor
+// that pages on backlogs is not paged a second time for a microphone outage.
+func TestComputeServiceStatus(t *testing.T) {
+	alert := []RecorderAlert{{Name: "bed", Alert: "silent"}}
+	tests := []struct {
+		name          string
+		edit          func(*Input)
+		status, alone Status
+	}{
+		{"healthy", func(*Input) {}, StatusOK, StatusOK},
+		{"recorder alert only", func(in *Input) { in.RecorderAlerts = alert }, StatusDegraded, StatusOK},
+		{"recorder alert and stale poll", func(in *Input) {
+			in.RecorderAlerts = alert
+			in.LastPollOK = in.Now.Add(-time.Hour)
+		}, StatusDegraded, StatusDegraded},
+		{"recorder alert and backlog", func(in *Input) {
+			in.RecorderAlerts = alert
+			in.Pending, in.OldestPendingAge = 1, time.Hour
+		}, StatusDegraded, StatusDegraded},
+		{"recorder alert and store down", func(in *Input) {
+			in.RecorderAlerts = alert
+			in.StoreOK = false
+		}, StatusUnhealthy, StatusUnhealthy},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := healthy()
+			tt.edit(&in)
+			r := Compute(in)
+			if r.Status != tt.status || r.ServiceOnly() != tt.alone {
+				t.Errorf("status = %s, service = %s; want %s, %s", r.Status, r.ServiceOnly(), tt.status, tt.alone)
+			}
+		})
 	}
 }
 

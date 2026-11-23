@@ -50,22 +50,27 @@ func TestCheckHealth(t *testing.T) {
 	const (
 		ok       = `{"status":"ok"}`
 		degraded = `{"status":"degraded"}`
+		micOnly  = `{"status":"degraded","service_status":"ok"}`
 		bad      = `{"status":"unhealthy"}`
 	)
 	tests := []struct {
 		name     string
 		code     int
 		body     string
-		strict   bool
+		mode     strictness
 		wantCode int
 	}{
-		{"ok", 200, ok, false, 0},
-		{"ok strict", 200, ok, true, 0},
-		{"degraded", 200, degraded, false, 0},
-		{"degraded strict", 200, degraded, true, 1},
-		{"unhealthy", 503, bad, false, 1},
-		{"unparseable strict", 200, "garbage", true, 1},
-		{"unparseable lenient", 200, "garbage", false, 0},
+		{"ok", 200, ok, lenient, 0},
+		{"ok strict", 200, ok, strict, 0},
+		{"degraded", 200, degraded, lenient, 0},
+		{"degraded strict", 200, degraded, strict, 1},
+		{"degraded ignoring recorders", 200, degraded, strictIgnoringRecorders, 1},
+		{"recorder alert strict", 200, micOnly, strict, 1},
+		{"recorder alert ignoring recorders", 200, micOnly, strictIgnoringRecorders, 0},
+		{"unhealthy", 503, bad, lenient, 1},
+		{"unparseable strict", 200, "garbage", strict, 1},
+		{"unparseable ignoring recorders", 200, "garbage", strictIgnoringRecorders, 1},
+		{"unparseable lenient", 200, "garbage", lenient, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -73,7 +78,7 @@ func TestCheckHealth(t *testing.T) {
 			defer srv.Close()
 
 			var stdout, stderr bytes.Buffer
-			got := checkHealth(context.Background(), srv.URL, tt.strict, &stdout, &stderr)
+			got := checkHealth(context.Background(), srv.URL, tt.mode, &stdout, &stderr)
 			if got != tt.wantCode {
 				t.Errorf("exit = %d, want %d (stderr %q)", got, tt.wantCode, stderr.String())
 			}
@@ -90,7 +95,7 @@ func TestCheckHealthUnreachable(t *testing.T) {
 	srv.Close()
 
 	var stdout, stderr bytes.Buffer
-	if got := checkHealth(context.Background(), url, false, &stdout, &stderr); got != 1 {
+	if got := checkHealth(context.Background(), url, lenient, &stdout, &stderr); got != 1 {
 		t.Errorf("exit = %d, want 1", got)
 	}
 	if stderr.Len() == 0 {
@@ -99,7 +104,7 @@ func TestCheckHealthUnreachable(t *testing.T) {
 }
 
 func TestRunHealthParsesFlagsAndEnv(t *testing.T) {
-	srv := healthServer(200, `{"status":"degraded"}`)
+	srv := healthServer(200, `{"status":"degraded","service_status":"ok"}`)
 	defer srv.Close()
 	_, port, err := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
 	if err != nil {
@@ -113,6 +118,12 @@ func TestRunHealthParsesFlagsAndEnv(t *testing.T) {
 	}
 	if got := run([]string{"health", "--strict"}, &stdout, &stderr); got != 1 {
 		t.Errorf("health --strict on degraded: exit = %d, want 1", got)
+	}
+	if got := run([]string{"health", "--strict", "--ignore-recorders"}, &stdout, &stderr); got != 0 {
+		t.Errorf("health --strict --ignore-recorders on a recorder alert: exit = %d, want 0", got)
+	}
+	if got := run([]string{"health", "--ignore-recorders"}, &stdout, &stderr); got != 2 {
+		t.Errorf("health --ignore-recorders without --strict: exit = %d, want 2", got)
 	}
 	if got := run([]string{"health", "--bogus"}, &stdout, &stderr); got != 2 {
 		t.Errorf("health --bogus: exit = %d, want 2", got)
@@ -136,7 +147,7 @@ func TestServeHTTPShutsDownGracefully(t *testing.T) {
 		serveHTTP(ctx, ln, h, zap.NewNop())
 	}()
 
-	code := checkHealth(context.Background(), "http://"+ln.Addr().String()+"/", false, io.Discard, io.Discard)
+	code := checkHealth(context.Background(), "http://"+ln.Addr().String()+"/", lenient, io.Discard, io.Discard)
 	if code != 0 {
 		t.Fatalf("request exit = %d, want 0", code)
 	}
