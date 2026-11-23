@@ -9,6 +9,19 @@ Versions follow [semver](https://semver.org). Commits follow
 
 ---
 
+## v0.4.0 — 2026-11-23
+
+Highlights:
+
+- A microphone outage pages once, not twice: `voicenotes health --strict --ignore-recorders` fails on everything `--strict` does except recorder alerts, which the service already reports in Telegram. `/healthz` adds `"service_status": "ok"` when recorder alerts are the only reason it is `degraded`. `--ignore-recorders` without `--strict` is a usage error (exit 2).
+- Upgrade: nothing to do. `voicenotes health` and `--strict` behave as before.
+
+### Features
+
+- feat(health): let --strict leave recorder alerts out with --ignore-recorders ([3e741f3](https://github.com/Toshik1978/voicenotes/commit/3e741f3c92492c438cdbe1c77b8f6858dbf184f6))
+
+---
+
 ## v0.3.0 — 2026-11-23
 
 Highlights:
