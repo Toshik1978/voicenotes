@@ -155,3 +155,44 @@ func TestFixed(t *testing.T) {
 		t.Fatalf("got %+v, %v, %v; want %+v", got, ok, err, want)
 	}
 }
+
+// The DJI Mic Mini 2S receiver on a Raspberry Pi, from the real kit (T030):
+// the receiver is USB 1-1.3, with its capture card on interface 1.1 and four
+// HID inputs on interface 1.0, of which only the "Consumer Control" (event0)
+// reports KEY_VOLUMEUP. The HDMI CEC remote (event4) reports KEY_VOLUMEUP too,
+// but it is not on USB, so it must not match. Headphones and HDMI audio are
+// playback-only cards.
+func TestDiscoverDJIReceiverOnPi(t *testing.T) {
+	const (
+		rx   = "devices/platform/soc/3f980000.usb/usb1/1-1/1-1.3"
+		hid  = rx + "/1-1.3:1.0/0003:2CA3:4011.0001/input"
+		hdmi = "devices/platform/soc/3f902000.hdmi"
+	)
+	links := map[string]string{
+		"class/sound/card0":  rx + "/1-1.3:1.1/sound/card0",
+		"class/sound/card1":  "devices/platform/soc/3f00b840.mailbox/bcm2835-audio/sound/card1",
+		"class/sound/card2":  hdmi + "/sound/card2",
+		"class/input/event0": hid + "/input0/event0",
+		"class/input/event1": hid + "/input1/event1",
+		"class/input/event2": hid + "/input2/event2",
+		"class/input/event3": hid + "/input3/event3",
+		"class/input/event4": hdmi + "/rc/rc0/input4/event4",
+		"class/input/event5": hdmi + "/sound/card2/input5/event5",
+	}
+	sys := Sysfs{FS: os.DirFS("testdata/dji/sys"), Real: fakeReal(links)}
+
+	got, ok, err := Discover{Sys: sys}.Discover()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (mic.Receiver{Card: 0, InputPath: "/dev/input/event0"}); !ok || got != want {
+		t.Fatalf("got %+v, %v; want %+v", got, ok, want)
+	}
+	remote, err := os.ReadFile("testdata/dji/sys/class/input/event4/device/capabilities/key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !mic.HasKey(string(remote), mic.KeyVolumeUp) {
+		t.Fatal("fixture: the HDMI remote should report KEY_VOLUMEUP, or this test proves nothing")
+	}
+}

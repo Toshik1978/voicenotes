@@ -23,9 +23,9 @@ On the host the receiver is plugged into (the Pi runs Ubuntu 26.04, aarch64):
 sudo apt install libasound2t64 evtest alsa-utils
 lsusb | grep -i 2ca3                 # expect 2ca3:4011 (another ID: record it, update R1)
 arecord -l                           # a capture device for the receiver
-sudo evtest                          # pick the receiver's "Consumer Control"; tap the TX
+sudo evtest                          # pick the receiver's "Consumer Control"; press Linking on the TX
                                      # expect: EV_KEY KEY_VOLUMEUP value 1, then value 0, per tap
-arecord -D hw:<card>,0 -f S16_LE -r 48000 -c 2 -d 5 test.wav && aplay test.wav
+arecord -D plughw:<card>,0 -f S16_LE -r 48000 -c 2 -d 5 test.wav && aplay test.wav
 ```
 
 Save anonymised outputs (`lsusb -v` without serial numbers, the sysfs paths involved, raw evtest

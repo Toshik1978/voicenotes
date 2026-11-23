@@ -6,8 +6,11 @@
 #   sudo systemctl enable --now voicenotes-mic
 [Unit]
 Description=VoiceNotes microphone recorder
-Wants=network-online.target sound.target
-After=network-online.target sound.target
+# time-sync.target holds the start only on a host whose time service has a wait
+# unit enabled (systemd-time-wait-sync, chrony-wait): a host without a real-time
+# clock then records with the right time. Wants= still starts it if that fails.
+Wants=network-online.target sound.target time-sync.target
+After=network-online.target sound.target time-sync.target
 
 [Service]
 User=voicenotes-mic

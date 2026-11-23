@@ -21,6 +21,16 @@ recorder binary (constitution v2.0.0). Each lists the decision, why, and what el
   - `evtest` shows one press and release of `KEY_VOLUMEUP` per tap.
   - A test recording through `voicenotes-mic` plays back clearly.
   - The captured outputs, anonymised with serials removed, become test fixtures.
+- **Verified on the real kit (2026-11-23)**, Ubuntu 26.04 on amd64 and on a Raspberry Pi (arm64):
+  - USB `2ca3:4011` "Wireless Mic Rx": one ALSA card, capture only `S24_3LE`, 2 channels,
+    48 kHz (both channels carry the same mono signal), and an input "Wireless Mic Rx Consumer
+    Control" whose key bitmap is `7800000000 8e000000000000 0` (keys 113-115, 119, 163-166).
+  - A tap is a short press of the transmitter's **Linking** button: `MSC_SCAN c00e9`, then
+    `KEY_VOLUMEUP` 1 and 0 about 1 ms apart. **Rec** starts the transmitter's internal recording
+    and reaches the host as nothing.
+  - Speech peaked at about -12 dBFS; room tone was about -69 dBFS.
+  - Fixtures: `internal/mic/testdata/key_dji_mic_rx.txt`, `tap_dji_mic_rx.bin` and the
+    `internal/micdev/testdata/dji/` sysfs tree.
 - **Alternatives**: the Hollyland Lark M2, which has no Linux evidence. The fallback if the kit
   fails verification is a Zigbee button through Home Assistant.
 
