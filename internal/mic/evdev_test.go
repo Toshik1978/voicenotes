@@ -100,3 +100,42 @@ func TestHasKey(t *testing.T) {
 		})
 	}
 }
+
+// The DJI Mic Mini 2S receiver (USB 2ca3:4011, "Wireless Mic Rx Consumer
+// Control"), captured on the real kit: its key bitmap, and the bytes one press
+// of the transmitter's Linking button produces (MSC_SCAN, KEY_VOLUMEUP 1,
+// SYN, then the same with value 0 about 1 ms later). Rec sends nothing.
+func TestDJIReceiverFixtures(t *testing.T) {
+	bitmap := readFixture(t, "key_dji_mic_rx.txt")
+	for _, code := range []int{113, 114, 115, 119, 163, 164, 165, 166} {
+		if !HasKey(bitmap, code) {
+			t.Errorf("bitmap lacks key %d", code)
+		}
+	}
+	if HasKey(bitmap, 116) {
+		t.Error("bitmap has key 116 (KEY_POWER)")
+	}
+
+	raw := readFixture(t, "tap_dji_mic_rx.bin")
+	if len(raw)%EventSize != 0 || len(raw) != 6*EventSize {
+		t.Fatalf("fixture is %d bytes, want 6 events", len(raw))
+	}
+	var taps, keys int
+	for off := 0; off < len(raw); off += EventSize {
+		var b [EventSize]byte
+		copy(b[:], raw[off:])
+		ev := DecodeEvent(b)
+		if ev.Type == EvKey {
+			keys++
+			if ev.Code != KeyVolumeUp {
+				t.Errorf("key event with code %d", ev.Code)
+			}
+		}
+		if IsTap(ev) {
+			taps++
+		}
+	}
+	if taps != 1 || keys != 2 {
+		t.Errorf("taps = %d, key events = %d; want one tap from a press and a release", taps, keys)
+	}
+}

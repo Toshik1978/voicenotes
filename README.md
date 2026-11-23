@@ -86,7 +86,7 @@ server speaking the same API will do, and no image, version, OCR engine or model
 ## Wireless microphone
 
 A DJI Mic Mini 2S transmitter and its Mobile Receiver (USB-C) can feed VoiceNotes without a phone.
-Plug the receiver into a Linux host, tap the transmitter's record button, talk, and tap again. The
+Plug the receiver into a Linux host, tap the transmitter's Linking button, talk, and tap again. The
 recording is saved and goes through the same pipeline as a Telegram voice message: the chat that
 receives microphone replies shows a silent `🎙 recording…` at the first tap, which the pipeline later
 edits to `✓ saved · open`. The note is `#inbox`, carries the WAV and is timed at the first tap.
@@ -103,8 +103,9 @@ Two programs take part:
 ### What the receiver must do
 
 The recorder needs two things from the receiver, both over USB: an ALSA capture device for the audio,
-and an input device that reports the transmitter's record button as `KEY_VOLUMEUP` (one press and
-release per tap). It grabs that input device exclusively, so a tap does not change the host's volume.
+and an input device that reports a tap as `KEY_VOLUMEUP` (one press and release per tap). On the
+DJI kit a tap is a short press of the transmitter's **Linking** button; its **Rec** button starts the
+transmitter's own internal recording and sends nothing to the host. It grabs that input device exclusively, so a tap does not change the host's volume.
 The hardware check below confirms both before anything is installed. When auto-discovery picks the
 wrong devices, name them with `MIC_CAPTURE_DEVICE` and `MIC_INPUT_DEVICE` (set both or neither).
 
@@ -116,13 +117,15 @@ On the host the receiver is plugged into:
 sudo apt install libasound2t64 evtest alsa-utils
 lsusb | grep -i 2ca3      # expect 2ca3:4011
 arecord -l                # a capture device for the receiver
-sudo evtest               # pick the receiver's "Consumer Control", tap the transmitter:
+sudo evtest               # pick the receiver's "Consumer Control", press Linking once:
                           # expect EV_KEY KEY_VOLUMEUP value 1, then value 0, per tap
-arecord -D hw:<card>,0 -f S16_LE -r 48000 -c 2 -d 5 test.wav && aplay test.wav
+arecord -D plughw:<card>,0 -f S16_LE -r 48000 -c 2 -d 5 test.wav && aplay test.wav
 ```
 
-If `lsusb` shows a different ID, or no `KEY_VOLUMEUP` events appear, stop and report it before going
-further.
+`plughw` converts: the DJI receiver captures only 24-bit stereo at 48 kHz (`S24_3LE`), so `hw:`
+rejects `S16_LE`. Without `sudo`, `arecord` needs the user in the `audio` group; a headless server
+has no desktop session to grant access. If `lsusb` shows a different ID, or no `KEY_VOLUMEUP`
+events appear, stop and report it before going further.
 
 ### Install the recorder
 
@@ -171,7 +174,11 @@ Notes for the Pi:
 - Disable the Pi's own Bluetooth for the same reason: add `dtoverlay=disable-bt` to the boot
   configuration (`/boot/firmware/config.txt` on Ubuntu) and reboot.
 - Keep the clock synchronised (the Ubuntu default, `systemd-timesyncd`). The service stamps check-ins
-  with its own clock, but the first-tap time is taken from the recorder's.
+  with its own clock, but the first-tap time is taken from the recorder's. A Raspberry Pi has no
+  real-time clock and boots with a stale time until NTP syncs, so a recording made right after boot
+  would be dated wrong. The unit starts after `time-sync.target`, so on such a host enable the time
+  service's wait unit (`systemd-time-wait-sync` or `chrony-wait`); its own timeout keeps an offline
+  host recording. On a host with a real-time clock nothing waits.
 
 Nothing is lost when something breaks. A recording is written to the spool as it is made, so a crash
 or a lost receiver keeps what was recorded; if the service is down, uploads wait in the spool and are
@@ -193,7 +200,8 @@ Set these on the service (all optional except `MIC_UPLOAD_TOKEN`, which turns th
 The recorder reads its own settings, listed in the example file: for instance `MIC_RECORDER_NAME`
 (default: the hostname), `MIC_MIN_LENGTH` (`2s`), `MIC_MAX_LENGTH` (`10m`, maximum `12m`),
 `MIC_SPOOL_MIN_FREE` (256 MiB), `MIC_CHECKIN_INTERVAL` (`1m`) and `MIC_HTTP_ADDR`
-(`127.0.0.1:8081`). `MIC_MIN_LENGTH` must be shorter than `MIC_MAX_LENGTH`. Keep
+(`127.0.0.1:8081`, a port other web frontends also default to; pick another if it is taken,
+or the recorder will not start). `MIC_MIN_LENGTH` must be shorter than `MIC_MAX_LENGTH`. Keep
 `MIC_CHECKIN_INTERVAL` below the service's `MIC_SILENCE_ALERT`: the two live on different hosts and
 cannot be checked against each other, and a check-in interval at or above the silence threshold
 makes the recorder flap between "not heard from" and "back online".

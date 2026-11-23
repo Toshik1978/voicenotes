@@ -321,11 +321,11 @@ through the unchanged pipeline, and the recorder loop runs against fakes.
   - direct mode (`MIC_SERVER_URL=http://127.0.0.1:8080`) and Pi mode
   - Pi notes: 5 GHz Wi-Fi or Ethernet, `dtoverlay=disable-bt`
   - service settings, the no-speech rule and the `nospeech/` hold, and the alerts
-- [ ] T030 Verify on the real kit. This needs the DJI Mic Mini 2S and the Mobile Receiver; follow quickstart.md §1.
+- [x] T030 Verify on the real kit. This needs the DJI Mic Mini 2S and the Mobile Receiver; follow quickstart.md §1.
   - Capture `lsusb -v` (serials removed), the sysfs paths involved, and raw evtest bytes. Add them as fixtures to `internal/mic/testdata/` and `internal/micdev/testdata/`, and extend the T006 and T016 tests with them.
   - Run the `VN_MICDEV=1` tests on the server (amd64) and on the Pi (arm64, Ubuntu 26.04).
   - Update research.md R1 if anything differs.
-- [ ] T031 Run the full quickstart.md §0–§4 with the recorder in both places, including the box out of the service host's radio range. Fix whatever it surfaces through the owning task's tests.
+- [x] T031 Run the full quickstart.md §0–§4 with the recorder in both places, including the box out of the service host's radio range. Fix whatever it surfaces through the owning task's tests.
 
 ---
 
